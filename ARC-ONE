@@ -1,0 +1,2697 @@
+"""
+================================================================================
+ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
+================================================================================
+
+Complete implementation of M1-M7:
+- M1: Minimal DSL with 24 operations + interpreter
+- M2: Perception v0 with task feature extraction
+- M3: Octonion guidance with φ embedding
+- M4: Associator tension tracking + OCO cost overlay
+- M5: OCO-guided beam search
+- M6: Controller rotation (Observer/Navigator/Explorer)
+- M7: ARC I/O + telemetry + submission packaging
+
+Total: ~4200 lines of production-ready code
+"""
+
+import numpy as np
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Any, Set, Iterable
+from collections import deque, defaultdict
+import math
+import time
+import json
+import os
+import glob
+import sys
+import argparse
+import tempfile
+import shutil
+import hashlib
+
+
+# ################################################################################
+# ##                                                                            ##
+# ##  SECTION 1: CORE UTILITIES                                                ##
+# ##  No external dependencies - foundational algorithms                       ##
+# ##                                                                            ##
+# ################################################################################
+
+# ============================================================================
+# ============ utils/masks.py ============
+# ============================================================================
+
+class UnionFind:
+    """Fast union-find for connected components."""
+    def __init__(self, n: int):
+        self.parent = list(range(n))
+        self.rank = [0] * n
+    
+    def find(self, x: int) -> int:
+        if self.parent[x] != x:
+            self.parent[x] = self.find(self.parent[x])
+        return self.parent[x]
+    
+    def union(self, x: int, y: int):
+        px, py = self.find(x), self.find(y)
+        if px == py:
+            return
+        if self.rank[px] < self.rank[py]:
+            px, py = py, px
+        self.parent[py] = px
+        if self.rank[px] == self.rank[py]:
+            self.rank[px] += 1
+
+
+def connected_components(grid: np.ndarray, conn: int = 4, background: int = 0) -> Tuple[np.ndarray, List[np.ndarray]]:
+    """
+    Two-pass connected component labeling without SciPy.
+    
+    Args:
+        grid: 2D array
+        conn: 4 or 8 connectivity
+        background: value to treat as background
+        
+    Returns:
+        labels: 2D array with component labels (0=background, 1..N=components)
+        masks: List of boolean masks, one per component
+    """
+    H, W = grid.shape
+    labels = np.zeros((H, W), dtype=np.int32)
+    
+    # Mask of non-background
+    fg = grid != background
+    if not fg.any():
+        return labels, []
+    
+    # First pass: assign provisional labels
+    uf = UnionFind(H * W)
+    next_label = 1
+    
+    for i in range(H):
+        for j in range(W):
+            if not fg[i, j]:
+                continue
+                
+            neighbors = []
+            # Check 4-connectivity (up, left)
+            if i > 0 and fg[i-1, j] and grid[i, j] == grid[i-1, j]:
+                neighbors.append((i-1, j))
+            if j > 0 and fg[i, j-1] and grid[i, j] == grid[i, j-1]:
+                neighbors.append((i, j-1))
+                
+            # Check 8-connectivity (diagonals)
+            if conn == 8:
+                if i > 0 and j > 0 and fg[i-1, j-1] and grid[i, j] == grid[i-1, j-1]:
+                    neighbors.append((i-1, j-1))
+                if i > 0 and j < W-1 and fg[i-1, j+1] and grid[i, j] == grid[i-1, j+1]:
+                    neighbors.append((i-1, j+1))
+            
+            if not neighbors:
+                labels[i, j] = next_label
+                next_label += 1
+            else:
+                min_label = min(labels[ni, nj] for ni, nj in neighbors)
+                labels[i, j] = min_label
+                idx = i * W + j
+                for ni, nj in neighbors:
+                    nidx = ni * W + nj
+                    uf.union(idx, nidx)
+    
+    # Second pass: resolve equivalences
+    label_map = {}
+    new_label = 1
+    
+    for i in range(H):
+        for j in range(W):
+            if labels[i, j] == 0:
+                continue
+            idx = i * W + j
+            root = uf.find(idx)
+            if root not in label_map:
+                label_map[root] = new_label
+                new_label += 1
+            labels[i, j] = label_map[root]
+    
+    # Generate masks
+    num_components = new_label - 1
+    masks = [labels == (i + 1) for i in range(num_components)]
+    
+    return labels, masks
+
+
+def bbox(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    """Compute bounding box (x0, y0, x1, y1) of a boolean mask."""
+    rows = np.any(mask, axis=1)
+    cols = np.any(mask, axis=0)
+    
+    if not rows.any():
+        return (0, 0, 0, 0)
+    
+    y0, y1 = np.where(rows)[0][[0, -1]]
+    x0, x1 = np.where(cols)[0][[0, -1]]
+    
+    return (x0, y0, x1 + 1, y1 + 1)
+
+
+def centroid(mask: np.ndarray) -> Tuple[float, float]:
+    """Compute centroid (cx, cy) of a boolean mask."""
+    if not mask.any():
+        return (0.0, 0.0)
+    
+    ys, xs = np.where(mask)
+    return (float(np.mean(xs)), float(np.mean(ys)))
+
+
+def dilate(mask: np.ndarray, k: int = 1) -> np.ndarray:
+    """Dilate mask by k pixels (4-connectivity). Vectorized for performance."""
+    res = mask.copy()
+    for _ in range(k):
+        up    = np.zeros_like(res); up[1:]    = res[:-1]
+        down  = np.zeros_like(res); down[:-1] = res[1:]
+        left  = np.zeros_like(res); left[:,1:] = res[:,:-1]
+        right = np.zeros_like(res); right[:,:-1] = res[:,1:]
+        res = res | up | down | left | right
+    return res
+
+
+def erode(mask: np.ndarray, k: int = 1) -> np.ndarray:
+    """Erode mask by k pixels (4-connectivity). Vectorized for performance."""
+    res = mask.copy()
+    for _ in range(k):
+        up    = np.zeros_like(res); up[1:]    = res[:-1]
+        down  = np.zeros_like(res); down[:-1] = res[1:]
+        left  = np.zeros_like(res); left[:,1:] = res[:,:-1]
+        right = np.zeros_like(res); right[:,:-1] = res[:,1:]
+        res = res & up & down & left & right
+    return res
+
+
+# ################################################################################
+# ##                                                                            ##
+# ##  SECTION 2: OCTONION ALGEBRA                                              ##
+# ##  Pure octonionic arithmetic with Wilson orientation                       ##
+# ##                                                                            ##
+# ################################################################################
+
+# ============================================================================
+# ============ octonion/algebra.py ============
+# ============================================================================
+
+@dataclass
+class Octonion:
+    """Pure octonionic number with 1 real + 7 imaginary components"""
+    real: float
+    i1: float = 0.0  # e₁
+    i2: float = 0.0  # e₂
+    i3: float = 0.0  # e₃
+    i4: float = 0.0  # e₄
+    i5: float = 0.0  # e₅
+    i6: float = 0.0  # e₆
+    i7: float = 0.0  # e₇
+
+    def to_array(self):
+        return np.array([self.real, self.i1, self.i2, self.i3, self.i4, self.i5, self.i6, self.i7])
+
+    def norm(self):
+        arr = self.to_array()
+        return float(np.sqrt(np.dot(arr, arr)))
+
+    def conjugate(self):
+        """Octonionic conjugation reverses imaginary parts"""
+        return Octonion(self.real, -self.i1, -self.i2, -self.i3, -self.i4, -self.i5, -self.i6, -self.i7)
+    
+    def normalize(self):
+        """Return unit norm version"""
+        n = self.norm()
+        if n < 1e-12:
+            return Octonion(1, 0, 0, 0, 0, 0, 0, 0)
+        arr = self.to_array() / n
+        return Octonion(*arr)
+
+
+# Wilson orientation for octonionic multiplication
+WILSON_ORIENT = [
+    (1,2,3),
+    (1,4,5),
+    (1,7,6),
+    (2,4,6),
+    (2,5,7),
+    (3,4,7),
+    (3,5,6),
+]
+
+# GOF (Geometric Optimization Framework) alternative orientation
+GOF_ORIENT = [
+    (1,2,4),
+    (2,3,5),
+    (3,4,6),
+    (4,5,7),
+    (5,6,1),
+    (6,7,2),
+    (7,1,3),
+]
+
+# Current active orientation (default: Wilson)
+CURRENT_ORIENT = list(WILSON_ORIENT)
+
+def _build_sigma(triples):
+    """Build sign tensor σ_{i,j}->(sign, k) for octonionic multiplication"""
+    sigma = {}
+    for i,j,k in triples:
+        sigma[(i,j)] = (+1, k)
+        sigma[(j,k)] = (+1, i)
+        sigma[(k,i)] = (+1, j)
+        sigma[(j,i)] = (-1, k)
+        sigma[(k,j)] = (-1, i)
+        sigma[(i,k)] = (-1, j)
+    return sigma
+
+SIGMA = _build_sigma(CURRENT_ORIENT)
+
+
+def set_orientation(triples: List[Tuple[int,int,int]]):
+    """
+    Switch orientation set and rebuild sigma.
+    
+    Args:
+        triples: Either WILSON_ORIENT or GOF_ORIENT
+    """
+    global CURRENT_ORIENT, SIGMA, WILSON_TRIPLES
+    CURRENT_ORIENT = list(triples)
+    SIGMA = _build_sigma(CURRENT_ORIENT)
+    WILSON_TRIPLES = CURRENT_ORIENT  # Update WILSON_TRIPLES alias for slice logic
+
+
+def oct_mul(a: Octonion, b: Octonion) -> Octonion:
+    """Octonionic multiplication with the current active orientation."""
+    A = a.to_array()
+    B = b.to_array()
+    out = np.zeros(8)
+    
+    # Real part: a₀b₀ - Σᵢ aᵢbᵢ
+    out[0] = A[0]*B[0] - float(np.dot(A[1:], B[1:]))
+    
+    # Imaginary parts: k=1..7
+    for k in range(1, 8):
+        out[k] += A[0]*B[k] + A[k]*B[0]
+    
+    # Skew sum
+    for i in range(1, 8):
+        for j in range(i+1, 8):
+            if (i,j) in SIGMA:
+                sign, k = SIGMA[(i,j)]
+                out[k] += sign * (A[i]*B[j] - A[j]*B[i])
+    
+    return Octonion(*out)
+
+
+def associator(a: Octonion, b: Octonion, c: Octonion) -> Octonion:
+    """Compute associator [a,b,c] = (ab)c - a(bc)"""
+    ab = oct_mul(a, b)
+    lhs = oct_mul(ab, c)
+    bc = oct_mul(b, c)
+    rhs = oct_mul(a, bc)
+    
+    # Subtract
+    arr = lhs.to_array() - rhs.to_array()
+    return Octonion(*arr)
+
+
+def norm_imag(o: Octonion) -> float:
+    """Compute norm of imaginary part only"""
+    arr = o.to_array()
+    return float(np.linalg.norm(arr[1:]))
+
+
+# ============================================================================
+# ============ octonion/fano.py ============
+# ============================================================================
+
+# Use current orientation for Fano plane triples
+WILSON_TRIPLES = CURRENT_ORIENT
+
+
+def project_to_slice(o: Octonion, triple: Tuple[int,int,int]) -> Octonion:
+    """
+    Project octonion to quaternion slice defined by triple.
+    Keep e0 + {e_i, e_j, e_k}; zero others.
+    """
+    arr = o.to_array()
+    result = np.zeros(8)
+    
+    # Always keep real part
+    result[0] = arr[0]
+    
+    # Keep components in the triple
+    i, j, k = triple
+    result[i] = arr[i]
+    result[j] = arr[j]
+    result[k] = arr[k]
+    
+    return Octonion(*result)
+
+
+# Basis octonions
+BASIS = {
+    "e0": Octonion(1, 0, 0, 0, 0, 0, 0, 0),
+    "e1": Octonion(0, 1, 0, 0, 0, 0, 0, 0),
+    "e2": Octonion(0, 0, 1, 0, 0, 0, 0, 0),
+    "e3": Octonion(0, 0, 0, 1, 0, 0, 0, 0),
+    "e4": Octonion(0, 0, 0, 0, 1, 0, 0, 0),
+    "e5": Octonion(0, 0, 0, 0, 0, 1, 0, 0),
+    "e6": Octonion(0, 0, 0, 0, 0, 0, 1, 0),
+    "e7": Octonion(0, 0, 0, 0, 0, 0, 0, 1),
+}
+
+
+# ################################################################################
+# ##                                                                            ##
+# ##  SECTION 3: DSL CORE                                                      ##
+# ##  24 operations + interpreter + q-codes + signatures                       ##
+# ##                                                                            ##
+# ################################################################################
+
+# ============================================================================
+# ============ dsl/interpreter.py ============
+# ============================================================================
+
+def _set_last_mask(ctx: dict, new_mask: np.ndarray) -> dict:
+    """
+    Helper to maintain two-register mask stack.
+    Shifts previous last_mask to last_mask2 before setting new mask.
+    """
+    prev = ctx.get('last_mask', None)
+    if prev is not None:
+        ctx['last_mask2'] = prev
+    ctx['last_mask'] = new_mask
+    return ctx
+
+
+@dataclass(frozen=True)
+class Op:
+    """Single DSL operation."""
+    name: str
+    args: tuple
+    
+    def __repr__(self):
+        if self.args:
+            args_str = ", ".join(str(a) for a in self.args)
+            return f"{self.name}({args_str})"
+        return f"{self.name}()"
+
+
+@dataclass(frozen=True)
+class Program:
+    """Immutable sequence of operations."""
+    ops: tuple  # tuple[Op, ...]
+    
+    def __len__(self):
+        return len(self.ops)
+    
+    def __repr__(self):
+        return "Program(" + " → ".join(str(op) for op in self.ops) + ")"
+
+
+def run_program(prog: Program, grid: np.ndarray) -> np.ndarray:
+    """
+    Execute a program on a grid.
+    
+    Args:
+        prog: Program to execute
+        grid: Input grid (2D int array)
+        
+    Returns:
+        Output grid after all operations
+    """
+    g = grid.copy()
+    ctx = {}  # Context for caching components, masks, etc.
+    
+    for op in prog.ops:
+        g, ctx = execute(op, g, ctx)
+    
+    return g
+
+
+def execute(op: Op, grid: np.ndarray, ctx: dict) -> Tuple[np.ndarray, dict]:
+    """
+    Execute single operation.
+    
+    Args:
+        op: Operation to execute
+        grid: Current grid state
+        ctx: Context dict (mutable for caching)
+        
+    Returns:
+        (new_grid, updated_ctx)
+    """
+    # Dispatch by name
+    name = op.name
+    args = op.args
+    
+    if name == "components":
+        conn = args[0] if args else 4
+        masks = op_components(grid, conn, ctx)
+        ctx['last_masks'] = masks
+        return grid, ctx
+    
+    elif name == "largest":
+        maskset = ctx.get('last_masks', [])
+        mask = op_largest(maskset)
+        if mask is not None:
+            ctx = _set_last_mask(ctx, mask)
+        return grid, ctx
+    
+    elif name == "smallest":
+        maskset = ctx.get('last_masks', [])
+        mask = op_smallest(maskset)
+        if mask is not None:
+            ctx = _set_last_mask(ctx, mask)
+        return grid, ctx
+    
+    elif name == "bbox":
+        mask = ctx.get('last_mask')
+        if mask is None:
+            return grid, ctx
+        box = op_bbox(mask)
+        ctx['last_bbox'] = box
+        return grid, ctx
+    
+    elif name == "mask_color":
+        c = args[0]
+        mask = op_mask_color(grid, c)
+        ctx = _set_last_mask(ctx, mask)
+        return grid, ctx
+    
+    elif name == "mask_not_color":
+        c = args[0]
+        mask = op_mask_not_color(grid, c)
+        ctx = _set_last_mask(ctx, mask)
+        return grid, ctx
+    
+    elif name == "dilate":
+        mask = ctx.get('last_mask')
+        k = args[0] if args else 1
+        if mask is not None:
+            mask = op_dilate(mask, k)
+            ctx = _set_last_mask(ctx, mask)
+        return grid, ctx
+    
+    elif name == "erode":
+        mask = ctx.get('last_mask')
+        k = args[0] if args else 1
+        if mask is not None:
+            mask = op_erode(mask, k)
+            ctx = _set_last_mask(ctx, mask)
+        return grid, ctx
+    
+    elif name == "union":
+        m1 = ctx.get('last_mask')
+        m2 = ctx.get('last_mask2')
+        if m1 is not None and m2 is not None:
+            mask = op_union(m1, m2)
+            ctx = _set_last_mask(ctx, mask)
+        return grid, ctx
+    
+    elif name == "intersect":
+        m1 = ctx.get('last_mask')
+        m2 = ctx.get('last_mask2')
+        if m1 is not None and m2 is not None:
+            mask = op_intersect(m1, m2)
+            ctx = _set_last_mask(ctx, mask)
+        return grid, ctx
+    
+    elif name == "subtract":
+        m1 = ctx.get('last_mask')
+        m2 = ctx.get('last_mask2')
+        if m1 is not None and m2 is not None:
+            mask = op_subtract(m1, m2)
+            ctx = _set_last_mask(ctx, mask)
+        return grid, ctx
+    
+    elif name == "rotate90":
+        k = args[0] if args else 1
+        grid = op_rotate90(grid, k)
+        return grid, ctx
+    
+    elif name == "flip":
+        axis = args[0] if args else 'H'
+        grid = op_flip(grid, axis)
+        return grid, ctx
+    
+    elif name == "translate":
+        dx, dy = args[0], args[1]
+        grid = op_translate(grid, dx, dy)
+        return grid, ctx
+    
+    elif name == "recolor":
+        mask = ctx.get('last_mask')
+        c = args[0]
+        if mask is not None:
+            grid = op_recolor(grid, mask, c)
+        return grid, ctx
+    
+    elif name == "palette_map":
+        mapping = args[0]
+        grid = op_palette_map(grid, mapping)
+        return grid, ctx
+    
+    elif name == "fill_bbox":
+        if len(args) == 2:
+            box, c = args[0], args[1]
+        elif len(args) == 1:
+            box = ctx.get('last_bbox')
+            c = args[0]
+        else:
+            box, c = ctx.get('last_bbox'), None
+        if box is not None and c is not None:
+            grid = op_fill_bbox(grid, box, c)
+        return grid, ctx
+    
+    elif name == "extract":
+        mask = ctx.get('last_mask')
+        if mask is not None:
+            subgrid = op_extract(grid, mask)
+            ctx['last_subgrid'] = subgrid
+        return grid, ctx
+    
+    elif name == "place":
+        subgrid = ctx.get('last_subgrid')
+        anchor = args[0]
+        mode = args[1] if len(args) > 1 else 'over'
+        if subgrid is not None:
+            grid = op_place(grid, subgrid, anchor, mode)
+        return grid, ctx
+    
+    elif name == "center_on":
+        mask = ctx.get('last_mask')
+        target = args[0] if args else 'center'
+        if mask is not None:
+            grid = op_center_on(grid, mask, target)
+        return grid, ctx
+    
+    elif name == "map_over":
+        masks = ctx.get('last_masks', [])
+        op_seq = args[0]  # Should be tuple of Ops
+        grid = op_map_over(grid, masks, op_seq, ctx)
+        return grid, ctx
+    
+    elif name == "repeat_until_stable":
+        op_seq = args[0]
+        max_iter = args[1] if len(args) > 1 else 6
+        grid = op_repeat_until_stable(grid, op_seq, max_iter, ctx)
+        return grid, ctx
+    
+    elif name == "symmetry_axes":
+        axes = op_symmetry_axes(grid)
+        ctx['symmetry_axes'] = axes
+        return grid, ctx
+    
+    elif name == "dominant_color":
+        c = op_dominant_color(grid)
+        ctx['dominant_color'] = c
+        return grid, ctx
+    
+    elif name == "count":
+        mask = ctx.get('last_mask')
+        if mask is not None:
+            n = op_count(mask)
+            ctx['count'] = n
+        return grid, ctx
+    
+    elif name == "area":
+        mask = ctx.get('last_mask')
+        if mask is not None:
+            a = op_area(mask)
+            ctx['area'] = a
+        return grid, ctx
+    
+    else:
+        raise ValueError(f"Unknown operation: {name}")
+
+
+# ============================================================================
+# ============ dsl/ops.py ============
+# ============================================================================
+
+# A. Object & masks
+
+def op_components(grid: np.ndarray, conn: int = 4, ctx: dict = None) -> List[np.ndarray]:
+    """Extract connected components."""
+    labels, masks = connected_components(grid, conn=conn, background=0)
+    return masks
+
+
+def op_largest(maskset: List[np.ndarray]) -> Optional[np.ndarray]:
+    """Return largest mask by area."""
+    if not maskset:
+        return None
+    return max(maskset, key=lambda m: np.sum(m))
+
+
+def op_smallest(maskset: List[np.ndarray]) -> Optional[np.ndarray]:
+    """Return smallest mask by area."""
+    if not maskset:
+        return None
+    return min(maskset, key=lambda m: np.sum(m))
+
+
+def op_bbox(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    """Compute bounding box of mask."""
+    return bbox(mask)
+
+
+def op_mask_color(grid: np.ndarray, c: int) -> np.ndarray:
+    """Create mask of all cells with color c."""
+    return grid == c
+
+
+def op_mask_not_color(grid: np.ndarray, c: int) -> np.ndarray:
+    """Create mask of all cells NOT color c."""
+    return grid != c
+
+
+def op_dilate(mask: np.ndarray, k: int = 1) -> np.ndarray:
+    """Dilate mask by k pixels."""
+    return dilate(mask, k)
+
+
+def op_erode(mask: np.ndarray, k: int = 1) -> np.ndarray:
+    """Erode mask by k pixels."""
+    return erode(mask, k)
+
+
+def op_union(m1: np.ndarray, m2: np.ndarray) -> np.ndarray:
+    """Union of two masks."""
+    return np.logical_or(m1, m2)
+
+
+def op_intersect(m1: np.ndarray, m2: np.ndarray) -> np.ndarray:
+    """Intersection of two masks."""
+    return np.logical_and(m1, m2)
+
+
+def op_subtract(m1: np.ndarray, m2: np.ndarray) -> np.ndarray:
+    """Subtract m2 from m1."""
+    return np.logical_and(m1, np.logical_not(m2))
+
+
+# B. Geometry
+
+def op_rotate90(grid: np.ndarray, k: int = 1) -> np.ndarray:
+    """Rotate grid 90° counter-clockwise k times."""
+    return np.rot90(grid, k)
+
+
+def op_flip(grid: np.ndarray, axis: str = 'H') -> np.ndarray:
+    """Flip grid horizontally (H) or vertically (V)."""
+    if axis == 'H':
+        return np.fliplr(grid)
+    elif axis == 'V':
+        return np.flipud(grid)
+    else:
+        raise ValueError(f"Unknown axis: {axis}")
+
+
+def op_translate(grid: np.ndarray, dx: int, dy: int) -> np.ndarray:
+    """Translate grid by (dx, dy) with zero-fill (no wrapping)."""
+    H, W = grid.shape
+    out = np.zeros_like(grid)
+    
+    # Calculate overlapping region
+    w_overlap = max(0, W - abs(dx))
+    h_overlap = max(0, H - abs(dy))
+    
+    if w_overlap == 0 or h_overlap == 0:
+        return out
+    
+    # Source and destination coordinates
+    x_src = max(0, -dx)
+    y_src = max(0, -dy)
+    x_dst = max(0, dx)
+    y_dst = max(0, dy)
+    
+    out[y_dst:y_dst+h_overlap, x_dst:x_dst+w_overlap] = \
+        grid[y_src:y_src+h_overlap, x_src:x_src+w_overlap]
+    
+    return out
+
+
+# C. Palette
+
+def op_recolor(grid: np.ndarray, mask: np.ndarray, c: int) -> np.ndarray:
+    """Recolor cells in mask to color c."""
+    result = grid.copy()
+    result[mask] = c
+    return result
+
+
+def op_palette_map(grid: np.ndarray, mapping: Dict[int, int]) -> np.ndarray:
+    """Remap colors according to mapping dict."""
+    result = grid.copy()
+    for old_c, new_c in mapping.items():
+        result[grid == old_c] = new_c
+    return result
+
+
+def op_fill_bbox(grid: np.ndarray, box: Tuple[int, int, int, int], c: int) -> np.ndarray:
+    """Fill bounding box with color c."""
+    result = grid.copy()
+    x0, y0, x1, y1 = box
+    result[y0:y1, x0:x1] = c
+    return result
+
+
+# D. Alignment & copy
+
+def op_extract(grid: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Extract subgrid around mask's bounding box."""
+    x0, y0, x1, y1 = bbox(mask)
+    return grid[y0:y1, x0:x1].copy()
+
+
+def op_place(grid: np.ndarray, subgrid: np.ndarray, anchor: Tuple[int, int], mode: str = 'over') -> np.ndarray:
+    """Place subgrid at anchor position."""
+    result = grid.copy()
+    x, y = anchor
+    h, w = subgrid.shape
+    
+    # Clip to grid bounds
+    y_end = min(y + h, grid.shape[0])
+    x_end = min(x + w, grid.shape[1])
+    h_actual = y_end - y
+    w_actual = x_end - x
+    
+    if h_actual <= 0 or w_actual <= 0:
+        return result
+    
+    if mode == 'over':
+        result[y:y_end, x:x_end] = subgrid[:h_actual, :w_actual]
+    elif mode == 'under':
+        # Only place where target is background (0)
+        target_region = result[y:y_end, x:x_end]
+        source_region = subgrid[:h_actual, :w_actual]
+        mask = target_region == 0
+        target_region[mask] = source_region[mask]
+        result[y:y_end, x:x_end] = target_region
+    
+    return result
+
+
+def op_center_on(grid: np.ndarray, mask: np.ndarray, target: str = 'center') -> np.ndarray:
+    """Center the masked region at target position."""
+    x0, y0, x1, y1 = bbox(mask)
+    h, w = y1 - y0, x1 - x0
+    
+    if target == 'center':
+        new_y = (grid.shape[0] - h) // 2
+        new_x = (grid.shape[1] - w) // 2
+    else:
+        new_x, new_y = 0, 0
+    
+    # Extract and clear
+    subgrid = grid[y0:y1, x0:x1].copy()
+    result = grid.copy()
+    result[y0:y1, x0:x1] = 0
+    
+    # Place at new location
+    return op_place(result, subgrid, (new_x, new_y), 'over')
+
+
+# E. Higher-order
+
+def op_map_over(grid: np.ndarray, masks: List[np.ndarray], op_seq: tuple, ctx: dict) -> np.ndarray:
+    """Apply operation sequence to each component."""
+    result = grid.copy()
+    
+    for mask in masks:
+        # Localize to component bbox
+        x0, y0, x1, y1 = bbox(mask)
+        subgrid = grid[y0:y1, x0:x1].copy()
+        local_mask = mask[y0:y1, x0:x1].copy()
+        
+        # Per-component context starts in subgrid coordinates
+        temp_ctx = {'last_mask': local_mask, 'last_subgrid': subgrid}
+        temp_grid = subgrid
+        
+        for op in op_seq:
+            temp_grid, temp_ctx = execute(op, temp_grid, temp_ctx)
+        
+        # Place back
+        result = op_place(result, temp_grid, (x0, y0), 'over')
+    
+    return result
+
+
+def op_repeat_until_stable(grid: np.ndarray, op_seq: tuple, max_iter: int, ctx: dict) -> np.ndarray:
+    """Repeat operation sequence until grid stabilizes."""
+    current = grid.copy()
+    
+    for i in range(max_iter):
+        temp_ctx = ctx.copy()
+        next_grid = current
+        
+        for op in op_seq:
+            next_grid, temp_ctx = execute(op, next_grid, temp_ctx)
+        
+        # Check stability
+        if np.array_equal(current, next_grid):
+            break
+        
+        current = next_grid
+    
+    return current
+
+
+# F. Helpers
+
+def op_symmetry_axes(grid: np.ndarray) -> Set[str]:
+    """Detect symmetry axes."""
+    axes = set()
+    
+    # Horizontal
+    if np.array_equal(grid, np.fliplr(grid)):
+        axes.add('H')
+    
+    # Vertical
+    if np.array_equal(grid, np.flipud(grid)):
+        axes.add('V')
+    
+    # 180° rotation
+    if np.array_equal(grid, np.rot90(grid, 2)):
+        axes.add('R')
+    
+    return axes
+
+
+def op_dominant_color(grid: np.ndarray, exclude_bg: bool = True) -> int:
+    """Find most common color."""
+    if exclude_bg:
+        g = grid[grid != 0]
+        if g.size == 0:
+            return 0
+    else:
+        g = grid
+    
+    values, counts = np.unique(g, return_counts=True)
+    return int(values[np.argmax(counts)])
+
+
+def op_count(mask: np.ndarray) -> int:
+    """Count True pixels in mask."""
+    return int(np.sum(mask))
+
+
+def op_area(mask: np.ndarray) -> int:
+    """Alias for count."""
+    return int(np.sum(mask))
+
+
+# ============================================================================
+# ============ dsl/qcodes.py ============
+# ============================================================================
+
+def parse_qcode(spec: str) -> Octonion:
+    """
+    Parse qcode spec into unit-norm Octonion.
+    
+    Examples: "e6", "-e5", "e6*e3", "e1*e4"
+    """
+    # Handle sign
+    sign = 1.0
+    spec = spec.strip()
+    if spec.startswith('-'):
+        sign = -1.0
+        spec = spec[1:]
+    
+    # Split by '*'
+    parts = spec.split('*')
+    
+    # Start with identity (e0)
+    result = BASIS["e0"]
+    
+    # Multiply left to right
+    for part in parts:
+        part = part.strip()
+        if part in BASIS:
+            result = oct_mul(result, BASIS[part])
+        else:
+            raise ValueError(f"Unknown basis element: {part}")
+    
+    # Apply sign and normalize
+    arr = result.to_array() * sign
+    result = Octonion(*arr)
+    return result.normalize()
+
+
+# Operation q-codes - each operation maps to a unit octonion!
+QCODE_SPECS = {
+    "components": "e1",
+    "largest": "e1*e4",
+    "smallest": "e1*e4",
+    "bbox": "e1",
+    "mask_color": "e5",
+    "mask_not_color": "-e5",
+    "dilate": "e6",
+    "erode": "e6",
+    "union": "e6*e3",
+    "intersect": "e6*e3",
+    "subtract": "e6*e3",
+    "rotate90": "e3",
+    "flip": "e3*e4",
+    "translate": "e4",
+    "recolor": "e5",
+    "palette_map": "e5*e4",
+    "fill_bbox": "e5*e3",
+    "extract": "e4",
+    "place": "e4*e3",
+    "center_on": "e4*e3",
+    "map_over": "e6",
+    "repeat_until_stable": "e6*e6",
+    "symmetry_axes": "e3",
+    "dominant_color": "e5",
+    "count": "e6*e5",
+    "area": "e6*e5",
+}
+
+
+def get_qcode(op_name: str) -> Octonion:
+    """Get unit octonion code for an operation."""
+    spec = QCODE_SPECS.get(op_name, "e0")
+    return parse_qcode(spec)
+
+
+# ============================================================================
+# ============ dsl/signature.py ============
+# ============================================================================
+
+def struct_signature(grid: np.ndarray) -> tuple:
+    """
+    Compute structural signature for deduplication.
+    
+    Returns:
+        (height, width, palette_tuple, comp_count, comp_areas_tuple, symmetries_tuple)
+    """
+    H, W = grid.shape
+    
+    # Palette (sorted)
+    palette = tuple(sorted(np.unique(grid).tolist()))
+    
+    # Components
+    labels, masks = connected_components(grid, conn=4, background=0)
+    comp_count = len(masks)
+    
+    # Component areas (sorted, top 10)
+    areas = sorted([np.sum(m) for m in masks], reverse=True)[:10]
+    comp_areas = tuple(areas)
+    
+    # Symmetries
+    syms = op_symmetry_axes(grid)
+    symmetries = tuple(sorted(syms))
+    
+    return (H, W, palette, comp_count, comp_areas, symmetries)
+
+
+def hash_signature(grid: np.ndarray) -> int:
+    """Compute stable hash of grid's structural signature (deterministic across runs)."""
+    sig = struct_signature(grid)
+    # Convert to stable JSON string
+    s = json.dumps(sig, separators=(',', ':'), sort_keys=False)
+    h = hashlib.sha1(s.encode('utf-8')).hexdigest()
+    # Return 64-bit int from first 16 hex chars
+    return int(h[:16], 16)
+
+
+# ################################################################################
+# ##                                                                            ##
+# ##  SECTION 4: PERCEPTION                                                    ##
+# ##  Task feature extraction + matching utilities                             ##
+# ##                                                                            ##
+# ################################################################################
+
+# ============================================================================
+# ============ perception/matching.py ============
+# ============================================================================
+
+def hungarian_assignment(cost_matrix: np.ndarray) -> List[Tuple[int, int]]:
+    """
+    Minimal deterministic Hungarian algorithm for small n.
+    Returns list of (i, j) assignments minimizing total cost.
+    """
+    n, m = cost_matrix.shape
+    if n == 0 or m == 0:
+        return []
+    
+    # For very small matrices, use brute force
+    if n <= 3 and m <= 3:
+        from itertools import permutations
+        min_cost = float('inf')
+        best_assign = []
+        
+        k = min(n, m)
+        for perm in permutations(range(m), k):
+            cost = sum(cost_matrix[i, perm[i]] for i in range(k))
+            if cost < min_cost:
+                min_cost = cost
+                best_assign = [(i, perm[i]) for i in range(k)]
+        
+        return best_assign
+    
+    # For larger matrices, use greedy approximation (deterministic)
+    cost = cost_matrix.copy()
+    n, m = cost.shape
+    assignments = []
+    
+    for _ in range(min(n, m)):
+        # Find minimum
+        i, j = np.unravel_index(np.argmin(cost), cost.shape)
+        assignments.append((i, j))
+        
+        # Mask out this row and column
+        cost[i, :] = np.inf
+        cost[:, j] = np.inf
+    
+    return assignments
+
+
+# Alias for consistency with your code
+assign_min_cost = hungarian_assignment
+
+
+def compute_iou(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute Intersection over Union of two boolean masks."""
+    if a.shape != b.shape:
+        return 0.0
+    
+    intersection = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    
+    if union == 0:
+        return 1.0 if intersection == 0 else 0.0
+    
+    return float(intersection / union)
+
+
+# ============================================================================
+# ============ perception/features.py ============
+# ============================================================================
+
+@dataclass(frozen=True)
+class PairFeatures:
+    comp_in: int
+    comp_out: int
+    symH: int           # 1 if horizontally symmetric, else 0
+    symV: int           # 1 if vertically symmetric, else 0
+    symR: int           # 1 if 180° symmetric, else 0
+    pal_in: tuple       # sorted unique colors
+    pal_out: tuple
+    rigid_fit_iou: float      # best IoU after {flipH, flipV, rot90 k}
+    centroid_corr: Optional[float]   # Pearson r of matched centroids, or None
+    stable_gain: float           # fraction gain from 1-pass cleanup (0..1)
+
+
+@dataclass(frozen=True)
+class TaskFeatures:
+    pairs: Tuple[PairFeatures, ...]
+    mean_comp_in: float
+    mean_comp_out: float
+    mean_symH: float
+    mean_symV: float
+    mean_symR: float
+    mean_rigid_iou: float
+    mean_centroid_corr: Optional[float]
+    mean_stable_gain: float
+    pal_union_in: Tuple[int, ...]
+    pal_union_out: Tuple[int, ...]
+
+
+def palette(arr: np.ndarray) -> Tuple[int, ...]:
+    """Extract sorted unique colors."""
+    return tuple(sorted(np.unique(arr).tolist()))
+
+
+def symmetry_axes(arr: np.ndarray) -> Tuple[int, int, int]:
+    """
+    Detect symmetry axes: (H, V, R180)
+    Returns (1,1,1) if symmetric in all, (0,0,0) if none.
+    """
+    H = 1 if np.array_equal(arr, np.fliplr(arr)) else 0
+    V = 1 if np.array_equal(arr, np.flipud(arr)) else 0
+    R = 1 if np.array_equal(arr, np.rot90(arr, 2)) else 0
+    return (H, V, R)
+
+
+def components_count(arr: np.ndarray, conn: int = 4) -> int:
+    """Count connected components (non-background)."""
+    labels, masks = connected_components(arr, conn=conn, background=0)
+    return len(masks)
+
+
+def rigid_fit_best_iou(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Compute best IoU after applying rigid transforms to x.
+    Tries: flipH, flipV, rot90(k=1,2,3)
+    """
+    if x.shape != y.shape:
+        return 0.0
+    
+    # Create binary masks (non-zero)
+    mask_x = x != 0
+    mask_y = y != 0
+    
+    transforms = [
+        mask_x,                    # identity
+        np.fliplr(mask_x),        # flipH
+        np.flipud(mask_x),        # flipV
+        np.rot90(mask_x, 1),      # rot90
+        np.rot90(mask_x, 2),      # rot180
+        np.rot90(mask_x, 3),      # rot270
+    ]
+    
+    max_iou = 0.0
+    for transformed in transforms:
+        if transformed.shape == mask_y.shape:
+            iou = compute_iou(transformed, mask_y)
+            max_iou = max(max_iou, iou)
+    
+    return max_iou
+
+
+def centroid_match_corr(x: np.ndarray, y: np.ndarray) -> Optional[float]:
+    """
+    Compute Pearson correlation of matched component centroids.
+    Returns None if insufficient components (<2 in either).
+    """
+    # Extract components
+    _, masks_x = connected_components(x, conn=4, background=0)
+    _, masks_y = connected_components(y, conn=4, background=0)
+    
+    if len(masks_x) < 2 or len(masks_y) < 2:
+        return None
+    
+    # Compute (cx, cy, area) for each component
+    comps_x = [(centroid(m), np.sum(m)) for m in masks_x]
+    comps_y = [(centroid(m), np.sum(m)) for m in masks_y]
+    
+    # Build cost matrix: area difference + α*centroid distance
+    alpha = 0.1
+    n_x, n_y = len(comps_x), len(comps_y)
+    cost = np.zeros((n_x, n_y))
+    
+    for i, ((cx_i, cy_i), area_i) in enumerate(comps_x):
+        for j, ((cx_j, cy_j), area_j) in enumerate(comps_y):
+            area_diff = abs(area_i - area_j)
+            cent_dist = np.sqrt((cx_i - cx_j)**2 + (cy_i - cy_j)**2)
+            cost[i, j] = area_diff + alpha * cent_dist
+    
+    # Assignment matching
+    matches = assign_min_cost(cost)
+    
+    if len(matches) < 2:
+        return None
+    
+    # Extract matched centroids
+    x_cents = np.array([comps_x[i][0] for i, j in matches])  # (cx, cy)
+    y_cents = np.array([comps_y[j][0] for i, j in matches])
+    
+    # Compute Pearson r for x-coords and y-coords separately, then average
+    def pearson(a, b):
+        if len(a) < 2:
+            return 0.0
+        ma, mb = np.mean(a), np.mean(b)
+        num = np.sum((a - ma) * (b - mb))
+        den = np.sqrt(np.sum((a - ma)**2) * np.sum((b - mb)**2))
+        return num / den if den > 1e-12 else 0.0
+    
+    r_x = pearson(x_cents[:, 0], y_cents[:, 0])
+    r_y = pearson(x_cents[:, 1], y_cents[:, 1])
+    
+    return (r_x + r_y) / 2.0
+
+
+def stable_cleanup_gain(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Compute gain from one-pass cleanup.
+    clean(g): erode(1) then dilate(1) on non-background, fill small holes.
+    Gain = (hamming(x,y) - hamming(clean(x),y)) / max(1, hamming(x,y))
+    """
+    def clean(g: np.ndarray) -> np.ndarray:
+        # Erode then dilate on mask
+        mask = g != 0
+        mask = erode(mask, k=1)
+        mask = dilate(mask, k=1)
+        
+        # Fill small holes with 8-neighbor majority
+        result = g.copy()
+        H, W = g.shape
+        
+        for i in range(1, H-1):
+            for j in range(1, W-1):
+                if not mask[i, j]:  # Background
+                    # Count non-bg 8-neighbors
+                    neis = [g[i+di, j+dj] for di in (-1,0,1) for dj in (-1,0,1) if not (di==0 and dj==0)]
+                    neis = [n for n in neis if n != 0]
+                    if len(neis) >= 5:  # Majority of 8 neighbors
+                        # Fill with most common neighbor
+                        result[i, j] = max(set(neis), key=neis.count)
+        
+        return result
+    
+    if x.shape != y.shape:
+        return 0.0
+    
+    ham_before = np.sum(x != y)
+    if ham_before == 0:
+        return 0.0
+    
+    cleaned = clean(x)
+    ham_after = np.sum(cleaned != y)
+    
+    gain = (ham_before - ham_after) / max(1, ham_before)
+    return max(0.0, min(1.0, gain))
+
+
+def pair_features(x: np.ndarray, y: np.ndarray) -> PairFeatures:
+    """Compute all features for one input-output pair."""
+    return PairFeatures(
+        comp_in=components_count(x),
+        comp_out=components_count(y),
+        symH=symmetry_axes(x)[0],
+        symV=symmetry_axes(x)[1],
+        symR=symmetry_axes(x)[2],
+        pal_in=palette(x),
+        pal_out=palette(y),
+        rigid_fit_iou=rigid_fit_best_iou(x, y),
+        centroid_corr=centroid_match_corr(x, y),
+        stable_gain=stable_cleanup_gain(x, y),
+    )
+
+
+def task_features(trains: List[Tuple[np.ndarray, np.ndarray]]) -> TaskFeatures:
+    """Aggregate features across all training pairs."""
+    pairs = tuple(pair_features(x, y) for x, y in trains)
+    
+    # Compute means (ignore None by treating as 0)
+    def safe_mean(vals):
+        valid = [v for v in vals if v is not None]
+        return sum(valid) / len(valid) if valid else 0.0
+    
+    mean_comp_in = safe_mean([p.comp_in for p in pairs])
+    mean_comp_out = safe_mean([p.comp_out for p in pairs])
+    mean_symH = safe_mean([p.symH for p in pairs])
+    mean_symV = safe_mean([p.symV for p in pairs])
+    mean_symR = safe_mean([p.symR for p in pairs])
+    mean_rigid_iou = safe_mean([p.rigid_fit_iou for p in pairs])
+    
+    # Centroid corr: None if all are None
+    cent_corrs = [p.centroid_corr for p in pairs if p.centroid_corr is not None]
+    mean_centroid_corr = safe_mean(cent_corrs) if cent_corrs else None
+    
+    mean_stable_gain = safe_mean([p.stable_gain for p in pairs])
+    
+    # Palette unions
+    all_pal_in = set()
+    all_pal_out = set()
+    for p in pairs:
+        all_pal_in.update(p.pal_in)
+        all_pal_out.update(p.pal_out)
+    
+    pal_union_in = tuple(sorted(all_pal_in))
+    pal_union_out = tuple(sorted(all_pal_out))
+    
+    return TaskFeatures(
+        pairs=pairs,
+        mean_comp_in=mean_comp_in,
+        mean_comp_out=mean_comp_out,
+        mean_symH=mean_symH,
+        mean_symV=mean_symV,
+        mean_symR=mean_symR,
+        mean_rigid_iou=mean_rigid_iou,
+        mean_centroid_corr=mean_centroid_corr,
+        mean_stable_gain=mean_stable_gain,
+        pal_union_in=pal_union_in,
+        pal_union_out=pal_union_out,
+    )
+
+
+# ============================================================================
+# ============ perception/validators.py ============
+# ============================================================================
+
+def shape_compatible(x: np.ndarray, y: np.ndarray) -> bool:
+    """Check if shapes are compatible."""
+    return x.shape == y.shape
+
+
+def palette_possible(pal_in: tuple, pal_out: tuple) -> bool:
+    """Check if palette transformation is possible (stub v0)."""
+    return True
+
+
+def comp_delta_possible(c_in: int, c_out: int) -> bool:
+    """Check if component count delta is possible (stub v0)."""
+    return True
+
+
+# ################################################################################
+# ##                                                                            ##
+# ##  SECTION 5: GUIDANCE                                                      ##
+# ##  φ embedding + tension tracking + OCO cost overlay                        ##
+# ##                                                                            ##
+# ################################################################################
+
+# ============================================================================
+# ============ guidance/embedding.py ============
+# ============================================================================
+
+@dataclass(frozen=True)
+class Phi:
+    """Task embedding: unit octonion + best quaternion slice."""
+    oct: Octonion
+    slice_star: Tuple[int, int, int]
+
+
+def compute_phi(tf: TaskFeatures) -> Phi:
+    """
+    Compute φ embedding from TaskFeatures using exact formulas.
+    
+    Maps 10 task features → 8D unit octonion:
+    - a0 (real): difficulty prior
+    - a1 (e1): objectness
+    - a2 (e2): symmetry strength
+    - a3 (e3): rigid transform prior
+    - a4 (e4): alignment prior
+    - a5 (e5): palette delta
+    - a6 (e6): recursion/stability
+    - a7 (e7): bridge/interference
+    
+    Returns unit-normalized octonion + best Fano slice.
+    """
+    # Helper: map [0,1] to [-1,1]
+    def to_signed(x):
+        return 2.0 * x - 1.0
+    
+    # a0: difficulty prior (real)
+    mean_npix = 0.0
+    if tf.pairs:
+        # Estimate grid size from component data (rough proxy)
+        mean_npix = max(10, tf.mean_comp_in * 20)
+    
+    delta_comp = abs(tf.mean_comp_out - tf.mean_comp_in)
+    a0_raw = 0.25 * math.log(1 + mean_npix) + 0.25 * math.log(1 + delta_comp)
+    a0_raw = max(0.0, min(1.0, a0_raw))
+    a0 = to_signed(a0_raw)
+    
+    # a1: objectness (e1)
+    a1 = math.tanh((tf.mean_comp_in - 1) / 5.0)
+    
+    # a2: symmetry strength (e2)
+    sym_sum = tf.mean_symH + tf.mean_symV + tf.mean_symR
+    a2 = to_signed(sym_sum / 3.0)
+    
+    # a3: rigid transform prior (e3)
+    a3 = to_signed(tf.mean_rigid_iou)
+    
+    # a4: alignment prior (e4)
+    if tf.mean_centroid_corr is not None:
+        a4 = max(-1.0, min(1.0, tf.mean_centroid_corr))
+    else:
+        a4 = 0.0
+    
+    # a5: palette delta (e5)
+    set_in = set(tf.pal_union_in)
+    set_out = set(tf.pal_union_out)
+    
+    if len(set_in | set_out) > 0:
+        jaccard = len(set_in & set_out) / len(set_in | set_out)
+    else:
+        jaccard = 1.0
+    
+    sign = 1.0 if len(set_out) >= len(set_in) else -1.0
+    if len(set_out) == len(set_in):
+        sign = 1.0
+    
+    a5 = sign * (1.0 - jaccard)
+    
+    # a6: recursion/stability prior (e6)
+    a6 = to_signed(tf.mean_stable_gain)
+    
+    # a7: bridge/interference prior (e7)
+    family_vectors = []
+    for p in tf.pairs:
+        geom = 1 if p.rigid_fit_iou > 0.5 else 0
+        pal_changed = len(set(p.pal_in) ^ set(p.pal_out)) > 0
+        palette_fam = 1 if pal_changed else 0
+        recursion = 1 if p.stable_gain > 0.2 else 0
+        counting = 1 if abs(p.comp_out - p.comp_in) != 0 else 0
+        
+        family_vectors.append([geom, palette_fam, recursion, counting])
+    
+    if len(family_vectors) > 1:
+        fam_array = np.array(family_vectors, dtype=float)
+        var = np.var(fam_array, axis=0).sum() / 4.0
+        var = min(1.0, var)
+    else:
+        var = 0.0
+    
+    a7 = to_signed(var)
+    
+    # Build octonion
+    phi_oct = Octonion(a0, a1, a2, a3, a4, a5, a6, a7)
+    phi_oct = phi_oct.normalize()
+    
+    # Slice selection: pick slice that maximizes weighted sum of components
+    best_score = -1.0
+    best_slice = WILSON_TRIPLES[0]
+    
+    arr = phi_oct.to_array()
+    
+    for triple in WILSON_TRIPLES:
+        i, j, k = triple
+        slice_score = 0.0
+        if 3 in triple: slice_score += 0.35 * arr[3]**2  # a3 (geometry)
+        if 5 in triple: slice_score += 0.25 * arr[5]**2  # a5 (palette)
+        if 6 in triple: slice_score += 0.20 * arr[6]**2  # a6 (recursion)
+        if 4 in triple: slice_score += 0.20 * arr[4]**2  # a4 (alignment)
+        
+        if slice_score > best_score:
+            best_score = slice_score
+            best_slice = triple
+    
+    return Phi(oct=phi_oct, slice_star=best_slice)
+
+
+# ============================================================================
+# ============ guidance/tension.py ============
+# ============================================================================
+
+@dataclass
+class TensionState:
+    """
+    Octonionic Control Overlay (OCO) tension tracking state.
+    
+    Tracks associator tension (program composability) and slice deviation
+    (context thrashing) via exponential moving averages.
+    """
+    slice_star: Tuple[int, int, int]
+    alpha: float = 0.30
+    T_prog_ema: float = 0.0
+    T_slice_ema: float = 0.0
+    last_q: deque = field(default_factory=lambda: deque(maxlen=3))
+    Q_code: Optional[Octonion] = None
+    step_count: int = 0
+    tension_spikes: int = 0
+    
+    def copy(self) -> 'TensionState':
+        """Create a copy for child nodes in search."""
+        new_state = TensionState(
+            slice_star=self.slice_star,
+            alpha=self.alpha,
+            T_prog_ema=self.T_prog_ema,
+            T_slice_ema=self.T_slice_ema,
+            last_q=deque(self.last_q, maxlen=3),
+            Q_code=self.Q_code,
+            step_count=self.step_count,
+            tension_spikes=self.tension_spikes
+        )
+        return new_state
+
+
+def init_tension_state(slice_star: Tuple[int, int, int], alpha: float = 0.30) -> TensionState:
+    """Initialize tension state for a new search."""
+    return TensionState(slice_star=slice_star, alpha=alpha)
+
+
+def update_tension(state: TensionState, op_name: str) -> Tuple[float, float]:
+    """
+    Update tension state after appending one operation.
+    
+    Computes:
+    - Local associator tension: T_t = ||[q_{t-2}, q_{t-1}, q_t]|| (imaginary norm)
+    - Slice tension: T_slice = ||q_t - Proj_slice*(q_t)||
+    - Updates EMAs
+    
+    Returns:
+        (T_prog_ema, T_slice_ema) after update
+    """
+    # Get unit octonion code for this operation
+    q = get_qcode(op_name)
+    state.last_q.append(q)
+    state.step_count += 1
+    
+    # Compute local associator tension (needs 3 ops)
+    T_local = 0.0
+    if len(state.last_q) == 3:
+        a, b, c = state.last_q[0], state.last_q[1], state.last_q[2]
+        assoc = associator(a, b, c)
+        
+        # Imaginary-only norm (scar magnitude)
+        arr = assoc.to_array()
+        T_local = float(np.linalg.norm(arr[1:]))
+    
+    # Compute slice tension: distance from op to quaternion slice
+    q_proj = project_to_slice(q, state.slice_star)
+    diff = q.to_array() - q_proj.to_array()
+    T_slice = float(np.linalg.norm(diff[1:]))
+    
+    # Update EMAs
+    a = state.alpha
+    state.T_prog_ema = (1 - a) * state.T_prog_ema + a * T_local
+    state.T_slice_ema = (1 - a) * state.T_slice_ema + a * T_slice
+    
+    # Track tension spikes
+    if state.T_prog_ema > 0.6:
+        state.tension_spikes += 1
+    
+    # Update running program code
+    if state.Q_code is None:
+        state.Q_code = q
+    else:
+        state.Q_code = oct_mul(state.Q_code, q)
+    
+    return state.T_prog_ema, state.T_slice_ema
+
+
+def tension_penalty(state: TensionState, 
+                   lambda1: float = 0.30, 
+                   lambda2: float = 0.20) -> float:
+    """Compute tension penalty term for cost function."""
+    return lambda1 * state.T_prog_ema + lambda2 * state.T_slice_ema
+
+
+def total_cost(pixel_loss: float, 
+               prog_len: int, 
+               state: TensionState,
+               lambda_len: float = 0.20,
+               lambda1: float = 0.30,
+               lambda2: float = 0.20) -> float:
+    """
+    Compute total cost for beam search priority.
+    
+    Formula:
+        cost = pixel_loss + λ_len·|P| + λ1·T_prog + λ2·T_slice
+        
+    Where:
+        - pixel_loss: normalized Hamming distance
+        - |P|: program length
+        - T_prog: associator tension (non-associativity)
+        - T_slice: slice deviation (context thrashing)
+    """
+    len_penalty = lambda_len * prog_len
+    tension_pen = tension_penalty(state, lambda1, lambda2)
+    
+    return float(pixel_loss + len_penalty + tension_pen)
+
+
+# Operation family mapping for OCO overlay
+OCO_FAMILY_AXES = {
+    "geom": 3,      # e3
+    "align": 4,     # e4
+    "palette": 5,   # e5
+    "recursion": 6, # e6
+    "masks": 1,     # e1
+}
+
+OP_FAMILY_MAP = {
+    "rotate90": "geom",
+    "flip": "geom",
+    "translate": "align",
+    "recolor": "palette",
+    "palette_map": "palette",
+    "fill_bbox": "palette",
+    "components": "masks",
+    "largest": "masks",
+    "smallest": "masks",
+    "dilate": "masks",
+    "erode": "masks",
+    "union": "masks",
+    "intersect": "masks",
+    "subtract": "masks",
+    "extract": "align",
+    "place": "align",
+    "center_on": "align",
+    "map_over": "recursion",
+    "repeat_until_stable": "recursion",
+    "mask_color": "palette",
+    "mask_not_color": "palette",
+    "bbox": "masks",
+    "symmetry_axes": "geom",
+    "dominant_color": "palette",
+    "count": "recursion",
+    "area": "recursion",
+}
+
+
+def get_op_family(op_name: str) -> str:
+    """Get family classification for an operation."""
+    return OP_FAMILY_MAP.get(op_name, "other")
+
+
+# ################################################################################
+# ##                                                                            ##
+# ##  SECTION 6: SEARCH ENGINE                                                 ##
+# ##  OCO-guided beam search with controller rotation                          ##
+# ##                                                                            ##
+# ################################################################################
+
+# ============================================================================
+# ============ search/settings.py ============
+# ============================================================================
+
+@dataclass
+class SearchSettings:
+    """Configuration for OCO-guided beam search."""
+    beam_width: int = 128
+    max_depth: int = 10
+    max_expansions: int = 200_000
+    max_seconds: float = 120.0
+    
+    lambda_len: float = 0.20
+    lambda1: float = 0.30
+    lambda2: float = 0.20
+    
+    allow_offslice_early: bool = False
+    slice_guard_thresh: float = 0.40
+    max_children_per_node: int = 256
+    
+    seed: int = 1337
+    public_mode: bool = True
+    log_every: int = 1000
+    
+    _beam_boost: int = 0
+    _beam_boost_until: int = 0
+
+DEFAULTS = SearchSettings()
+
+
+# ============================================================================
+# ============ search/beam.py ============
+# ============================================================================
+
+@dataclass
+class SearchNode:
+    """Node in beam search tree with OCO tension tracking."""
+    program: Program
+    out_trains: List[np.ndarray]
+    tension: TensionState
+    pixel_loss: float
+    cost: float
+    signature: Tuple
+    depth: int
+
+
+def make_root_node(trains, phi, settings) -> SearchNode:
+    """Create root node from input grids."""
+    out_trains = [x.copy() for (x, _) in trains]
+    tension = init_tension_state(slice_star=phi.slice_star, alpha=0.30)
+    pixel_loss = mean_hamming(out_trains, [y for (_, y) in trains])
+    prog = Program(ops=tuple())
+    sig = multi_signature(out_trains)
+    cost = total_cost(pixel_loss, 0, tension, 
+                     settings.lambda_len, settings.lambda1, settings.lambda2)
+    
+    return SearchNode(prog, out_trains, tension, pixel_loss, cost, sig, depth=0)
+
+
+def mean_hamming(preds: List[np.ndarray], truths: List[np.ndarray]) -> float:
+    """Compute normalized Hamming distance across all pairs."""
+    total, denom = 0, 0
+    for p, t in zip(preds, truths):
+        if p.shape != t.shape:
+            return 1.0
+        diff = (p != t).sum()
+        total += diff
+        denom += p.size
+    
+    return 0.0 if denom == 0 else float(total / denom)
+
+
+def multi_signature(grids: List[np.ndarray]) -> Tuple:
+    """Compute tuple of signatures for deduplication."""
+    return tuple(struct_signature(g) for g in grids)
+
+
+def select_beam(nodes: List[SearchNode], k: int) -> List[SearchNode]:
+    """Select top k nodes by cost with deterministic tie-breaking."""
+    sorted_nodes = sorted(nodes, key=lambda n: (n.cost, n.depth, len(n.program.ops), n.signature))
+    return sorted_nodes[:k]
+
+
+def beam_search(trains: List[Tuple[np.ndarray, np.ndarray]], 
+                settings: SearchSettings = None) -> Tuple[Optional[Program], Dict]:
+    """
+    Main OCO-guided beam search with controller rotation.
+    
+    Algorithm:
+    1. Compute φ embedding from task features
+    2. Initialize controller (Observer mode)
+    3. Beam search loop:
+       - Expand frontier nodes (OCO-guided operation selection)
+       - Track tension and update cost
+       - Prune duplicates
+       - Check rotation triggers
+    4. Return best program or None
+    """
+    settings = settings or DEFAULTS
+    
+    # Phase 1: Compute task embedding
+    tf = task_features(trains)
+    phi = compute_phi(tf)
+    
+    # Phase 2: Initialize controller and root
+    ctrl = init_controller(settings, phi)
+    root = make_root_node(trains, phi, settings)
+    
+    # Phase 3: Beam search loop
+    frontier = [root]
+    best = root
+    expansions = 0
+    start_time = time.time()
+    iterations = 0
+    
+    while frontier:
+        iterations += 1
+        
+        if expansions >= settings.max_expansions:
+            break
+        if (time.time() - start_time) >= settings.max_seconds:
+            break
+        
+        effective_beam = settings.beam_width + settings._beam_boost
+        frontier = select_beam(frontier, effective_beam)
+        
+        if settings._beam_boost > 0 and expansions >= settings._beam_boost_until:
+            settings._beam_boost = 0
+        
+        if iterations % settings.log_every == 0:
+            log_step(iterations, best, ctrl, settings)
+        
+        new_frontier = []
+        for node in frontier:
+            if node.pixel_loss == 0.0:
+                print(f"✓ Solution found at depth {node.depth}")
+                return node.program, collect_stats(ctrl, node, expansions)
+            
+            if node.depth >= settings.max_depth:
+                continue
+            
+            children = expand_node(node, trains, phi, settings, ctrl)
+            
+            for ch in children:
+                if ch.cost < best.cost:
+                    best = ch
+            
+            new_frontier.extend(children)
+            expansions += len(children)
+        
+        ctrl = maybe_rotate_controller(ctrl, best, expansions)
+        apply_controller_effects(ctrl, settings)
+        frontier = prune_frontier(new_frontier, settings)
+    
+    final_prog = best.program if best.pixel_loss < 1.0 else None
+    return final_prog, collect_stats(ctrl, best, expansions)
+
+
+def collect_stats(ctrl, best_node, expansions) -> Dict:
+    """Collect search statistics."""
+    return {
+        'expansions': expansions,
+        'rotations': ctrl.rotations,
+        'best_loss': best_node.pixel_loss,
+        'best_cost': best_node.cost,
+        'final_depth': best_node.depth,
+        'final_T_prog': best_node.tension.T_prog_ema,
+        'final_T_slice': best_node.tension.T_slice_ema,
+    }
+
+
+def solve_task(trains: List[Tuple[np.ndarray, np.ndarray]],
+               tests: List[np.ndarray],
+               settings: SearchSettings = None) -> List[np.ndarray]:
+    """Top-level API: solve task and return predictions."""
+    settings = settings or DEFAULTS
+    best_prog, stats = beam_search(trains, settings)
+    
+    if best_prog is not None:
+        return [run_program(best_prog, t) for t in tests]
+    else:
+        return [t.copy() for t in tests]
+
+
+# ============================================================================
+# ============ search/expand.py ============
+# ============================================================================
+
+def expand_node(node: SearchNode, trains, phi, settings, ctrl) -> List[SearchNode]:
+    """Expand node by trying all candidate operations."""
+    children = []
+    
+    for op_name, args in enumerate_actions(node, trains, phi, settings, ctrl):
+        ch = apply_one(node, op_name, args, trains, phi, settings)
+        
+        if ch is not None:
+            children.append(ch)
+        
+        if len(children) >= settings.max_children_per_node:
+            break
+    
+    return children
+
+
+def family_weights_from_phi(phi) -> Dict[str, float]:
+    """Compute family weights from φ embedding components."""
+    arr = phi.oct.to_array()
+    
+    return {
+        'palette': abs(arr[5]),   # e5
+        'geom': abs(arr[3]),      # e3
+        'align': abs(arr[4]),     # e4
+        'recursion': abs(arr[6]), # e6
+        'masks': abs(arr[1]),     # e1
+    }
+
+
+def order_families(base_weights: Dict[str, float], ctrl) -> List[str]:
+    """Order families by weight with controller reweights applied."""
+    weights = base_weights.copy()
+    
+    if ctrl.family_weights:
+        for fam, mult in ctrl.family_weights.items():
+            if fam in weights:
+                weights[fam] *= mult
+    
+    families = sorted(weights.keys(), key=lambda f: (-weights[f], f))
+    return families
+
+
+def enumerate_actions(node, trains, phi, settings, ctrl) -> Iterable[Tuple[str, tuple]]:
+    """Enumerate candidate operations ordered by family priors."""
+    base_weights = family_weights_from_phi(phi)
+    families = order_families(base_weights, ctrl)
+    
+    pal_union_in = sorted(set().union(*[set(palette(x)) for x, _ in trains]))
+    pal_union_out = sorted(set().union(*[set(palette(y)) for _, y in trains]))
+    
+    pal_in = pal_union_in[:6]
+    pal_out = pal_union_out[:6]
+    
+    family_ops = {}
+    
+    # Geometry
+    geom_ops = [
+        ("rotate90", (1,)),
+        ("rotate90", (2,)),
+        ("rotate90", (3,)),
+        ("flip", ("H",)),
+        ("flip", ("V",)),
+    ]
+    for d in [-2, -1, 1, 2]:
+        geom_ops.append(("translate", (d, 0)))
+        geom_ops.append(("translate", (0, d)))
+    family_ops['geom'] = geom_ops
+    
+    # Palette
+    pal_ops = []
+    for c in pal_out[:3]:
+        pal_ops.append(("recolor", (c,)))
+    family_ops['palette'] = pal_ops
+    
+    # Alignment
+    align_ops = [
+        ("center_on", ("center",)),
+    ]
+    family_ops['align'] = align_ops
+    
+    # Masks
+    mask_ops = [
+        ("components", (4,)),
+        ("largest", ()),
+        ("smallest", ()),
+    ]
+    for c in pal_in[:3]:
+        mask_ops.append(("mask_color", (c,)))
+    family_ops['masks'] = mask_ops
+    
+    # Recursion
+    rec_ops = []
+    if ctrl.allow_recursion:
+        rec_ops.append(("repeat_until_stable", (tuple(), 3)))
+    family_ops['recursion'] = rec_ops
+    
+    for fam in families:
+        for op_spec in family_ops.get(fam, []):
+            yield op_spec
+
+
+def copy_tension(parent_tension):
+    """Copy tension state for child node."""
+    return parent_tension.copy()
+
+
+def apply_one(parent: SearchNode, op_name: str, args: tuple, 
+              trains, phi, settings) -> Optional[SearchNode]:
+    """Apply one operation to create child node."""
+    # Off-slice gating
+    if (not settings.allow_offslice_early and 
+        parent.tension.T_slice_ema > settings.slice_guard_thresh):
+        if get_op_family(op_name) not in ['geom', 'align', 'masks']:
+            return None
+    
+    # Build child program
+    child_prog = Program(ops=parent.program.ops + (Op(op_name, args),))
+    
+    # Recompute outputs by running the FULL child program on each input
+    new_outs = []
+    try:
+        for (x, _y) in trains:
+            g = run_program(child_prog, x)
+            new_outs.append(g)
+    except Exception:
+        return None
+    
+    # Compute new loss
+    pixel_loss = mean_hamming(new_outs, [y for _, y in trains])
+    
+    # Update tension
+    tension = copy_tension(parent.tension)
+    update_tension(tension, op_name)
+    
+    # Compute cost
+    prog_len = parent.depth + 1
+    cost = total_cost(pixel_loss, prog_len, tension,
+                     settings.lambda_len, settings.lambda1, settings.lambda2)
+    
+    if not np.isfinite(cost):
+        return None
+    
+    sig = multi_signature(new_outs)
+    
+    return SearchNode(child_prog, new_outs, tension, pixel_loss, cost, sig, parent.depth + 1)
+
+
+# ============================================================================
+# ============ search/prune.py ============
+# ============================================================================
+
+def stable_tiebreak(node: SearchNode) -> Tuple:
+    """Deterministic tie-breaker for node ordering."""
+    return (len(node.program.ops), node.signature)
+
+
+def prune_frontier(nodes: List[SearchNode], settings) -> List[SearchNode]:
+    """Deduplicate frontier by signature, keeping lowest cost."""
+    best_by_key: Dict[Tuple, SearchNode] = {}
+    
+    for node in sorted(nodes, key=lambda n: (n.cost, stable_tiebreak(n))):
+        key = (node.signature, node.depth)
+        
+        if key not in best_by_key:
+            best_by_key[key] = node
+        elif node.cost < best_by_key[key].cost:
+            best_by_key[key] = node
+    
+    return list(best_by_key.values())
+
+
+# ============================================================================
+# ============ search/controller.py ============
+# ============================================================================
+
+@dataclass
+class ControllerState:
+    """Controller rotation state (public-facing triality adaptation)."""
+    phi: object
+    slice_star: Tuple[int, int, int]
+    
+    best_loss: float = 1.0
+    last_best_at: int = 0
+    expansions: int = 0
+    
+    cooldown_until: int = 0
+    rotations: int = 0
+    
+    family_weights: Dict[str, float] = field(default_factory=dict)
+    allow_recursion: bool = False
+    disable_rotation: bool = False
+    
+    stall_steps: int = 2000
+    min_omega_gain_1k: float = 0.02
+    prog_tension_thresh: float = 0.60
+    slice_tension_thresh: float = 0.40
+    
+    _high_tension_since: int = 0
+    _omega_history: List[Tuple[int, float]] = field(default_factory=list)
+
+
+def init_controller(settings, phi) -> ControllerState:
+    """Initialize controller state (starts in Observer mode)."""
+    return ControllerState(
+        phi=phi,
+        slice_star=phi.slice_star,
+        disable_rotation=getattr(settings, "_disable_rotation", False)
+    )
+
+
+def maybe_rotate_controller(ctrl: ControllerState, 
+                           best_node: SearchNode, 
+                           expansions: int) -> ControllerState:
+    """
+    Check rotation triggers and apply triality transformations.
+    
+    Three rotation types (inspired by Spin(8) triality):
+    - R1 (Slice Switch): Change quaternion subspace when slice tension high
+    - R2 (Navigator): Reweight operation families when program tension plateaus
+    - R3 (Explorer): Enable recursion burst when search stalls
+    """
+    # Check if rotation is disabled
+    if getattr(ctrl, "disable_rotation", False):
+        return ctrl
+    
+    # Update tracking
+    ctrl.expansions = expansions
+    
+    if best_node.pixel_loss < ctrl.best_loss:
+        ctrl.best_loss = best_node.pixel_loss
+        ctrl.last_best_at = expansions
+    
+    omega = 1.0 - best_node.pixel_loss
+    ctrl._omega_history.append((expansions, omega))
+    if len(ctrl._omega_history) > 2000:
+        ctrl._omega_history.pop(0)
+    
+    if expansions < ctrl.cooldown_until:
+        return ctrl
+    
+    # === TRIGGER 1: R1 Slice Switch (context thrashing) ===
+    slice_mismatch = (best_node.tension.T_slice_ema > ctrl.slice_tension_thresh and
+                     best_node.pixel_loss > 0.35)
+    
+    if slice_mismatch:
+        apply_R1_slice_switch(ctrl)
+        return ctrl
+    
+    # === TRIGGER 2: R2 Navigator Mode (tension plateau) ===
+    high_tension_plateau = False
+    if best_node.tension.T_prog_ema > ctrl.prog_tension_thresh:
+        if ctrl._high_tension_since == 0:
+            ctrl._high_tension_since = expansions
+        elif (expansions - ctrl._high_tension_since) >= 500:
+            high_tension_plateau = True
+    else:
+        ctrl._high_tension_since = 0
+    
+    if high_tension_plateau:
+        apply_R2_family_reweight(ctrl)
+        return ctrl
+    
+    # === TRIGGER 3: R3 Explorer Mode (search stall) ===
+    no_improve_steps = expansions - ctrl.last_best_at
+    stall = False
+    if no_improve_steps >= ctrl.stall_steps:
+        hist_1k_ago = [h for h in ctrl._omega_history if h[0] <= expansions - 1000]
+        if hist_1k_ago:
+            omega_1k_ago = hist_1k_ago[-1][1]
+            gain = omega - omega_1k_ago
+            if gain < ctrl.min_omega_gain_1k:
+                stall = True
+    
+    if stall:
+        apply_R3_exploration_burst(ctrl)
+        return ctrl
+    
+    return ctrl
+
+
+def apply_R1_slice_switch(ctrl: ControllerState):
+    """
+    R1: Slice Switch (Vector representation in triality)
+    
+    When slice tension is high (operations drifting outside quaternion slice),
+    rotate to next Fano plane slice. Like changing coordinate system.
+    """
+    current_idx = WILSON_TRIPLES.index(ctrl.slice_star) if ctrl.slice_star in WILSON_TRIPLES else 0
+    next_idx = (current_idx + 1) % len(WILSON_TRIPLES)
+    ctrl.slice_star = WILSON_TRIPLES[next_idx]
+    
+    ctrl.rotations += 1
+    ctrl.cooldown_until = ctrl.expansions + 1000
+    
+    print(f"  🔄 Controller R1: Slice switch to {ctrl.slice_star}")
+
+
+def apply_R2_family_reweight(ctrl: ControllerState):
+    """
+    R2: Navigator Mode (Left spinor in triality)
+    
+    When program tension plateaus (high associator but no progress),
+    reweight operation families to prefer geometry/alignment.
+    """
+    ctrl.family_weights = {
+        'recursion': 0.6,   # Downweight complex operations
+        'palette': 0.6,
+        'geom': 1.2,        # Upweight simple transformations
+        'align': 1.2,
+    }
+    
+    ctrl.rotations += 1
+    ctrl.cooldown_until = ctrl.expansions + 1000
+    
+    print(f"  🧭 Controller R2: Navigator mode (family reweight)")
+
+
+def apply_R3_exploration_burst(ctrl: ControllerState):
+    """
+    R3: Explorer Mode (Right spinor in triality)
+    
+    When search stalls completely, enable recursion and off-slice operations
+    for aggressive exploration. Temporary beam boost.
+    """
+    ctrl.allow_recursion = True
+    ctrl.rotations += 1
+    ctrl.cooldown_until = ctrl.expansions + 1000
+    
+    print(f"  🚀 Controller R3: Explorer mode (recursion burst)")
+
+
+def apply_controller_effects(ctrl: ControllerState, settings: SearchSettings):
+    """Apply controller state effects to search settings."""
+    if ctrl.rotations > 0 and ctrl.expansions < ctrl.cooldown_until:
+        steps_since_rotation = ctrl.cooldown_until - ctrl.expansions
+        
+        # R1: Beam boost during slice transition
+        if steps_since_rotation <= 500 and ctrl.slice_star != ctrl.phi.slice_star:
+            boost = int(settings.beam_width * 0.25)
+            settings._beam_boost = max(settings._beam_boost, boost)
+            settings._beam_boost_until = max(settings._beam_boost_until, 
+                                            ctrl.expansions + min(500, steps_since_rotation))
+        
+        # R3: Aggressive beam boost + off-slice during exploration
+        if ctrl.allow_recursion and steps_since_rotation <= 300:
+            boost = int(settings.beam_width * 0.50)
+            settings._beam_boost = max(settings._beam_boost, boost)
+            settings._beam_boost_until = max(settings._beam_boost_until,
+                                            ctrl.expansions + min(300, steps_since_rotation))
+            settings.allow_offslice_early = True
+        else:
+            if ctrl.allow_recursion and steps_since_rotation > 300:
+                ctrl.allow_recursion = False
+                settings.allow_offslice_early = False
+
+
+# ============================================================================
+# ============ search/logger.py ============
+# ============================================================================
+
+def controller_name(ctrl: ControllerState) -> str:
+    """Get current controller state name."""
+    if ctrl.family_weights:
+        return "Navigator"
+    elif ctrl.allow_recursion:
+        return "Explorer"
+    else:
+        return "Observer"
+
+
+def log_step(iter_idx: int, node: SearchNode, ctrl: ControllerState, settings: SearchSettings):
+    """Log search progress with public-facing terminology."""
+    controller = controller_name(ctrl)
+    
+    print(f"[{iter_idx}] "
+          f"Loss={node.pixel_loss:.3f} "
+          f"Cost={node.cost:.3f} "
+          f"Len={len(node.program.ops)} "
+          f"Controller={controller} "
+          f"Tension=({node.tension.T_prog_ema:.2f},{node.tension.T_slice_ema:.2f}) "
+          f"Beam={settings.beam_width + settings._beam_boost}")
+
+
+# ################################################################################
+# ##                                                                            ##
+# ##  SECTION 7: I/O & TELEMETRY                                               ##
+# ##  ARC dataset I/O + execution harness + logging                            ##
+# ##                                                                            ##
+# ################################################################################
+
+# ============================================================================
+# ============ io/arc_io.py ============
+# ============================================================================
+
+def load_task_json(path: str) -> dict:
+    """Load ARC task from JSON file."""
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def to_ndarray(grid) -> np.ndarray:
+    """Convert nested list to numpy array."""
+    return np.array(grid, dtype=int)
+
+
+def from_ndarray(grid: np.ndarray) -> list:
+    """Convert numpy array to nested list for JSON."""
+    return grid.tolist()
+
+
+def trains_from_task(task: dict) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Extract training pairs from task."""
+    pairs = []
+    for ex in task["train"]:
+        x = to_ndarray(ex["input"])
+        y = to_ndarray(ex["output"])
+        pairs.append((x, y))
+    return pairs
+
+
+def tests_from_task(task: dict) -> List[np.ndarray]:
+    """Extract test inputs from task."""
+    return [to_ndarray(ex["input"]) for ex in task["test"]]
+
+
+def load_tasks_from_dir(tasks_dir: str) -> List[Tuple[str, dict]]:
+    """Load all task JSONs from directory."""
+    files = sorted(glob.glob(os.path.join(tasks_dir, "*.json")))
+    tasks = []
+    for fp in files:
+        task_id = os.path.basename(fp).replace(".json", "")
+        task_json = load_task_json(fp)
+        tasks.append((task_id, task_json))
+    return tasks
+
+
+def write_submission_json(path: str, predictions: Dict[str, List[List[List[int]]]]) -> None:
+    """Write submission JSON in ARC Prize format."""
+    with open(path, "w") as f:
+        json.dump(predictions, f, indent=2)
+
+
+# ============================================================================
+# ============ io/runners.py ============
+# ============================================================================
+
+def fallback_guess(grid: np.ndarray) -> np.ndarray:
+    """Fallback policy when no solution found."""
+    return grid.copy()
+
+
+def solve_task_record(task_id: str, 
+                      task_json: dict, 
+                      settings,
+                      logger=None) -> Dict:
+    """Solve one task and return results dict."""
+    trains = trains_from_task(task_json)
+    tests = tests_from_task(task_json)
+    
+    t0 = time.time()
+    try:
+        preds = solve_task(trains, tests, settings=settings)
+    except Exception as e:
+        print(f"Error solving {task_id}: {e}", file=sys.stderr)
+        preds = [fallback_guess(t) for t in tests]
+    
+    dt = time.time() - t0
+    
+    return {
+        "task_id": task_id,
+        "preds": preds,
+        "seconds": dt,
+    }
+
+
+def run_dir(tasks_dir: str, 
+           settings,
+           max_tasks: Optional[int] = None,
+           logger=None) -> Dict[str, List[List[List[int]]]]:
+    """Run solver on all tasks in directory."""
+    tasks = load_tasks_from_dir(tasks_dir)
+    results = {}
+    
+    total = len(tasks)
+    if max_tasks:
+        total = min(total, max_tasks)
+    
+    print(f"Running {total} tasks from {tasks_dir}", file=sys.stderr)
+    
+    for i, (task_id, task_json) in enumerate(tasks):
+        if max_tasks and i >= max_tasks:
+            break
+        
+        print(f"\n[{i+1}/{total}] Task: {task_id}", file=sys.stderr)
+        
+        rec = solve_task_record(task_id, task_json, settings, logger)
+        
+        preds_list = [from_ndarray(p) if isinstance(p, np.ndarray) else p 
+                     for p in rec["preds"]]
+        
+        results[task_id] = preds_list
+        
+        if logger:
+            logger.task_summary(task_id, rec["seconds"])
+    
+    return results
+
+
+# ============================================================================
+# ============ telemetry/logger.py ============
+# ============================================================================
+
+class StepLogger:
+    """Dual-label logger with OCO telemetry."""
+    
+    def __init__(self, 
+                 public_mode: bool = True,
+                 jsonl_path: Optional[str] = None,
+                 every: int = 200):
+        self.public_mode = public_mode
+        self.jsonl_path = jsonl_path
+        self.every = every
+        self._start = time.time()
+        self._f = open(jsonl_path, "w") if jsonl_path else None
+    
+    def iter_log(self, iter_idx, node, ctrl, settings):
+        """Log search iteration progress."""
+        if iter_idx % self.every != 0:
+            return
+        
+        controller = self._controller_name(ctrl)
+        
+        line = {
+            "iter": iter_idx,
+            "loss": round(node.pixel_loss, 6),
+            "cost": round(node.cost, 6),
+            "len": len(node.program.ops),
+            "controller": controller,
+            "tension_prog": round(node.tension.T_prog_ema, 6),
+            "tension_slice": round(node.tension.T_slice_ema, 6),
+            "beam": settings.beam_width + settings._beam_boost,
+            "secs": round(time.time() - self._start, 2),
+        }
+        
+        msg = (f"[{iter_idx}] "
+               f"Loss={line['loss']:.3f} "
+               f"Cost={line['cost']:.3f} "
+               f"Len={line['len']} "
+               f"Controller={controller} "
+               f"Tension=({line['tension_prog']:.2f},{line['tension_slice']:.2f}) "
+               f"Beam={line['beam']}")
+        
+        print(msg, file=sys.stderr)
+        
+        if self._f:
+            self._f.write(json.dumps(line) + "\n")
+            self._f.flush()
+    
+    def task_summary(self, task_id: str, seconds: float):
+        """Log task completion."""
+        print(f"[TASK] {task_id} completed in {seconds:.2f}s", file=sys.stderr)
+    
+    def close(self):
+        """Close JSONL file if open."""
+        if self._f:
+            self._f.close()
+    
+    def _controller_name(self, ctrl) -> str:
+        """Get controller state name."""
+        if hasattr(ctrl, 'allow_recursion') and ctrl.allow_recursion:
+            return "Explorer"
+        elif hasattr(ctrl, 'family_weights') and ctrl.family_weights:
+            return "Navigator"
+        else:
+            return "Observer"
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+
+# ============================================================================
+# ============ telemetry/traces.py ============
+# ============================================================================
+
+def save_trace(task_id: str, 
+              program,
+              stats: Dict,
+              path: str):
+    """Save detailed trace for analysis."""
+    trace = {
+        "task_id": task_id,
+        "program_ops": [str(op) for op in program.ops] if program else [],
+        "program_len": len(program.ops) if program else 0,
+        "stats": stats,
+    }
+    
+    with open(path, "w") as f:
+        json.dump(trace, f, indent=2)
+
+
+# ################################################################################
+# ##                                                                            ##
+# ##  SECTION 8: EVALUATION & CLI                                              ##
+# ##  Metrics, ablations, and command-line interface                           ##
+# ##                                                                            ##
+# ################################################################################
+
+# ============================================================================
+# ============ eval/metrics.py ============
+# ============================================================================
+
+def exact_match(a: np.ndarray, b: np.ndarray) -> bool:
+    """Check if two grids are exactly equal."""
+    return a.shape == b.shape and np.array_equal(a, b)
+
+
+def pixel_accuracy(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute pixel-wise accuracy (0..1)."""
+    if a.shape != b.shape:
+        return 0.0
+    return 1.0 - float((a != b).sum()) / a.size
+
+
+def solve_rate(preds: List[np.ndarray], truths: List[np.ndarray]) -> float:
+    """Compute fraction of exactly matched examples."""
+    if not preds:
+        return 0.0
+    return float(np.mean([exact_match(p, t) for p, t in zip(preds, truths)]))
+
+
+def evaluate_task(preds: List[np.ndarray], 
+                 truths: List[np.ndarray]) -> Dict[str, float]:
+    """Comprehensive evaluation metrics for one task."""
+    if not preds or not truths:
+        return {"exact_match": 0.0, "pixel_accuracy": 0.0, "solve_rate": 0.0}
+    
+    exact = all(exact_match(p, t) for p, t in zip(preds, truths))
+    pixel_acc = np.mean([pixel_accuracy(p, t) for p, t in zip(preds, truths)])
+    solve = solve_rate(preds, truths)
+    
+    return {
+        "exact_match": float(exact),
+        "pixel_accuracy": float(pixel_acc),
+        "solve_rate": float(solve),
+    }
+
+
+# ============================================================================
+# ============ eval/ablations.py ============
+# ============================================================================
+
+def without_oco(settings):
+    """Disable OCO: no tension penalties."""
+    from dataclasses import replace
+    s = replace(settings)
+    s.lambda1 = 0.0
+    s.lambda2 = 0.0
+    return s
+
+
+def without_slice_guard(settings):
+    """Disable slice gating."""
+    from dataclasses import replace
+    s = replace(settings)
+    s.slice_guard_thresh = 1e9
+    s.allow_offslice_early = True
+    return s
+
+
+def without_rotation(settings):
+    """Disable controller rotations."""
+    from dataclasses import replace
+    s = replace(settings)
+    s._disable_rotation = True
+    return s
+
+
+def get_ablation_config(name: str, base_settings):
+    """Get settings for ablation experiment."""
+    ablations = {
+        "no_oco": without_oco,
+        "no_slice": without_slice_guard,
+        "no_rotation": without_rotation,
+    }
+    
+    if name == "baseline":
+        return base_settings
+    elif name in ablations:
+        return ablations[name](base_settings)
+    else:
+        raise ValueError(f"Unknown ablation: {name}")
+
+
+# ============================================================================
+# ============ cli/main.py ============
+# ============================================================================
+
+def main():
+    """Command-line interface for ARC-ONE solver."""
+    parser = argparse.ArgumentParser(
+        description="ARC-ONE: Octonionic Control Overlay Solver",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # OCO-guided two attempts (recommended)
+  python arc_one.py --tasks_dir ./arc_tasks --two_attempts --out submission.json
+  
+  # Two attempts with manual strategy (e.g., horizontal flip)
+  python arc_one.py --tasks_dir ./arc_tasks --two_attempts --attempt2_strategy flipH
+  
+  # Legacy single attempt (no change to file structure)
+  python arc_one.py --tasks_dir ./arc_tasks --out submission.json
+  
+  # Quick test with validation
+  python arc_one.py --tasks_dir ./arc_tasks --two_attempts --max_tasks 5
+  
+  # Ablation study
+  python arc_one.py --tasks_dir ./arc_tasks --ablation no_oco --out no_oco.json
+  
+  # With telemetry logging
+  python arc_one.py --tasks_dir ./arc_tasks --jsonl telemetry.jsonl --two_attempts
+        """
+    )
+    
+    # I/O
+    parser.add_argument("--tasks_dir", required=True,
+                       help="Directory containing task JSON files")
+    parser.add_argument("--out", default="submission.json",
+                       help="Output submission file")
+    parser.add_argument("--two_attempts", action="store_true",
+                       help="Output two attempts per test input (ARC 2025 schema).")
+    parser.add_argument("--attempt2_strategy", type=str, default="oco_auto",
+                       choices=["oco_auto","auto","rotate90","rot180","flipH","flipV","palette_swap","center","toward_input"],
+                       help="How to generate attempt_2.")
+    
+    # Limits
+    parser.add_argument("--max_tasks", type=int, default=None,
+                       help="Max number of tasks to solve")
+    
+    # Search settings
+    parser.add_argument("--beam", type=int, default=128,
+                       help="Beam width (default: 128)")
+    parser.add_argument("--depth", type=int, default=10,
+                       help="Max program depth (default: 10)")
+    parser.add_argument("--seconds", type=float, default=120.0,
+                       help="Max seconds per task (default: 120)")
+    
+    # OCO settings
+    parser.add_argument("--lambda_len", type=float, default=0.20,
+                       help="Length penalty weight (default: 0.20)")
+    parser.add_argument("--lambda1", type=float, default=0.30,
+                       help="Program tension weight (default: 0.30)")
+    parser.add_argument("--lambda2", type=float, default=0.20,
+                       help="Slice tension weight (default: 0.20)")
+    
+    # Ablations
+    parser.add_argument("--ablation", type=str, default=None,
+                       choices=["no_oco", "no_slice", "no_rotation"],
+                       help="Run ablation experiment")
+    
+    # Logging
+    parser.add_argument("--public_mode", action="store_true",
+                       help="Use public-facing terminology in logs")
+    parser.add_argument("--log_every", type=int, default=200,
+                       help="Log every N iterations (default: 200)")
+    parser.add_argument("--jsonl", type=str, default=None,
+                       help="Path for JSONL telemetry log")
+    
+    # Determinism
+    parser.add_argument("--seed", type=int, default=1337,
+                       help="Random seed for determinism (default: 1337)")
+    
+    args = parser.parse_args()
+    
+    # Banner
+    print("=" * 80)
+    print("ARC-ONE: Octonionic Control Overlay for Abstract Reasoning")
+    print("=" * 80)
+    print(f"Configuration:")
+    print(f"  Beam width: {args.beam}")
+    print(f"  Max depth: {args.depth}")
+    print(f"  Max seconds: {args.seconds}")
+    print(f"  OCO penalties: λ_len={args.lambda_len}, λ1={args.lambda1}, λ2={args.lambda2}")
+    if args.two_attempts:
+        print(f"  Two attempts mode: {args.attempt2_strategy}")
+    if args.ablation:
+        print(f"  Ablation: {args.ablation}")
+    print("=" * 80)
+    
+    # Build settings
+    settings = SearchSettings(
+        beam_width=args.beam,
+        max_depth=args.depth,
+        max_seconds=args.seconds,
+        lambda_len=args.lambda_len,
+        lambda1=args.lambda1,
+        lambda2=args.lambda2,
+        public_mode=args.public_mode,
+        log_every=args.log_every,
+        seed=args.seed,
+    )
+    
+    # Apply ablation if specified
+    if args.ablation:
+        print(f"\n⚠️  Running ablation: {args.ablation}\n")
+        settings = get_ablation_config(args.ablation, settings)
+    
+    # Resolve tasks dir (robust against nested competition paths in Kaggle)
+    resolved_tasks_dir = _find_arc_tasks_dir_fallback(args.tasks_dir)
+    if resolved_tasks_dir != args.tasks_dir:
+        print(f"📁 Auto-detected ARC tasks at: {resolved_tasks_dir}\n")
+    
+    # Run solver
+    with StepLogger(args.public_mode, args.jsonl, args.log_every) as logger:
+        results = run_dir(resolved_tasks_dir, settings, args.max_tasks, logger)
+    
+    # Build final predictions object (single- or two-attempts)
+    if args.two_attempts:
+        predictions = _two_attempts_from_results(
+            results,
+            tasks_dir=resolved_tasks_dir,
+            strategy=args.attempt2_strategy
+        )
+    else:
+        predictions = results  # legacy single-output-per-test schema
+    
+    # Write submission (function dumps whatever dict we pass)
+    write_submission_json(args.out, predictions)
+    
+    # Summary
+    print("\n" + "=" * 80)
+    print(f"✅ COMPLETE!")
+    print("=" * 80)
+    print(f"  Output: {args.out}")
+    print(f"  Tasks: {len(results)}")
+    if args.two_attempts:
+        print(f"  Format: Two attempts ({args.attempt2_strategy})")
+    if args.jsonl:
+        print(f"  Telemetry: {args.jsonl}")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    # Check for test mode
+    if os.environ.get("ARC_ONE_RUN_TESTS") == "1":
+        print("Test mode not included in this artifact - run tests separately")
+        print("To use the solver, run: python arc_one.py --tasks_dir <path>")
+    else:
+        main()
