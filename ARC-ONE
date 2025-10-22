@@ -15,7 +15,27 @@ Complete implementation of M1-M7:
 Total: ~4200 lines of production-ready code
 """
 
-import numpy as np
+_NUMPY_IMPORT_ERROR = (
+    "ARC-ONE requires the 'numpy' package. Install it with `pip install numpy` "
+    "or ensure it is available in your execution environment before running the solver."
+)
+
+try:
+    import numpy as np  # type: ignore
+    _NUMPY_AVAILABLE = True
+except ModuleNotFoundError:  # pragma: no cover - depends on environment
+    _NUMPY_AVAILABLE = False
+
+    class _MissingNumpy:
+        """Proxy that surfaces a helpful error message when numpy is absent."""
+
+        class ndarray:  # minimal stand-in for isinstance checks
+            pass
+
+        def __getattr__(self, name):
+            raise ModuleNotFoundError(_NUMPY_IMPORT_ERROR)
+
+    np = _MissingNumpy()  # type: ignore
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Any, Set, Iterable
 from collections import deque, defaultdict
@@ -29,6 +49,234 @@ import argparse
 import tempfile
 import shutil
 import hashlib
+
+
+# ==================================================================================
+# OCO-GUIDED TWO-ATTEMPTS HELPERS (Attempt 2 generation + robust task dir resolve)
+# ==================================================================================
+
+def _symmetry_flags_np(grid_ll):
+    g = np.array(grid_ll)
+    H = int(np.array_equal(g, np.fliplr(g)))
+    V = int(np.array_equal(g, np.flipud(g)))
+    R = int(np.array_equal(g, np.rot90(g, 2)))
+    return H, V, R
+
+
+def _center_on_mass_np(grid_ll):
+    g = np.array(grid_ll)
+    mask = (g != 0)
+    if not mask.any():
+        return g.tolist()
+    ys, xs = np.where(mask)
+    cy, cx = int(np.round(ys.mean())), int(np.round(xs.mean()))
+    H, W = g.shape
+    ty = (H // 2) - cy
+    tx = (W // 2) - cx
+    out = np.zeros_like(g)
+    y_src0 = max(0, -ty)
+    y_dst0 = max(0, ty)
+    x_src0 = max(0, -tx)
+    x_dst0 = max(0, tx)
+    h = min(H - y_dst0, H - y_src0)
+    w = min(W - x_dst0, W - x_src0)
+    if h > 0 and w > 0:
+        out[y_dst0:y_dst0 + h, x_dst0:x_dst0 + w] = g[y_src0:y_src0 + h, x_src0:x_src0 + w]
+    return out.tolist()
+
+
+def _translate_toward_input_centroid_np(pred_ll, x_in_ll):
+    g = np.array(pred_ll)
+    xin = np.array(x_in_ll)
+    if not (g != 0).any() or not (xin != 0).any():
+        return g.tolist()
+    yP, xP = np.where(g != 0)
+    yX, xX = np.where(xin != 0)
+    cyP, cxP = int(np.round(yP.mean())), int(np.round(xP.mean()))
+    cyX, cxX = int(np.round(yX.mean())), int(np.round(xX.mean()))
+    ty, tx = (cyX - cyP), (cxX - cxP)
+    out = np.zeros_like(g)
+    H, W = g.shape
+    y_src0 = max(0, -ty)
+    y_dst0 = max(0, ty)
+    x_src0 = max(0, -tx)
+    x_dst0 = max(0, tx)
+    h = min(H - y_dst0, H - y_src0)
+    w = min(W - x_dst0, W - x_src0)
+    if h > 0 and w > 0:
+        out[y_dst0:y_dst0 + h, x_dst0:x_dst0 + w] = g[y_src0:y_src0 + h, x_src0:x_src0 + w]
+    return out.tolist()
+
+
+def _palette_map_from_train_pairs(train_pairs):
+    if not train_pairs:
+        return {}
+    tally = {}
+    for x, y in train_pairs:
+        x = np.asarray(x)
+        y = np.asarray(y)
+        for c in np.unique(x):
+            mask = (x == c)
+            ys = y[mask]
+            if ys.size == 0:
+                continue
+            vals, cnts = np.unique(ys, return_counts=True)
+            target = int(vals[np.argmax(cnts)])
+            tally.setdefault(int(c), {}).setdefault(target, 0)
+            tally[int(c)][target] += int(cnts.max())
+    mapping = {c: max(v.items(), key=lambda kv: kv[1])[0] for c, v in tally.items()}
+    if 0 in mapping and mapping[0] == 0:
+        mapping.pop(0, None)
+    return mapping
+
+
+def _apply_palette_map_ll(grid_ll, mapping):
+    if not mapping:
+        return grid_ll
+    g = np.array(grid_ll, copy=True)
+    for src, dst in mapping.items():
+        g[g == src] = dst
+    return g.tolist()
+
+
+def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_ll):
+    g = np.array(att1_ll)
+
+    if strategy == "rotate90":
+        return np.rot90(g, 1).tolist()
+    if strategy == "rot180":
+        return np.rot90(g, 2).tolist()
+    if strategy == "flipH":
+        return np.fliplr(g).tolist()
+    if strategy == "flipV":
+        return np.flipud(g).tolist()
+    if strategy == "center":
+        return _center_on_mass_np(att1_ll)
+    if strategy == "toward_input":
+        if test_input_ll is None:
+            return att1_ll
+        return _translate_toward_input_centroid_np(att1_ll, test_input_ll)
+    if strategy == "palette_swap":
+        mapping = _palette_map_from_train_pairs(train_pairs or [])
+        return _apply_palette_map_ll(att1_ll, mapping)
+
+    if strategy == "auto":
+        if test_input_ll is not None:
+            Hs, Vs, Rs = _symmetry_flags_np(test_input_ll)
+            if Hs and not Vs:
+                return np.fliplr(g).tolist()
+            if Vs and not Hs:
+                return np.flipud(g).tolist()
+            if Rs:
+                return np.rot90(g, 2).tolist()
+        if g.shape[0] == g.shape[1]:
+            return np.rot90(g, 1).tolist()
+        return _center_on_mass_np(att1_ll)
+
+    if strategy == "oco_auto":
+        if phi_arr is None or len(phi_arr) != 8:
+            return _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
+        a = np.abs(np.array(phi_arr))
+        scores = {"geom": float(a[3]), "palette": float(a[5]), "align": float(a[4]), "objectness": float(a[1])}
+        fam = max(scores.items(), key=lambda kv: kv[1])[0]
+        if fam == "geom":
+            if test_input_ll is not None:
+                Hs, Vs, Rs = _symmetry_flags_np(test_input_ll)
+                if Rs:
+                    return np.rot90(g, 2).tolist()
+                if Hs and not Vs:
+                    return np.fliplr(g).tolist()
+                if Vs and not Hs:
+                    return np.flipud(g).tolist()
+            return np.rot90(g, 1).tolist()
+        if fam == "palette":
+            mapping = _palette_map_from_train_pairs(train_pairs or [])
+            if mapping:
+                return _apply_palette_map_ll(att1_ll, mapping)
+            return _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
+        if fam == "align":
+            return _center_on_mass_np(att1_ll)
+        if fam == "objectness":
+            if test_input_ll is not None:
+                return _translate_toward_input_centroid_np(att1_ll, test_input_ll)
+            return _center_on_mass_np(att1_ll)
+        return _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
+
+    return att1_ll
+
+
+def _build_train_test_lookups(tasks_dir):
+    train_lookup = {}
+    test_lookup = {}
+    for task_id, task_json in load_tasks_from_dir(tasks_dir):
+        pairs = trains_from_task(task_json)
+        tests = tests_from_task(task_json)
+        train_lookup[task_id] = pairs
+        test_lookup[task_id] = tests
+    return train_lookup, test_lookup
+
+
+def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto"):
+    train_lookup, test_lookup = _build_train_test_lookups(tasks_dir)
+    out = {}
+    for tid, outs in results.items():
+        pairs = train_lookup.get(tid, [])
+        if pairs:
+            tf = task_features(pairs)
+            phi = compute_phi(tf)
+            phi_arr = phi.oct.to_array()
+        else:
+            phi_arr = None
+        tests = test_lookup.get(tid, [None] * len(outs))
+        attempts = []
+        for o_ll, x_in in zip(outs, tests):
+            a1 = o_ll
+            x_in_ll = x_in.tolist() if isinstance(x_in, np.ndarray) else x_in
+            a2 = _attempt2_from_strategy(a1, strategy, phi_arr, pairs, x_in_ll)
+            attempts.append({"attempt_1": a1, "attempt_2": a2})
+        out[tid] = attempts
+    return out
+
+
+def _find_arc_tasks_dir_fallback(tasks_dir):
+    """Return a directory that *directly* contains ARC JSONs (train/test keys)."""
+
+    def dir_has_arc_json(path):
+        try:
+            files = [f for f in os.listdir(path) if f.endswith(".json")]
+        except Exception:
+            return False
+        for fn in files:
+            fp = os.path.join(path, fn)
+            try:
+                with open(fp, "r") as h:
+                    obj = json.load(h)
+                if isinstance(obj, dict) and "train" in obj and "test" in obj:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    if tasks_dir and os.path.isdir(tasks_dir) and dir_has_arc_json(tasks_dir):
+        return tasks_dir
+
+    if tasks_dir and os.path.isdir(tasks_dir):
+        for name in os.listdir(tasks_dir):
+            cand = os.path.join(tasks_dir, name)
+            if os.path.isdir(cand) and dir_has_arc_json(cand):
+                return cand
+
+    if tasks_dir and os.path.isdir(tasks_dir):
+        for root, dirs, files in os.walk(tasks_dir):
+            if any(f.endswith(".json") for f in files) and dir_has_arc_json(root):
+                return root
+
+    if os.path.isdir("/kaggle/input"):
+        for root, dirs, files in os.walk("/kaggle/input"):
+            if any(f.endswith(".json") for f in files) and dir_has_arc_json(root):
+                return root
+
+    raise RuntimeError("ARC tasks not found. Ensure the competition data is attached and paths are correct.")
 
 
 # ################################################################################
@@ -2619,7 +2867,11 @@ Examples:
                        help="Random seed for determinism (default: 1337)")
     
     args = parser.parse_args()
-    
+
+    if not _NUMPY_AVAILABLE:
+        print(f"ERROR: {_NUMPY_IMPORT_ERROR}", file=sys.stderr)
+        sys.exit(1)
+
     # Banner
     print("=" * 80)
     print("ARC-ONE: Octonionic Control Overlay for Abstract Reasoning")
