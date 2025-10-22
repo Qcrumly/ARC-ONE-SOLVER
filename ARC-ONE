@@ -239,6 +239,38 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto"):
 
 
 def _find_arc_tasks_dir_fallback(tasks_dir):
+    """Return a directory that *directly* contains ARC JSONs (train/test), robust to variants.
+
+    Recognizes two common per-file schemas:
+      • Dict-per-file: {"train": [...], "test": [...]}
+      • List-per-file: [{"train": ... , "test": ...}, ...]   # uncommon but seen in forks
+    """
+
+    def file_is_arc_task_json(fp):
+        try:
+            with open(fp, "r") as h:
+                obj = json.load(h)
+            if isinstance(obj, dict) and "train" in obj and "test" in obj:
+                return True
+            if (
+                isinstance(obj, list)
+                and obj
+                and isinstance(obj[0], dict)
+                and "train" in obj[0]
+                and "test" in obj[0]
+            ):
+                return True
+        except Exception:
+            return False
+        return False
+
+    def dir_has_arc_json(path):
+        try:
+            files = [os.path.join(path, f) for f in os.listdir(path) if f.endswith(".json")]
+        except Exception:
+            return False
+        hits = sum(1 for fp in files if file_is_arc_task_json(fp))
+        return hits >= 3
     """Return a directory that *directly* contains ARC JSONs (train/test keys)."""
 
     def dir_has_arc_json(path):
@@ -267,14 +299,28 @@ def _find_arc_tasks_dir_fallback(tasks_dir):
                 return cand
 
     if tasks_dir and os.path.isdir(tasks_dir):
-        for root, dirs, files in os.walk(tasks_dir):
-            if any(f.endswith(".json") for f in files) and dir_has_arc_json(root):
-                return root
+        best = None
+        best_hits = 0
+        for root, _, files in os.walk(tasks_dir):
+            jsons = [os.path.join(root, f) for f in files if f.endswith(".json")]
+            hits = sum(1 for fp in jsons if file_is_arc_task_json(fp))
+            if hits > best_hits:
+                best_hits = hits
+                best = root
+        if best and best_hits >= 3:
+            return best
 
     if os.path.isdir("/kaggle/input"):
-        for root, dirs, files in os.walk("/kaggle/input"):
-            if any(f.endswith(".json") for f in files) and dir_has_arc_json(root):
-                return root
+        best = None
+        best_hits = 0
+        for root, _, files in os.walk("/kaggle/input"):
+            jsons = [os.path.join(root, f) for f in files if f.endswith(".json")]
+            hits = sum(1 for fp in jsons if file_is_arc_task_json(fp))
+            if hits > best_hits:
+                best_hits = hits
+                best = root
+        if best and best_hits >= 3:
+            return best
 
     raise RuntimeError("ARC tasks not found. Ensure the competition data is attached and paths are correct.")
 
@@ -2527,8 +2573,57 @@ def load_tasks_from_dir(tasks_dir: str) -> List[Tuple[str, dict]]:
     return tasks
 
 
-def write_submission_json(path: str, predictions: Dict[str, List[List[List[int]]]]) -> None:
-    """Write submission JSON in ARC Prize format."""
+def write_submission_json(path: str, predictions: dict) -> None:
+    """
+    Write submission JSON to disk.
+
+    Supports BOTH schemas:
+      (A) Legacy single-attempt: {task_id: [grid, grid, ...]}
+      (B) ARC 2025 two-attempts: {task_id: [ {"attempt_1": grid, "attempt_2": grid}, ... ]}
+
+    A "grid" is a nested list of ints (no numpy arrays). This function does a light,
+    non-fatal validation and then dumps JSON as-is.
+    """
+
+    def _is_grid(g):
+        return (
+            isinstance(g, list)
+            and all(isinstance(r, list) and all(isinstance(v, (int, bool)) for v in r) for r in g)
+        )
+
+    def _is_two_attempts_entry(e):
+        return (
+            isinstance(e, dict)
+            and "attempt_1" in e
+            and "attempt_2" in e
+            and _is_grid(e["attempt_1"])
+            and _is_grid(e["attempt_2"])
+        )
+
+    # Light validation of a couple of entries (don’t fail hard; just warn)
+    try:
+        if isinstance(predictions, dict) and predictions:
+            _k = next(iter(predictions))
+            _v = predictions[_k]
+            if isinstance(_v, list) and _v:
+                sample = _v[0]
+                if isinstance(sample, list):
+                    # Legacy schema
+                    if not _is_grid(sample):
+                        print(
+                            "⚠️  write_submission_json: sample grid is not a nested list of ints.",
+                            file=sys.stderr,
+                        )
+                elif isinstance(sample, dict):
+                    # Two-attempts schema
+                    if not _is_two_attempts_entry(sample):
+                        print(
+                            "⚠️  write_submission_json: sample two-attempts entry not valid.",
+                            file=sys.stderr,
+                        )
+    except Exception as _e:  # pragma: no cover - best-effort validation
+        print(f"⚠️  write_submission_json: validation skipped ({_e})", file=sys.stderr)
+
     with open(path, "w") as f:
         json.dump(predictions, f, indent=2)
 
