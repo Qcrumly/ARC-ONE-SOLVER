@@ -271,6 +271,23 @@ def _find_arc_tasks_dir_fallback(tasks_dir):
             return False
         hits = sum(1 for fp in files if file_is_arc_task_json(fp))
         return hits >= 3
+    """Return a directory that *directly* contains ARC JSONs (train/test keys)."""
+
+    def dir_has_arc_json(path):
+        try:
+            files = [f for f in os.listdir(path) if f.endswith(".json")]
+        except Exception:
+            return False
+        for fn in files:
+            fp = os.path.join(path, fn)
+            try:
+                with open(fp, "r") as h:
+                    obj = json.load(h)
+                if isinstance(obj, dict) and "train" in obj and "test" in obj:
+                    return True
+            except Exception:
+                continue
+        return False
 
     if tasks_dir and os.path.isdir(tasks_dir) and dir_has_arc_json(tasks_dir):
         return tasks_dir
