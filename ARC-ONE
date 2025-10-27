@@ -12,8 +12,9 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.8.5 — remove_isolated(min_size) + light seeds
+Version: v2.8.6 — Topology side-channel (_topo_hint)
 Enhancements:
+- v2.8.6: Topology side-channel (_topo_hint) fixes conditional refiner gating while keeping φ at 8-D.
 - v2.3.1: Centroid-biased shift enumeration for training search
 - v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
 - v2.5: Block-mask finisher learns k×k (3×3 or 5×5) block-presence masks from
@@ -886,6 +887,17 @@ def _flood_holes_mask(mask: np.ndarray) -> np.ndarray:
             q.append((y + dy, x + dx))
 
     return bg & ~ext
+
+
+def _holes_count(grid: np.ndarray) -> int:
+    """Count interior holes (background regions fully enclosed by non-zero cells)."""
+    mask = (grid != 0).astype(np.uint8)
+    return int(_flood_holes_mask(mask).sum())
+
+
+def _component_count(grid: np.ndarray) -> int:
+    """Count 4-connected non-zero components (color collapsed)."""
+    return int(_cc_label((grid != 0).astype(np.uint8), structure=np.ones((3, 3), int))[1])
 
 
 def _op_fill_holes(grid: np.ndarray) -> np.ndarray:
@@ -2083,15 +2095,11 @@ def beam_search_one_pair(
     seeds = [prog for (acc, prog) in meta]
 
     # --- φ-aware topo gating for seeds / refiners ---
-    try:
-        dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
-        if len(phi) >= 12:
-            dholes_g = float(phi[-4])
-            dcomps_g = float(phi[-3])
-            dholes_pc = float(phi[-2])
-            dcomps_pc = float(phi[-1])
-    except Exception:
-        dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+    dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+    # Topology side-channel: use settings._topo_hint instead of expanding φ to 12-D
+    topo_hint = getattr(settings, "_topo_hint", None)
+    if topo_hint and len(topo_hint) == 4:
+        dholes_g, dcomps_g, dholes_pc, dcomps_pc = map(float, topo_hint)
 
     try:
         if dholes_g > 0.0 or dholes_pc > 0.0:
@@ -2247,15 +2255,11 @@ def beam_search_one_pair(
             cur_state = input_grid
 
         # --- v2.8.3 Topology-aware refiner: keep_rings post-alignment ---
-        try:
-            dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
-            if len(phi) >= 12:
-                dholes_g = float(phi[-4])
-                dcomps_g = float(phi[-3])
-                dholes_pc = float(phi[-2])
-                dcomps_pc = float(phi[-1])
-        except Exception:
-            dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+        dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+        # Topology side-channel: use settings._topo_hint instead of expanding φ to 12-D
+        topo_hint = getattr(settings, "_topo_hint", None)
+        if topo_hint and len(topo_hint) == 4:
+            dholes_g, dcomps_g, dholes_pc, dcomps_pc = map(float, topo_hint)
 
         acc_proxy = 0.0
         try:
@@ -2811,6 +2815,19 @@ def solve_task(
     features = task_features(train_pairs)
     phi = compute_phi(features)
 
+    # --- Topology hint (side-channel): averages over train pairs ---
+    dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+    for xi, yi in train_pairs:
+        try:
+            dholes_g += _holes_count(yi) - _holes_count(xi)
+            dcomps_g += _component_count(yi) - _component_count(xi)
+            dholes_pc += _holes_count(yi)
+            dcomps_pc += _component_count(yi)
+        except Exception:
+            pass
+    n = float(max(1, len(train_pairs)))
+    settings._topo_hint = (dholes_g / n, dcomps_g / n, dholes_pc / n, dcomps_pc / n)
+
     # Meta-controller (opt-in)
     meta = None
     if settings.use_meta_controller:
@@ -2864,6 +2881,10 @@ def solve_task(
                 )
             else:
                 mode_settings = apply_mode_bias(settings, controller.mode)
+
+            topo_hint = getattr(settings, "_topo_hint", None)
+            if topo_hint is not None:
+                setattr(mode_settings, "_topo_hint", topo_hint)
 
             # Search for program
             prog = beam_search_one_pair(x, y, phi, mode_settings, logger)
