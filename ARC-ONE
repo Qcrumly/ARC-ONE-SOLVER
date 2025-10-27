@@ -12,7 +12,7 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.8.1 — Band-limited Meta-Controller bundles (opt-in) + optional telemetry
+Version: v2.8.2 — Topology-aware ops + gated seeds
 Enhancements:
 - v2.3.1: Centroid-biased shift enumeration for training search
 - v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
@@ -113,6 +113,7 @@ import argparse
 import tempfile
 import shutil
 import hashlib
+from scipy.ndimage import label as _cc_label
 
 
 # ==================================================================================
@@ -855,6 +856,72 @@ def _conn_comps(arr):
                 comps.append((color, pts))
     return comps
 
+
+def _flood_holes_mask(mask: np.ndarray) -> np.ndarray:
+    """Return a boolean mask marking interior background pixels (holes) of a binary mask."""
+    H, W = mask.shape
+    bg = mask == 0
+    ext = np.zeros_like(bg, dtype=bool)
+    q = deque()
+
+    for x in range(W):
+        if bg[0, x]:
+            q.append((0, x))
+        if bg[H - 1, x]:
+            q.append((H - 1, x))
+    for y in range(H):
+        if bg[y, 0]:
+            q.append((y, 0))
+        if bg[y, W - 1]:
+            q.append((y, W - 1))
+
+    while q:
+        y, x = q.popleft()
+        if not (0 <= y < H and 0 <= x < W):
+            continue
+        if ext[y, x] or not bg[y, x]:
+            continue
+        ext[y, x] = True
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            q.append((y + dy, x + dx))
+
+    return bg & ~ext
+
+
+def _op_fill_holes(grid: np.ndarray) -> np.ndarray:
+    """Fill interior holes of each color component independently."""
+    out = grid.copy()
+    for c in np.unique(grid):
+        if c == 0:
+            continue
+        mask = (grid == c).astype(np.uint8)
+        if not mask.any():
+            continue
+        holes = _flood_holes_mask(mask)
+        if holes.any():
+            out[holes] = c
+    return out
+
+
+def _op_keep_rings(grid: np.ndarray) -> np.ndarray:
+    """Keep only components (per color) that contain at least one hole; zero everything else."""
+    out = np.zeros_like(grid)
+    structure = np.ones((3, 3), dtype=int)
+    for c in np.unique(grid):
+        if c == 0:
+            continue
+        mask = (grid == c).astype(np.uint8)
+        if not mask.any():
+            continue
+        lbl, n = _cc_label(mask, structure=structure)
+        for k in range(1, n + 1):
+            comp = (lbl == k).astype(np.uint8)
+            holes = _flood_holes_mask(comp)
+            if holes.any():
+                out[comp == 1] = c
+    return out
+
+
 def _op_keep_n_largest(grid, n):
     """keep_n_largest <n>
     Keep only the n largest connected components by size.
@@ -1224,6 +1291,8 @@ OP_NAMES_BASIC = [
     ("minority", 1, ["grid"]),
     ("threshold", 2, ["grid", "int"]),
     ("largest", 1, ["grid"]),
+    ("fill_holes", 1, ["grid"]),
+    ("keep_rings", 1, ["grid"]),
     ("stack", 3, ["grid", "grid", "int"]),
     ("subtract", 2, ["grid", "grid"]),
 ]
@@ -1251,6 +1320,8 @@ OP_REGISTRY = {
     "minority": _op_minority,
     "threshold": _op_threshold,
     "largest": _op_largest,
+    "fill_holes": _op_fill_holes,
+    "keep_rings": _op_keep_rings,
     "keep_n_largest": _op_keep_n_largest,
     "keep_size_range": _op_keep_size_range,
     "resize": _op_resize,
@@ -1273,7 +1344,7 @@ OP_ORDER_O2 = [
     # Core geometry next
     "rot90", "mirror", "transpose", "shift", "crop", "grow", "shrink",
     # Composition / structural
-    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "scale", "duplicate",
+    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "fill_holes", "keep_rings", "scale", "duplicate",
     # Color / palette last
     "mask", "replacecolor", "swapcolors", "invert", "fill", "outline", "threshold", "majority", "minority",
 ]
@@ -1285,7 +1356,7 @@ _OP_RANK = {name: i for i, name in enumerate(OP_ORDER_O2)}
 SHAPE_OPS = {
     "tile", "tile_masked", "phase_tile_row", "phase_tile_col", "phase_tile", "resize",
     "rot90", "mirror", "transpose", "shift", "crop", "grow", "shrink",
-    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "scale", "duplicate",
+    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "fill_holes", "keep_rings", "scale", "duplicate",
 }
 COLOR_OPS = {
     "mask", "replacecolor", "swapcolors", "invert", "fill", "outline", "threshold", "majority", "minority",
@@ -1515,10 +1586,11 @@ def compute_phi(features: Dict[str, Any]) -> np.ndarray:
 
 def phi_to_family(phi: np.ndarray) -> str:
     """Classify task family from φ."""
-    if phi is None or len(phi) != 8:
+    if phi is None or len(phi) < 8:
         return "unknown"
 
-    abs_phi = np.abs(phi)
+    core = np.array(phi[:8], dtype=np.float32)
+    abs_phi = np.abs(core)
     idx = np.argmax(abs_phi)
 
     families = [
@@ -1609,6 +1681,8 @@ def op_to_vector(op_name: str) -> np.ndarray:
         "minority": [0, 0, 1, 0, 0, 0, 0, 0],
         "threshold": [0, 0, 1, 0, 0, 0, 0, 0],
         "largest": [0, 1, 0, 0, 0, 1, 0, 0],
+        "fill_holes": [0, 0, 0, 0, 0, 1, 0, 0],
+        "keep_rings": [0, 1, 0, 0, 0, 1, 0, 0],
         "keep_n_largest": [0, 1, 0, 0, 0, 1, 0, 0],
         "keep_size_range": [0, 1, 0, 0, 0, 1, 0, 0],
         "resize": [1, 0, 0, 0, 0, 0, 0, 0],
@@ -1936,6 +2010,8 @@ def _int_space_for(op_name, idx, ctx):
             for b in pals[i+1:]:
                 pairs.append((a, b))
         return pairs or [(1, 2), (2, 3), (3, 4)]
+    if op_name in ("fill_holes", "keep_rings"):
+        return [()]
     if op_name == "keep_n_largest":
         return [(1,), (2,), (3,)]
     if op_name == "keep_size_range":
@@ -1977,6 +2053,25 @@ def beam_search_one_pair(
     # === Meta-seed discovery ===
     meta = _quick_shape_candidates(input_grid, target_grid)
     seeds = [prog for (acc, prog) in meta]
+
+    # --- φ-aware topo gating for seeds / refiners ---
+    try:
+        dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+        if len(phi) >= 12:
+            dholes_g = float(phi[-4])
+            dcomps_g = float(phi[-3])
+            dholes_pc = float(phi[-2])
+            dcomps_pc = float(phi[-1])
+    except Exception:
+        dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+
+    try:
+        if dholes_g > 0.0 or dholes_pc > 0.0:
+            seeds.insert(0, Program([Step("keep_rings", ())]))
+        if dholes_g < 0.0 or dholes_pc < 0.0:
+            seeds.append(Program([Step("fill_holes", ())]))
+    except Exception:
+        pass
 
     # Early-latch: if any seed already strong, prefer it
     best_so_far, best_cost = None, 1e9
