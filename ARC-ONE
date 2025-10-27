@@ -12,7 +12,7 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.7.9 - pair sampling when consensus fails (beam on first K pairs only)
+Version: v2.8.1 — Band-limited Meta-Controller bundles (opt-in) + optional telemetry
 Enhancements:
 - v2.3.1: Centroid-biased shift enumeration for training search
 - v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
@@ -2346,21 +2346,32 @@ class MetaControllerUCB:
         # bundles are minimal & stable; adjust offline if needed
         self.bundle_map = {
             "scale": [
-                dict(beam_width=64, lambda1=0.30, lambda2=0.20, max_train_pairs_for_beam=2),
-                dict(beam_width=192, lambda1=0.10, lambda2=0.10, max_train_pairs_for_beam=2),
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+                {"beam_width": 96, "lambda1": 0.30, "lambda2": 0.20, "max_train_pairs_for_beam": 2},
+                {"beam_width": 128, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
             ],
             "objectness": [
-                dict(beam_width=64, lambda1=0.30, lambda2=0.20, max_train_pairs_for_beam=2),
-                dict(beam_width=192, lambda1=0.10, lambda2=0.10, max_train_pairs_for_beam=2),
-                dict(beam_width=128, lambda1=0.25, lambda2=0.15, max_train_pairs_for_beam=2),
+                {"beam_width": 48, "lambda1": 0.35, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
+            ],
+            "palette": [
+                {"beam_width": 64, "lambda1": 0.20, "lambda2": 0.15, "max_train_pairs_for_beam": 2},
+                {"beam_width": 96, "lambda1": 0.10, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
             ],
             "alignment": [
-                dict(beam_width=64, lambda1=0.30, lambda2=0.20, max_train_pairs_for_beam=2),
-                dict(beam_width=128, lambda1=0.20, lambda2=0.15, max_train_pairs_for_beam=2),
+                {"beam_width": 64, "lambda1": 0.25, "lambda2": 0.30, "max_train_pairs_for_beam": 1},
+                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 1},
+            ],
+            "geometry": [
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+            ],
+            "pattern": [
+                {"beam_width": 128, "lambda1": 0.25, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
             ],
             "default": [
-                dict(beam_width=64, lambda1=0.30, lambda2=0.20, max_train_pairs_for_beam=2),
-                dict(beam_width=192, lambda1=0.10, lambda2=0.10, max_train_pairs_for_beam=2),
+                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.20, "max_train_pairs_for_beam": 2},
             ],
         }
         self.bandits = {}
@@ -2651,6 +2662,8 @@ def solve_task(
         if meta is not None:
             selected_fam = phi_to_family(phi)
             selected_arm, selected_bundle = meta.select(selected_fam)
+            if logger:
+                print(f"[meta] family={selected_fam} arm={selected_arm} bundle={selected_bundle}")
         for pair_idx, (x, y) in enumerate(pairs_for_beam):
             # Apply controller mode bias
             if meta is not None and selected_bundle is not None:
