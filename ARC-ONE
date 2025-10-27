@@ -1661,6 +1661,7 @@ class SearchSettings:
     log_every: int = 200
     seed: int = 1337
     _disable_rotation: bool = False
+    max_train_pairs_for_beam: int = 2  # NEW: how many train pairs to use when consensus fails
 
 
 def compute_cost(
@@ -2555,8 +2556,13 @@ def solve_task(
         best_program = cons_prog
         best_avg_cost = 1.0 - cons_mean
     else:
-        # Standard beam search on each training pair
-        for pair_idx, (x, y) in enumerate(train_pairs):
+        # Standard beam search on a subset of training pairs when consensus is weak
+        pairs_for_beam = train_pairs[:max(1, settings.max_train_pairs_for_beam)]
+        if logger:
+            print(
+                f"[beam] sampling {len(pairs_for_beam)}/{len(train_pairs)} pairs (consensus={cons_mean:.3f})"
+            )
+        for pair_idx, (x, y) in enumerate(pairs_for_beam):
             # Apply controller mode bias
             mode_settings = apply_mode_bias(settings, controller.mode)
 
