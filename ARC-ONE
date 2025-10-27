@@ -12,7 +12,7 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.7.9 - pair sampling when consensus fails (beam on first K pairs only)
+Version: v2.8.5 — remove_isolated(min_size) + light seeds
 Enhancements:
 - v2.3.1: Centroid-biased shift enumeration for training search
 - v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
@@ -113,6 +113,7 @@ import argparse
 import tempfile
 import shutil
 import hashlib
+from scipy.ndimage import label as _cc_label
 
 
 # ==================================================================================
@@ -855,6 +856,90 @@ def _conn_comps(arr):
                 comps.append((color, pts))
     return comps
 
+
+def _flood_holes_mask(mask: np.ndarray) -> np.ndarray:
+    """Return a boolean mask marking interior background pixels (holes) of a binary mask."""
+    H, W = mask.shape
+    bg = mask == 0
+    ext = np.zeros_like(bg, dtype=bool)
+    q = deque()
+
+    for x in range(W):
+        if bg[0, x]:
+            q.append((0, x))
+        if bg[H - 1, x]:
+            q.append((H - 1, x))
+    for y in range(H):
+        if bg[y, 0]:
+            q.append((y, 0))
+        if bg[y, W - 1]:
+            q.append((y, W - 1))
+
+    while q:
+        y, x = q.popleft()
+        if not (0 <= y < H and 0 <= x < W):
+            continue
+        if ext[y, x] or not bg[y, x]:
+            continue
+        ext[y, x] = True
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            q.append((y + dy, x + dx))
+
+    return bg & ~ext
+
+
+def _op_fill_holes(grid: np.ndarray) -> np.ndarray:
+    """Fill interior holes of each color component independently."""
+    out = grid.copy()
+    for c in np.unique(grid):
+        if c == 0:
+            continue
+        mask = (grid == c).astype(np.uint8)
+        if not mask.any():
+            continue
+        holes = _flood_holes_mask(mask)
+        if holes.any():
+            out[holes] = c
+    return out
+
+
+def _op_keep_rings(grid: np.ndarray) -> np.ndarray:
+    """Keep only components (per color) that contain at least one hole; zero everything else."""
+    out = np.zeros_like(grid)
+    structure = np.ones((3, 3), dtype=int)
+    for c in np.unique(grid):
+        if c == 0:
+            continue
+        mask = (grid == c).astype(np.uint8)
+        if not mask.any():
+            continue
+        lbl, n = _cc_label(mask, structure=structure)
+        for k in range(1, n + 1):
+            comp = (lbl == k).astype(np.uint8)
+            holes = _flood_holes_mask(comp)
+            if holes.any():
+                out[comp == 1] = c
+    return out
+
+
+def _op_remove_isolated(grid: np.ndarray, min_size: int) -> np.ndarray:
+    """Remove color components smaller than min_size (per color), keep the rest."""
+    out = grid.copy()
+    structure = np.ones((3, 3), dtype=int)
+    for c in np.unique(grid):
+        if c == 0:
+            continue
+        mask = (grid == c).astype(np.uint8)
+        if not mask.any():
+            continue
+        lbl, n = _cc_label(mask, structure=structure)
+        for k in range(1, n + 1):
+            comp = lbl == k
+            if np.count_nonzero(comp) < int(min_size):
+                out[comp] = 0
+    return out
+
+
 def _op_keep_n_largest(grid, n):
     """keep_n_largest <n>
     Keep only the n largest connected components by size.
@@ -1224,6 +1309,9 @@ OP_NAMES_BASIC = [
     ("minority", 1, ["grid"]),
     ("threshold", 2, ["grid", "int"]),
     ("largest", 1, ["grid"]),
+    ("fill_holes", 1, ["grid"]),
+    ("keep_rings", 1, ["grid"]),
+    ("remove_isolated", 2, ["grid", "int"]),
     ("stack", 3, ["grid", "grid", "int"]),
     ("subtract", 2, ["grid", "grid"]),
 ]
@@ -1251,6 +1339,9 @@ OP_REGISTRY = {
     "minority": _op_minority,
     "threshold": _op_threshold,
     "largest": _op_largest,
+    "fill_holes": _op_fill_holes,
+    "keep_rings": _op_keep_rings,
+    "remove_isolated": _op_remove_isolated,
     "keep_n_largest": _op_keep_n_largest,
     "keep_size_range": _op_keep_size_range,
     "resize": _op_resize,
@@ -1273,7 +1364,7 @@ OP_ORDER_O2 = [
     # Core geometry next
     "rot90", "mirror", "transpose", "shift", "crop", "grow", "shrink",
     # Composition / structural
-    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "scale", "duplicate",
+    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "remove_isolated", "fill_holes", "keep_rings", "scale", "duplicate",
     # Color / palette last
     "mask", "replacecolor", "swapcolors", "invert", "fill", "outline", "threshold", "majority", "minority",
 ]
@@ -1285,7 +1376,7 @@ _OP_RANK = {name: i for i, name in enumerate(OP_ORDER_O2)}
 SHAPE_OPS = {
     "tile", "tile_masked", "phase_tile_row", "phase_tile_col", "phase_tile", "resize",
     "rot90", "mirror", "transpose", "shift", "crop", "grow", "shrink",
-    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "scale", "duplicate",
+    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "remove_isolated", "fill_holes", "keep_rings", "scale", "duplicate",
 }
 COLOR_OPS = {
     "mask", "replacecolor", "swapcolors", "invert", "fill", "outline", "threshold", "majority", "minority",
@@ -1515,10 +1606,11 @@ def compute_phi(features: Dict[str, Any]) -> np.ndarray:
 
 def phi_to_family(phi: np.ndarray) -> str:
     """Classify task family from φ."""
-    if phi is None or len(phi) != 8:
+    if phi is None or len(phi) < 8:
         return "unknown"
 
-    abs_phi = np.abs(phi)
+    core = np.array(phi[:8], dtype=np.float32)
+    abs_phi = np.abs(core)
     idx = np.argmax(abs_phi)
 
     families = [
@@ -1609,6 +1701,8 @@ def op_to_vector(op_name: str) -> np.ndarray:
         "minority": [0, 0, 1, 0, 0, 0, 0, 0],
         "threshold": [0, 0, 1, 0, 0, 0, 0, 0],
         "largest": [0, 1, 0, 0, 0, 1, 0, 0],
+        "fill_holes": [0, 0, 0, 0, 0, 1, 0, 0],
+        "keep_rings": [0, 1, 0, 0, 0, 1, 0, 0],
         "keep_n_largest": [0, 1, 0, 0, 0, 1, 0, 0],
         "keep_size_range": [0, 1, 0, 0, 0, 1, 0, 0],
         "resize": [1, 0, 0, 0, 0, 0, 0, 0],
@@ -1661,6 +1755,8 @@ class SearchSettings:
     log_every: int = 200
     seed: int = 1337
     _disable_rotation: bool = False
+    max_train_pairs_for_beam: int = 2  # NEW: how many train pairs to use when consensus fails
+    use_meta_controller: bool = False  # NEW: opt-in meta-controller for search bundles
 
 
 def compute_cost(
@@ -1721,6 +1817,12 @@ def compute_cost(
     c_oco = lam1 * t_prog + lam2 * t_slice
 
     total = c_match + c_len + c_oco - beta * acc
+
+    # shape-stage: tiny prior for topology selection ops (mirrors tile_masked prior)
+    if pred.shape == target_grid.shape and len(prog) > 0:
+        last = prog.steps[-1].op
+        if last in ("keep_rings", "fill_holes"):
+            total -= 0.01
 
     return float(total)
 
@@ -1934,6 +2036,10 @@ def _int_space_for(op_name, idx, ctx):
             for b in pals[i+1:]:
                 pairs.append((a, b))
         return pairs or [(1, 2), (2, 3), (3, 4)]
+    if op_name in ("fill_holes", "keep_rings"):
+        return [()]
+    if op_name == "remove_isolated":
+        return [(1,), (2,), (3,)]
     if op_name == "keep_n_largest":
         return [(1,), (2,), (3,)]
     if op_name == "keep_size_range":
@@ -1975,6 +2081,33 @@ def beam_search_one_pair(
     # === Meta-seed discovery ===
     meta = _quick_shape_candidates(input_grid, target_grid)
     seeds = [prog for (acc, prog) in meta]
+
+    # --- φ-aware topo gating for seeds / refiners ---
+    try:
+        dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+        if len(phi) >= 12:
+            dholes_g = float(phi[-4])
+            dcomps_g = float(phi[-3])
+            dholes_pc = float(phi[-2])
+            dcomps_pc = float(phi[-1])
+    except Exception:
+        dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+
+    try:
+        if dholes_g > 0.0 or dholes_pc > 0.0:
+            seeds.insert(0, Program([Step("keep_rings", ())]))
+        if dholes_g < 0.0 or dholes_pc < 0.0:
+            seeds.append(Program([Step("fill_holes", ())]))
+    except Exception:
+        pass
+
+    # if shape is identical sizes and accuracy is high-ish, try denoising early
+    try:
+        if target_grid.size == input_grid.size:
+            seeds.append(Program([Step("remove_isolated", (1,))]))
+            seeds.append(Program([Step("remove_isolated", (2,))]))
+    except Exception:
+        pass
 
     # Early-latch: if any seed already strong, prefer it
     best_so_far, best_cost = None, 1e9
@@ -2112,6 +2245,61 @@ def beam_search_one_pair(
                 no_shape_seen = False
         except Exception:
             cur_state = input_grid
+
+        # --- v2.8.3 Topology-aware refiner: keep_rings post-alignment ---
+        try:
+            dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+            if len(phi) >= 12:
+                dholes_g = float(phi[-4])
+                dcomps_g = float(phi[-3])
+                dholes_pc = float(phi[-2])
+                dcomps_pc = float(phi[-1])
+        except Exception:
+            dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+
+        acc_proxy = 0.0
+        try:
+            if cur_state.shape == target_grid.shape:
+                acc_proxy = float((cur_state == target_grid).mean())
+        except Exception:
+            acc_proxy = 0.0
+
+        if (
+            cur_state.shape == target_grid.shape
+            and (dholes_g > 0.0 or dholes_pc > 0.0)
+            and acc_proxy >= 0.55
+            and current.depth < 3
+        ):
+            try:
+                ring_prog = current.program.copy()
+                ring_prog.steps.append(Step("keep_rings", ()))
+                sig = ring_prog.to_tuple()
+                if sig not in visited:
+                    cost_ring = compute_cost(ring_prog, input_grid, target_grid, phi, settings)
+                    beam.append(Candidate(ring_prog, cost_ring, current.depth + 1))
+                    visited.add(sig)
+            except Exception:
+                pass
+        # --- end v2.8.3 insert ---
+
+        # --- v2.8.4 Topology-aware refiner: fill_holes post-alignment ---
+        if (
+            cur_state.shape == target_grid.shape
+            and (dholes_g < 0.0 or dholes_pc < 0.0)
+            and acc_proxy >= 0.55
+            and current.depth < 3
+        ):
+            try:
+                fill_prog = current.program.copy()
+                fill_prog.steps.append(Step("fill_holes", ()))
+                sig = fill_prog.to_tuple()
+                if sig not in visited:
+                    cost_fill = compute_cost(fill_prog, input_grid, target_grid, phi, settings)
+                    beam.append(Candidate(fill_prog, cost_fill, current.depth + 1))
+                    visited.add(sig)
+            except Exception:
+                pass
+        # --- end v2.8.4 insert ---
 
         # --- Conditional Smart Refiner (one extra post-shape step) ---
         try:
@@ -2304,6 +2492,88 @@ class ControllerState:
     mode: str = "observer"  # observer, navigator, explorer
     rotation_count: int = 0
     last_rotation_cost: float = 1e9
+
+
+# ============================================================================
+# ============ controller/meta.py (opt-in meta-controller) ============
+# ============================================================================
+
+
+class _UCB:
+    def __init__(self, n_arms: int):
+        self.n = [0] * n_arms
+        self.r = [0.0] * n_arms
+        self.t = 0
+
+    def select(self) -> int:
+        self.t += 1
+        for i, c in enumerate(self.n):
+            if c == 0:
+                return i
+        import math
+
+        avg = [self.r[i] / self.n[i] for i in range(len(self.n))]
+        bonus = [math.sqrt(2 * math.log(self.t) / self.n[i]) for i in range(len(self.n))]
+        ucb = [avg[i] + bonus[i] for i in range(len(self.n))]
+        return int(np.argmax(ucb))
+
+    def update(self, arm: int, reward: float):
+        self.n[arm] += 1
+        self.r[arm] += reward
+
+
+class MetaControllerUCB:
+    """
+    Per-φ-family UCB over a few fixed bundles (beam, λ1, λ2, K).
+    Reward is provided by caller (e.g., acc/sec).
+    """
+
+    def __init__(self):
+        # bundles are minimal & stable; adjust offline if needed
+        self.bundle_map = {
+            "scale": [
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+                {"beam_width": 96, "lambda1": 0.30, "lambda2": 0.20, "max_train_pairs_for_beam": 2},
+                {"beam_width": 128, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
+            ],
+            "objectness": [
+                {"beam_width": 48, "lambda1": 0.35, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
+            ],
+            "palette": [
+                {"beam_width": 64, "lambda1": 0.20, "lambda2": 0.15, "max_train_pairs_for_beam": 2},
+                {"beam_width": 96, "lambda1": 0.10, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
+            ],
+            "alignment": [
+                {"beam_width": 64, "lambda1": 0.25, "lambda2": 0.30, "max_train_pairs_for_beam": 1},
+                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 1},
+            ],
+            "geometry": [
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+            ],
+            "pattern": [
+                {"beam_width": 128, "lambda1": 0.25, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
+            ],
+            "default": [
+                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.20, "max_train_pairs_for_beam": 2},
+            ],
+        }
+        self.bandits = {}
+
+    def _bundles_for(self, fam: str):
+        return self.bundle_map.get(fam, self.bundle_map["default"])
+
+    def select(self, fam: str):
+        bundles = self._bundles_for(fam)
+        if fam not in self.bandits:
+            self.bandits[fam] = _UCB(len(bundles))
+        arm = self.bandits[fam].select()
+        return arm, bundles[arm]
+
+    def update(self, fam: str, arm: int, reward: float):
+        self.bandits[fam].update(arm, reward)
 
 
 def should_rotate(state: ControllerState, current_cost: float, settings: SearchSettings) -> bool:
@@ -2541,6 +2811,14 @@ def solve_task(
     features = task_features(train_pairs)
     phi = compute_phi(features)
 
+    # Meta-controller (opt-in)
+    meta = None
+    if settings.use_meta_controller:
+        meta = getattr(solve_task, "_META", None)
+        if meta is None:
+            meta = MetaControllerUCB()
+            solve_task._META = meta
+
     # --- Consensus one-step sweep (fast path) ---
     cons_prog, cons_mean = _consensus_one_step_candidate(train_pairs)
 
@@ -2549,16 +2827,43 @@ def solve_task(
     best_avg_cost = 1e9
 
     controller = ControllerState(mode="observer")
+    selected_arm = None
+    selected_bundle = None
+    selected_fam = None
 
     # If consensus is strong, accept it and let finishers polish
     if cons_prog is not None and cons_mean >= 0.80:
         best_program = cons_prog
         best_avg_cost = 1.0 - cons_mean
     else:
-        # Standard beam search on each training pair
-        for pair_idx, (x, y) in enumerate(train_pairs):
+        # Standard beam search on a subset of training pairs when consensus is weak
+        pairs_for_beam = train_pairs[:max(1, settings.max_train_pairs_for_beam)]
+        if logger:
+            print(
+                f"[beam] sampling {len(pairs_for_beam)}/{len(train_pairs)} pairs (consensus={cons_mean:.3f})"
+            )
+        selected_arm = None
+        selected_bundle = None
+        selected_fam = None
+        if meta is not None:
+            selected_fam = phi_to_family(phi)
+            selected_arm, selected_bundle = meta.select(selected_fam)
+            if logger:
+                print(f"[meta] family={selected_fam} arm={selected_arm} bundle={selected_bundle}")
+        for pair_idx, (x, y) in enumerate(pairs_for_beam):
             # Apply controller mode bias
-            mode_settings = apply_mode_bias(settings, controller.mode)
+            if meta is not None and selected_bundle is not None:
+                from dataclasses import replace
+
+                mode_settings = replace(
+                    settings,
+                    beam_width=selected_bundle["beam_width"],
+                    lambda1=selected_bundle["lambda1"],
+                    lambda2=selected_bundle["lambda2"],
+                    max_train_pairs_for_beam=selected_bundle["max_train_pairs_for_beam"],
+                )
+            else:
+                mode_settings = apply_mode_bias(settings, controller.mode)
 
             # Search for program
             prog = beam_search_one_pair(x, y, phi, mode_settings, logger)
@@ -2817,6 +3122,14 @@ def solve_task(
 
     elapsed = time.time() - start_time
     success = best_avg_cost < 0.01
+
+    # Meta-controller reward (opt-in)
+    if meta is not None and selected_arm is not None and selected_fam is not None:
+        try:
+            reward = max(0.0, 1.0 - float(best_avg_cost)) / (0.05 + elapsed)
+            meta.update(selected_fam, selected_arm, reward)
+        except Exception:
+            pass
 
     if logger:
         logger.log_task_end(task_id, success, elapsed)
