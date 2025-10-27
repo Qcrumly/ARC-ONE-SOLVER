@@ -461,12 +461,15 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
     if train_pairs and strategy not in ("palette_swap",):  # Don't double-apply
         mapping = _palette_map_from_train_pairs(train_pairs)
         if mapping:
-            result_with_palette = _apply_palette_map_ll(result, mapping)
+            result = _apply_palette_map_ll(result, mapping)
             # In a production setting, you might want to score both and pick the best
             # For now, we'll just return the palette-remapped version
-            return result_with_palette
-    
-    return result
+
+    att2 = result
+    att2_np = np.asarray(att2)
+    if att2_np.ndim != 2:
+        return att1_ll
+    return att2_np.tolist()
 
 
 def _build_train_test_lookups(tasks_dir):
@@ -496,11 +499,32 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto"):
             outs = [outs]
         out_two = []
         for idx, pred_ll in enumerate(outs):
+            if isinstance(pred_ll, dict) and "attempt_1" in pred_ll:
+                base = pred_ll["attempt_1"]
+            else:
+                base = pred_ll
+
+            base_np = np.asarray(base)
+            if base_np.ndim != 2:
+                out_two.append({
+                    "attempt_1": base_np.tolist(),
+                    "attempt_2": base_np.tolist(),
+                })
+                continue
+
             tin = None
             if test_lookup[tid] and idx < len(test_lookup[tid]):
                 tin = test_lookup[tid][idx]
-            a2 = _attempt2_from_strategy(pred_ll, strategy, phi, pairs, tin)
-            out_two.append({"attempt_1": pred_ll, "attempt_2": a2})
+
+            att2 = _attempt2_from_strategy(base_np.tolist(), strategy, phi, pairs, tin)
+            att2_np = np.asarray(att2)
+            if att2_np.ndim != 2 or att2_np.shape != base_np.shape:
+                att2_np = base_np
+
+            out_two.append({
+                "attempt_1": base_np.tolist(),
+                "attempt_2": att2_np.tolist(),
+            })
         out[tid] = out_two
     return out
 
