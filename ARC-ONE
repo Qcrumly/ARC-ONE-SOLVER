@@ -1661,6 +1661,8 @@ class SearchSettings:
     log_every: int = 200
     seed: int = 1337
     _disable_rotation: bool = False
+    max_train_pairs_for_beam: int = 2  # NEW: how many train pairs to use when consensus fails
+    use_meta_controller: bool = False  # NEW: opt-in meta-controller for search bundles
 
 
 def compute_cost(
@@ -2306,6 +2308,77 @@ class ControllerState:
     last_rotation_cost: float = 1e9
 
 
+# ============================================================================
+# ============ controller/meta.py (opt-in meta-controller) ============
+# ============================================================================
+
+
+class _UCB:
+    def __init__(self, n_arms: int):
+        self.n = [0] * n_arms
+        self.r = [0.0] * n_arms
+        self.t = 0
+
+    def select(self) -> int:
+        self.t += 1
+        for i, c in enumerate(self.n):
+            if c == 0:
+                return i
+        import math
+
+        avg = [self.r[i] / self.n[i] for i in range(len(self.n))]
+        bonus = [math.sqrt(2 * math.log(self.t) / self.n[i]) for i in range(len(self.n))]
+        ucb = [avg[i] + bonus[i] for i in range(len(self.n))]
+        return int(np.argmax(ucb))
+
+    def update(self, arm: int, reward: float):
+        self.n[arm] += 1
+        self.r[arm] += reward
+
+
+class MetaControllerUCB:
+    """
+    Per-φ-family UCB over a few fixed bundles (beam, λ1, λ2, K).
+    Reward is provided by caller (e.g., acc/sec).
+    """
+
+    def __init__(self):
+        # bundles are minimal & stable; adjust offline if needed
+        self.bundle_map = {
+            "scale": [
+                dict(beam_width=64, lambda1=0.30, lambda2=0.20, max_train_pairs_for_beam=2),
+                dict(beam_width=192, lambda1=0.10, lambda2=0.10, max_train_pairs_for_beam=2),
+            ],
+            "objectness": [
+                dict(beam_width=64, lambda1=0.30, lambda2=0.20, max_train_pairs_for_beam=2),
+                dict(beam_width=192, lambda1=0.10, lambda2=0.10, max_train_pairs_for_beam=2),
+                dict(beam_width=128, lambda1=0.25, lambda2=0.15, max_train_pairs_for_beam=2),
+            ],
+            "alignment": [
+                dict(beam_width=64, lambda1=0.30, lambda2=0.20, max_train_pairs_for_beam=2),
+                dict(beam_width=128, lambda1=0.20, lambda2=0.15, max_train_pairs_for_beam=2),
+            ],
+            "default": [
+                dict(beam_width=64, lambda1=0.30, lambda2=0.20, max_train_pairs_for_beam=2),
+                dict(beam_width=192, lambda1=0.10, lambda2=0.10, max_train_pairs_for_beam=2),
+            ],
+        }
+        self.bandits = {}
+
+    def _bundles_for(self, fam: str):
+        return self.bundle_map.get(fam, self.bundle_map["default"])
+
+    def select(self, fam: str):
+        bundles = self._bundles_for(fam)
+        if fam not in self.bandits:
+            self.bandits[fam] = _UCB(len(bundles))
+        arm = self.bandits[fam].select()
+        return arm, bundles[arm]
+
+    def update(self, fam: str, arm: int, reward: float):
+        self.bandits[fam].update(arm, reward)
+
+
 def should_rotate(state: ControllerState, current_cost: float, settings: SearchSettings) -> bool:
     """Decide if controller should rotate to next mode."""
     if settings._disable_rotation:
@@ -2541,6 +2614,14 @@ def solve_task(
     features = task_features(train_pairs)
     phi = compute_phi(features)
 
+    # Meta-controller (opt-in)
+    meta = None
+    if settings.use_meta_controller:
+        meta = getattr(solve_task, "_META", None)
+        if meta is None:
+            meta = MetaControllerUCB()
+            solve_task._META = meta
+
     # --- Consensus one-step sweep (fast path) ---
     cons_prog, cons_mean = _consensus_one_step_candidate(train_pairs)
 
@@ -2549,16 +2630,41 @@ def solve_task(
     best_avg_cost = 1e9
 
     controller = ControllerState(mode="observer")
+    selected_arm = None
+    selected_bundle = None
+    selected_fam = None
 
     # If consensus is strong, accept it and let finishers polish
     if cons_prog is not None and cons_mean >= 0.80:
         best_program = cons_prog
         best_avg_cost = 1.0 - cons_mean
     else:
-        # Standard beam search on each training pair
-        for pair_idx, (x, y) in enumerate(train_pairs):
+        # Standard beam search on a subset of training pairs when consensus is weak
+        pairs_for_beam = train_pairs[:max(1, settings.max_train_pairs_for_beam)]
+        if logger:
+            print(
+                f"[beam] sampling {len(pairs_for_beam)}/{len(train_pairs)} pairs (consensus={cons_mean:.3f})"
+            )
+        selected_arm = None
+        selected_bundle = None
+        selected_fam = None
+        if meta is not None:
+            selected_fam = phi_to_family(phi)
+            selected_arm, selected_bundle = meta.select(selected_fam)
+        for pair_idx, (x, y) in enumerate(pairs_for_beam):
             # Apply controller mode bias
-            mode_settings = apply_mode_bias(settings, controller.mode)
+            if meta is not None and selected_bundle is not None:
+                from dataclasses import replace
+
+                mode_settings = replace(
+                    settings,
+                    beam_width=selected_bundle["beam_width"],
+                    lambda1=selected_bundle["lambda1"],
+                    lambda2=selected_bundle["lambda2"],
+                    max_train_pairs_for_beam=selected_bundle["max_train_pairs_for_beam"],
+                )
+            else:
+                mode_settings = apply_mode_bias(settings, controller.mode)
 
             # Search for program
             prog = beam_search_one_pair(x, y, phi, mode_settings, logger)
@@ -2817,6 +2923,14 @@ def solve_task(
 
     elapsed = time.time() - start_time
     success = best_avg_cost < 0.01
+
+    # Meta-controller reward (opt-in)
+    if meta is not None and selected_arm is not None and selected_fam is not None:
+        try:
+            reward = max(0.0, 1.0 - float(best_avg_cost)) / (0.05 + elapsed)
+            meta.update(selected_fam, selected_arm, reward)
+        except Exception:
+            pass
 
     if logger:
         logger.log_task_end(task_id, success, elapsed)
