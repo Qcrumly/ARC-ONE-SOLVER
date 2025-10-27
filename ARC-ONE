@@ -12,7 +12,7 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.8.4 — Topology-aware refiner (fill_holes post-alignment)
+Version: v2.8.4-r2 — topo refiners gate (0.55, depth<3) + tiny cost nudge
 Enhancements:
 - v2.3.1: Centroid-biased shift enumeration for training search
 - v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
@@ -1798,6 +1798,12 @@ def compute_cost(
 
     total = c_match + c_len + c_oco - beta * acc
 
+    # shape-stage: tiny prior for topology selection ops (mirrors tile_masked prior)
+    if pred.shape == target_grid.shape and len(prog) > 0:
+        last = prog.steps[-1].op
+        if last in ("keep_rings", "fill_holes"):
+            total -= 0.01
+
     return float(total)
 
 
@@ -2231,8 +2237,8 @@ def beam_search_one_pair(
         if (
             cur_state.shape == target_grid.shape
             and (dholes_g > 0.0 or dholes_pc > 0.0)
-            and acc_proxy >= 0.60
-            and current.depth < 2
+            and acc_proxy >= 0.55
+            and current.depth < 3
         ):
             try:
                 ring_prog = current.program.copy()
@@ -2250,8 +2256,8 @@ def beam_search_one_pair(
         if (
             cur_state.shape == target_grid.shape
             and (dholes_g < 0.0 or dholes_pc < 0.0)
-            and acc_proxy >= 0.60
-            and current.depth < 2
+            and acc_proxy >= 0.55
+            and current.depth < 3
         ):
             try:
                 fill_prog = current.program.copy()
