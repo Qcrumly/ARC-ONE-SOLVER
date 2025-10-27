@@ -12,7 +12,7 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.8.7 — “Schedule & Topo Hardened”
+Version: v2.8.7-hotfix1 — Two-Attempts Align Crash Guard
 Enhancements:
 - v2.8.7: Schedule search helper, topology side-channel hardening, two-attempts default, and replay hooks.
 - v2.8.6: Topology side-channel (_topo_hint) fixes conditional refiner gating while keeping φ at 8-D.
@@ -82,9 +82,8 @@ Enhancements:
 
 from __future__ import annotations
 
-__version__ = "v2.8.7"
-# v2.8.7 “Schedule & Topo Hardened”
-# - forward type-hint fix; topology side-channel; progressive schedule; always-two-attempts; replay + helpers.
+__version__ = "v2.8.7-hotfix1"
+# Fix: dimension-safe two-attempts align path (_center_on_mass_np); guards in strategy builder.
 
 last_best_program = None
 
@@ -156,25 +155,30 @@ def _symmetry_flags_np(grid_ll):
 
 
 def _center_on_mass_np(grid_ll):
-    g = np.array(grid_ll)
+    """
+    Center non-zero mass of a predicted grid. Guaranteed no-crash:
+    - No-op if grid is not 2D
+    - No-op if mask empty or indices weird
+    """
+    g = np.asarray(grid_ll)
+    # Guard: only operate on 2-D grids
+    if g.ndim != 2:
+        return g.tolist() if hasattr(g, "tolist") else grid_ll
+
     mask = (g != 0)
     if not mask.any():
         return g.tolist()
+
     ys, xs = np.where(mask)
+    # Extra guard: require 1D coordinate arrays
+    if ys.ndim != 1 or xs.ndim != 1 or ys.size == 0 or xs.size == 0:
+        return g.tolist()
+
     cy, cx = int(np.round(ys.mean())), int(np.round(xs.mean()))
     H, W = g.shape
-    ty = (H // 2) - cy
-    tx = (W // 2) - cx
-    out = np.zeros_like(g)
-    y_src0 = max(0, -ty)
-    y_dst0 = max(0, ty)
-    x_src0 = max(0, -tx)
-    x_dst0 = max(0, tx)
-    h = min(H - y_dst0, H - y_src0)
-    w = min(W - x_dst0, W - x_src0)
-    if h > 0 and w > 0:
-        out[y_dst0:y_dst0 + h, x_dst0:x_dst0 + w] = g[y_src0:y_src0 + h, x_src0:x_src0 + w]
-    return out.tolist()
+    dy, dx = H // 2 - cy, W // 2 - cx
+    g2 = np.roll(np.roll(g, dy, axis=0), dx, axis=1)
+    return g2.tolist()
 
 
 def _translate_toward_input_centroid_np(pred_ll, x_in_ll):
@@ -438,7 +442,10 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
                 else:
                     result = _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
             elif fam == "align":
-                result = _center_on_mass_np(att1_ll)
+                try:
+                    result = _center_on_mass_np(att1_ll)
+                except Exception:
+                    result = att1_ll
             elif fam == "objectness":
                 if test_input_ll is not None:
                     result = _translate_toward_input_centroid_np(att1_ll, test_input_ll)
