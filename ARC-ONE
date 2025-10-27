@@ -12,7 +12,7 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.8.3 — Topology-aware refiner (keep_rings post-alignment)
+Version: v2.8.4 — Topology-aware refiner (fill_holes post-alignment)
 Enhancements:
 - v2.3.1: Centroid-biased shift enumeration for training search
 - v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
@@ -2245,6 +2245,25 @@ def beam_search_one_pair(
             except Exception:
                 pass
         # --- end v2.8.3 insert ---
+
+        # --- v2.8.4 Topology-aware refiner: fill_holes post-alignment ---
+        if (
+            cur_state.shape == target_grid.shape
+            and (dholes_g < 0.0 or dholes_pc < 0.0)
+            and acc_proxy >= 0.60
+            and current.depth < 2
+        ):
+            try:
+                fill_prog = current.program.copy()
+                fill_prog.steps.append(Step("fill_holes", ()))
+                sig = fill_prog.to_tuple()
+                if sig not in visited:
+                    cost_fill = compute_cost(fill_prog, input_grid, target_grid, phi, settings)
+                    beam.append(Candidate(fill_prog, cost_fill, current.depth + 1))
+                    visited.add(sig)
+            except Exception:
+                pass
+        # --- end v2.8.4 insert ---
 
         # --- Conditional Smart Refiner (one extra post-shape step) ---
         try:
