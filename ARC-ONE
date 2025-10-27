@@ -12,7 +12,7 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.8.2 — Topology-aware ops + gated seeds
+Version: v2.8.3 — Topology-aware refiner (keep_rings post-alignment)
 Enhancements:
 - v2.3.1: Centroid-biased shift enumeration for training search
 - v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
@@ -2209,6 +2209,42 @@ def beam_search_one_pair(
                 no_shape_seen = False
         except Exception:
             cur_state = input_grid
+
+        # --- v2.8.3 Topology-aware refiner: keep_rings post-alignment ---
+        try:
+            dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+            if len(phi) >= 12:
+                dholes_g = float(phi[-4])
+                dcomps_g = float(phi[-3])
+                dholes_pc = float(phi[-2])
+                dcomps_pc = float(phi[-1])
+        except Exception:
+            dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+
+        acc_proxy = 0.0
+        try:
+            if cur_state.shape == target_grid.shape:
+                acc_proxy = float((cur_state == target_grid).mean())
+        except Exception:
+            acc_proxy = 0.0
+
+        if (
+            cur_state.shape == target_grid.shape
+            and (dholes_g > 0.0 or dholes_pc > 0.0)
+            and acc_proxy >= 0.60
+            and current.depth < 2
+        ):
+            try:
+                ring_prog = current.program.copy()
+                ring_prog.steps.append(Step("keep_rings", ()))
+                sig = ring_prog.to_tuple()
+                if sig not in visited:
+                    cost_ring = compute_cost(ring_prog, input_grid, target_grid, phi, settings)
+                    beam.append(Candidate(ring_prog, cost_ring, current.depth + 1))
+                    visited.add(sig)
+            except Exception:
+                pass
+        # --- end v2.8.3 insert ---
 
         # --- Conditional Smart Refiner (one extra post-shape step) ---
         try:
