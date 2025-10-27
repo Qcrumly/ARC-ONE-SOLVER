@@ -12,7 +12,7 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.8.4-r2 — topo refiners gate (0.55, depth<3) + tiny cost nudge
+Version: v2.8.5 — remove_isolated(min_size) + light seeds
 Enhancements:
 - v2.3.1: Centroid-biased shift enumeration for training search
 - v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
@@ -922,6 +922,24 @@ def _op_keep_rings(grid: np.ndarray) -> np.ndarray:
     return out
 
 
+def _op_remove_isolated(grid: np.ndarray, min_size: int) -> np.ndarray:
+    """Remove color components smaller than min_size (per color), keep the rest."""
+    out = grid.copy()
+    structure = np.ones((3, 3), dtype=int)
+    for c in np.unique(grid):
+        if c == 0:
+            continue
+        mask = (grid == c).astype(np.uint8)
+        if not mask.any():
+            continue
+        lbl, n = _cc_label(mask, structure=structure)
+        for k in range(1, n + 1):
+            comp = lbl == k
+            if np.count_nonzero(comp) < int(min_size):
+                out[comp] = 0
+    return out
+
+
 def _op_keep_n_largest(grid, n):
     """keep_n_largest <n>
     Keep only the n largest connected components by size.
@@ -1293,6 +1311,7 @@ OP_NAMES_BASIC = [
     ("largest", 1, ["grid"]),
     ("fill_holes", 1, ["grid"]),
     ("keep_rings", 1, ["grid"]),
+    ("remove_isolated", 2, ["grid", "int"]),
     ("stack", 3, ["grid", "grid", "int"]),
     ("subtract", 2, ["grid", "grid"]),
 ]
@@ -1322,6 +1341,7 @@ OP_REGISTRY = {
     "largest": _op_largest,
     "fill_holes": _op_fill_holes,
     "keep_rings": _op_keep_rings,
+    "remove_isolated": _op_remove_isolated,
     "keep_n_largest": _op_keep_n_largest,
     "keep_size_range": _op_keep_size_range,
     "resize": _op_resize,
@@ -1344,7 +1364,7 @@ OP_ORDER_O2 = [
     # Core geometry next
     "rot90", "mirror", "transpose", "shift", "crop", "grow", "shrink",
     # Composition / structural
-    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "fill_holes", "keep_rings", "scale", "duplicate",
+    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "remove_isolated", "fill_holes", "keep_rings", "scale", "duplicate",
     # Color / palette last
     "mask", "replacecolor", "swapcolors", "invert", "fill", "outline", "threshold", "majority", "minority",
 ]
@@ -1356,7 +1376,7 @@ _OP_RANK = {name: i for i, name in enumerate(OP_ORDER_O2)}
 SHAPE_OPS = {
     "tile", "tile_masked", "phase_tile_row", "phase_tile_col", "phase_tile", "resize",
     "rot90", "mirror", "transpose", "shift", "crop", "grow", "shrink",
-    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "fill_holes", "keep_rings", "scale", "duplicate",
+    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "remove_isolated", "fill_holes", "keep_rings", "scale", "duplicate",
 }
 COLOR_OPS = {
     "mask", "replacecolor", "swapcolors", "invert", "fill", "outline", "threshold", "majority", "minority",
@@ -2018,6 +2038,8 @@ def _int_space_for(op_name, idx, ctx):
         return pairs or [(1, 2), (2, 3), (3, 4)]
     if op_name in ("fill_holes", "keep_rings"):
         return [()]
+    if op_name == "remove_isolated":
+        return [(1,), (2,), (3,)]
     if op_name == "keep_n_largest":
         return [(1,), (2,), (3,)]
     if op_name == "keep_size_range":
@@ -2076,6 +2098,14 @@ def beam_search_one_pair(
             seeds.insert(0, Program([Step("keep_rings", ())]))
         if dholes_g < 0.0 or dholes_pc < 0.0:
             seeds.append(Program([Step("fill_holes", ())]))
+    except Exception:
+        pass
+
+    # if shape is identical sizes and accuracy is high-ish, try denoising early
+    try:
+        if target_grid.size == input_grid.size:
+            seeds.append(Program([Step("remove_isolated", (1,))]))
+            seeds.append(Program([Step("remove_isolated", (2,))]))
     except Exception:
         pass
 
