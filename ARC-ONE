@@ -12,8 +12,9 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.8.7-hotfix1 — Two-Attempts Align Crash Guard
+Version: v2.9.0 — Prior & Finishers
 Enhancements:
+- v2.9.0: Policy prior hook for beam expansion, late auto-refiners, optional trace tap for operator deltas.
 - v2.8.7: Schedule search helper, topology side-channel hardening, two-attempts default, and replay hooks.
 - v2.8.6: Topology side-channel (_topo_hint) fixes conditional refiner gating while keeping φ at 8-D.
 - v2.3.1: Centroid-biased shift enumeration for training search
@@ -82,8 +83,8 @@ Enhancements:
 
 from __future__ import annotations
 
-__version__ = "v2.8.7-hotfix1"
-# Fix: dimension-safe two-attempts align path (_center_on_mass_np); guards in strategy builder.
+__version__ = "v2.9.0"
+# v2.9.0 “Prior & Finishers”: policy prior hook; late auto-refiners; optional trace tap.
 
 last_best_program = None
 
@@ -982,6 +983,55 @@ def get_test_truths(solutions_obj: dict, tid: str):
         else:
             resolved.append(np.array(out, dtype=np.int32))
     return resolved
+
+
+# ===== v2.9.0: Policy Prior =====
+
+
+class PolicyPrior:
+    """Return an additive logit (prior) for an operator under context."""
+
+    def op_logit(self, op_name: str, ctx) -> float:
+        return 0.0
+
+
+class HeuristicPrior(PolicyPrior):
+    """
+    Heuristic prior using φ-family hints (scale, objectness, palette, alignment, geometry, pattern, topology, composition)
+    and simple grid checks (divisibility for tiling, symmetry flags if available).
+    """
+
+    def op_logit(self, op_name: str, ctx) -> float:
+        # ctx: dict with fields we pass from the beam: phi, grid, grid_shape, divs, sym, family
+        divs = ctx.get("divs", ())
+        family = ctx.get("family", None)
+
+        score = 0.0
+
+        if ("tile" in op_name or "phase_tile" in op_name) and divs:
+            score += 0.6
+
+        if family in ("alignment", "geometry") and (
+            "mirror" in op_name or "rot" in op_name
+        ):
+            score += 0.3
+
+        if family in ("objectness", "topology") and (
+            "keep_n_largest" in op_name
+            or "fill_holes" in op_name
+            or "remove_isolated" in op_name
+        ):
+            score += 0.25
+
+        if family == "palette" and any(word in op_name for word in ("palette_map", "recolor")):
+            score += 0.2
+        elif family != "palette" and "palette" in op_name:
+            score -= 0.15
+
+        return score
+
+
+_DEFAULT_POLICY_PRIOR = HeuristicPrior()
 
 
 def _op_fill_holes(grid: np.ndarray) -> np.ndarray:
@@ -2162,6 +2212,10 @@ def beam_search_one_pair(
     Returns the best program found, or None if time/depth exceeded.
     """
     start_time = time.time()
+    policy_prior = getattr(settings, "_policy_prior", _DEFAULT_POLICY_PRIOR) or _DEFAULT_POLICY_PRIOR
+    trace_buffer = getattr(settings, "_trace_buffer", None) if getattr(settings, "_trace_ops", False) else None
+    family_hint = phi_to_family(phi)
+    divs_hint = _divisible_shape(input_grid.shape, target_grid.shape)
 
     # Early-abort tracking (no-shape)
     no_shape_seen = True           # flip to False once any successor matches target shape
@@ -2455,28 +2509,53 @@ def beam_search_one_pair(
                 continue
             visited.add(prog_sig)
 
+            op_name = succ_prog.steps[-1].op if succ_prog.steps else ""
+
             # Compute cost
             cost = compute_cost(succ_prog, input_grid, target_grid, phi, settings)
 
             # Check successor output for tie-break, early exit, and shape tracking
+            pred = None
             try:
                 pred = interpret_program(succ_prog, input_grid)
-                
+
                 # Track shape match
                 if pred.shape == target_grid.shape:
                     no_shape_seen = False
-                
+
                 # Tiny tie-break for tile_masked when shape matches
                 if pred.shape == target_grid.shape:
                     last = succ_prog.steps[-1].op if succ_prog.steps else None
                     if last == "tile_masked":
                         cost -= 0.02
-                    
+
                     # Early exit if exact match
                     if np.array_equal(pred, target_grid):
                         return succ_prog
             except Exception:
                 pass
+
+            # Apply policy prior as an additive bonus in score space (subtract from cost)
+            try:
+                grid_shape = pred.shape if isinstance(pred, np.ndarray) else (None, None)
+                ctx_prior = {
+                    "phi": phi,
+                    "grid": pred,
+                    "grid_shape": grid_shape,
+                    "divs": divs_hint if divs_hint is not None else (),
+                    "family": family_hint,
+                }
+                prior_logit = policy_prior.op_logit(op_name, ctx_prior)
+                cost -= 0.05 * prior_logit
+            except Exception:
+                pass
+
+            if trace_buffer is not None and op_name:
+                try:
+                    delta_cost = float(cost - current.cost)
+                except Exception:
+                    delta_cost = float(cost)
+                trace_buffer.append((op_name, delta_cost))
 
             # Add to beam
             new_cand = Candidate(succ_prog, cost, current.depth + 1)
@@ -2900,6 +2979,12 @@ def solve_task(
     features = task_features(train_pairs)
     phi = compute_phi(features)
 
+    if getattr(settings, "_policy_prior", None) is None:
+        settings._policy_prior = _DEFAULT_POLICY_PRIOR
+
+    trace = getattr(settings, "_trace_ops", False)
+    settings._trace_buffer = []
+
     # --- Topology hint (side-channel): averages over train pairs ---
     dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
     for xi, yi in train_pairs:
@@ -2970,6 +3055,10 @@ def solve_task(
             topo_hint = getattr(settings, "_topo_hint", None)
             if topo_hint is not None:
                 setattr(mode_settings, "_topo_hint", topo_hint)
+            setattr(mode_settings, "_policy_prior", getattr(settings, "_policy_prior", _DEFAULT_POLICY_PRIOR))
+            setattr(mode_settings, "_trace_ops", getattr(settings, "_trace_ops", False))
+            if hasattr(settings, "_trace_buffer"):
+                setattr(mode_settings, "_trace_buffer", getattr(settings, "_trace_buffer"))
 
             # Search for program
             prog = beam_search_one_pair(x, y, phi, mode_settings, logger)
@@ -3137,6 +3226,41 @@ def solve_task(
             if avg_p2 < avg_best:
                 best_program = prog2
 
+    # ===== v2.9.0: Late auto-refiners =====
+    if best_program is not None:
+        def _avg_train_cost_pixels(prog: Program) -> float:
+            errs = []
+            for xi, yi in train_pairs:
+                try:
+                    pred = interpret_program(prog, xi)
+                    tgt = np.asarray(yi)
+                    if pred.shape != tgt.shape:
+                        errs.append(1.0)
+                    else:
+                        errs.append(float((pred != tgt).mean()))
+                except Exception:
+                    errs.append(1.0)
+            return float(np.mean(errs)) if errs else 1.0
+
+        try:
+            base_cost_px = _avg_train_cost_pixels(best_program)
+            if base_cost_px <= 0.25:
+                candidates = []
+                base_steps = [Step(s.op, s.args) for s in best_program.steps]
+                prog_keep = Program(base_steps + [Step("keep_n_largest", (1,))])
+                prog_fill = Program(base_steps + [Step("fill_holes", tuple())])
+                candidates.append(("keep_n_largest(1)", prog_keep, _avg_train_cost_pixels(prog_keep)))
+                candidates.append(("fill_holes", prog_fill, _avg_train_cost_pixels(prog_fill)))
+                _, best_prog2, best_cost_px = min(candidates, key=lambda t: t[2])
+                if best_cost_px + 1e-9 < base_cost_px:
+                    best_program = best_prog2
+                    # refresh best_avg_cost in the same metric used by the search loop
+                    best_avg_cost = np.mean(
+                        [compute_cost(best_program, xi, yi, phi, settings) for (xi, yi) in train_pairs]
+                    )
+        except Exception:
+            pass
+
     # Apply best program to test inputs
     # Learn palette map once from training pairs (used for TRAIN evaluation only)
     palette_map = _palette_map_from_train_pairs(train_pairs)
@@ -3272,6 +3396,9 @@ def solve_task(
         except Exception:
             pass
 
+    if trace and logger:
+        print(f"[trace] collected {len(getattr(settings, '_trace_buffer', []))} op deltas")
+
     if logger:
         logger.log_task_end(task_id, success, elapsed)
 
@@ -3310,7 +3437,7 @@ def solve_task_with_schedule(
     for beam_width, max_depth in schedules:
         sub = replace(settings, beam_width=beam_width, max_depth=max_depth)
         # propagate auxiliary hooks if present
-        for attr in ("_truths_provider",):
+        for attr in ("_truths_provider", "_policy_prior", "_trace_ops"):
             if hasattr(settings, attr):
                 setattr(sub, attr, getattr(settings, attr))
 
