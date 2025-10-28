@@ -12,8 +12,10 @@ Complete implementation of M1-M7:
 - M6: Controller rotation (Observer/Navigator/Explorer)
 - M7: ARC I/O + telemetry + submission packaging
 
-Version: v2.9.0 — Prior & Finishers
+Version: v2.9.1 — Flip the Near-Miss
 Enhancements:
+- v2.9.1: Looser late auto-refiners with additional keep_n_largest(2), symmetry-friendly
+  alternates, and faster stall cutoff for small grids.
 - v2.9.0: Policy prior hook for beam expansion, late auto-refiners, optional trace tap for operator deltas.
 - v2.8.7: Schedule search helper, topology side-channel hardening, two-attempts default, and replay hooks.
 - v2.8.6: Topology side-channel (_topo_hint) fixes conditional refiner gating while keeping φ at 8-D.
@@ -83,8 +85,8 @@ Enhancements:
 
 from __future__ import annotations
 
-__version__ = "v2.9.0"
-# v2.9.0 “Prior & Finishers”: policy prior hook; late auto-refiners; optional trace tap.
+__version__ = "v2.9.1"
+# v2.9.1 “Flip the Near-Miss”: refined finishers, symmetry alternates, quicker stall aborts.
 
 last_best_program = None
 
@@ -180,6 +182,13 @@ def _center_on_mass_np(grid_ll):
     dy, dx = H // 2 - cy, W // 2 - cx
     g2 = np.roll(np.roll(g, dy, axis=0), dx, axis=1)
     return g2.tolist()
+
+
+def _rot90_np(grid_ll):
+    g = np.asarray(grid_ll)
+    if g.ndim != 2:
+        return g.tolist() if hasattr(g, "tolist") else g
+    return np.rot90(g, 1).tolist()
 
 
 def _translate_toward_input_centroid_np(pred_ll, x_in_ll):
@@ -378,6 +387,12 @@ def _truncate_at_last_tile_masked(prog):
 
 def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_ll):
     g = np.array(att1_ll)
+    fam_hint = None
+    if phi_arr is not None:
+        try:
+            fam_hint = phi_to_family(np.asarray(phi_arr))
+        except Exception:
+            fam_hint = None
 
     if strategy == "rotate90":
         result = np.rot90(g, 1).tolist()
@@ -421,9 +436,9 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
             result = _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
         else:
             a = np.abs(np.array(phi_arr))
-            scores = {"geom": float(a[3]), "palette": float(a[2]), "align": float(a[4]), "objectness": float(a[1])}
+            scores = {"geometry": float(a[3]), "palette": float(a[2]), "alignment": float(a[4]), "objectness": float(a[1])}
             fam = max(scores.items(), key=lambda kv: kv[1])[0]
-            if fam == "geom":
+            if fam == "geometry":
                 if test_input_ll is not None:
                     Hs, Vs, Rs = _symmetry_flags_np(test_input_ll)
                     if Rs:
@@ -442,7 +457,7 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
                     result = _apply_palette_map_ll(att1_ll, mapping)
                 else:
                     result = _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
-            elif fam == "align":
+            elif fam == "alignment":
                 try:
                     result = _center_on_mass_np(att1_ll)
                 except Exception:
@@ -454,6 +469,11 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
                     result = _center_on_mass_np(att1_ll)
             else:
                 result = _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
+    elif fam_hint in ("alignment", "geometry"):
+        try:
+            result = _rot90_np(att1_ll)
+        except Exception:
+            result = att1_ll
     else:
         result = att1_ll
 
@@ -467,6 +487,15 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
             # For now, we'll just return the palette-remapped version
 
     att2 = result
+    try:
+        if fam_hint in ("alignment", "geometry"):
+            base_np = np.asarray(att1_ll)
+            res_np = np.asarray(att2)
+            if res_np.ndim != 2 or np.array_equal(res_np, base_np):
+                att2 = _rot90_np(att1_ll)
+    except Exception:
+        att2 = att1_ll
+
     att2_np = np.asarray(att2)
     if att2_np.ndim != 2:
         return att1_ll
@@ -2225,6 +2254,15 @@ def beam_search_one_pair(
     last_improve_t = time.time()
     best_cost_seen = 1e9
     stall_window = settings.max_seconds / 3.0  # same scale as no-shape abort
+    try:
+        area = int(np.prod(target_grid.shape))
+    except Exception:
+        area = None
+    if area is not None:
+        if area <= 400:
+            stall_window = min(stall_window, 0.6)
+        else:
+            stall_window = min(stall_window, 1.0)
 
     # Build context for op-specific argument generation
     ctx = build_synth_context(input_grid, target_grid)
@@ -3226,7 +3264,7 @@ def solve_task(
             if avg_p2 < avg_best:
                 best_program = prog2
 
-    # ===== v2.9.0: Late auto-refiners =====
+    # ===== v2.9.1: Late auto-refiners (looser gate, extra candidate) =====
     if best_program is not None:
         def _avg_train_cost_pixels(prog: Program) -> float:
             errs = []
@@ -3244,17 +3282,18 @@ def solve_task(
 
         try:
             base_cost_px = _avg_train_cost_pixels(best_program)
-            if base_cost_px <= 0.25:
+            if base_cost_px <= 0.45:
                 candidates = []
                 base_steps = [Step(s.op, s.args) for s in best_program.steps]
-                prog_keep = Program(base_steps + [Step("keep_n_largest", (1,))])
+                prog_keep1 = Program(base_steps + [Step("keep_n_largest", (1,))])
+                prog_keep2 = Program(base_steps + [Step("keep_n_largest", (2,))])
                 prog_fill = Program(base_steps + [Step("fill_holes", tuple())])
-                candidates.append(("keep_n_largest(1)", prog_keep, _avg_train_cost_pixels(prog_keep)))
+                candidates.append(("keep_n_largest(1)", prog_keep1, _avg_train_cost_pixels(prog_keep1)))
+                candidates.append(("keep_n_largest(2)", prog_keep2, _avg_train_cost_pixels(prog_keep2)))
                 candidates.append(("fill_holes", prog_fill, _avg_train_cost_pixels(prog_fill)))
                 _, best_prog2, best_cost_px = min(candidates, key=lambda t: t[2])
                 if best_cost_px + 1e-9 < base_cost_px:
                     best_program = best_prog2
-                    # refresh best_avg_cost in the same metric used by the search loop
                     best_avg_cost = np.mean(
                         [compute_cost(best_program, xi, yi, phi, settings) for (xi, yi) in train_pairs]
                     )
