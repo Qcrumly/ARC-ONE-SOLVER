@@ -20,6 +20,13 @@ from __future__ import annotations
 
 last_best_program = None
 
+from __future__ import annotations
+
+__version__ = "v2.9.2"
+# v2.9.2 “Debate & Palette Guard”: diversity-driven alternates, rho-adaptive aborts, staged runs.
+
+last_best_program = None
+
 _NUMPY_IMPORT_ERROR = (
     "ARC-ONE requires the 'numpy' package. Install it with `pip install numpy` "
     "or ensure it is available in your execution environment before running the solver."
@@ -3831,6 +3838,41 @@ def solve_task(
         settings.always_two_attempts
         and predictions
         and not (isinstance(predictions[0], dict) and ("attempt_1" in predictions[0] or "grid" in predictions[0]))
+    ):
+        enhanced = []
+        for grid in predictions:
+            try:
+                g = np.asarray(grid)
+                alt_cands = [
+                    np.rot90(g, k=1),
+                    np.rot90(g, k=2),
+                    np.rot90(g, k=3),
+                    np.fliplr(g),
+                    np.flipud(g),
+                ]
+                attempt_2 = alt_cands[0]
+                enhanced.append(
+                    {
+                        "attempt_1": g.tolist(),
+                        "attempt_2": attempt_2.tolist(),
+                    }
+                )
+            except Exception:
+                fallback = grid.tolist() if hasattr(grid, "tolist") else grid
+                enhanced.append({"attempt_1": fallback, "attempt_2": fallback})
+        predictions = enhanced
+
+    # v2.8.7: expose last program for replay/debugging
+    try:
+        globals()["last_best_program"] = best_program
+    except Exception:
+        pass
+
+    # v2.8.7: universal two-attempts for non-tiling programs
+    if (
+        settings.always_two_attempts
+        and predictions
+        and not (isinstance(predictions[0], dict) and "attempt_1" in predictions[0])
     ):
         enhanced = []
         for grid in predictions:
