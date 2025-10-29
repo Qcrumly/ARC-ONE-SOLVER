@@ -1,89 +1,24 @@
-"""
-================================================================================
-ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
-================================================================================
+# ==================================================================================
+# ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
+# ==================================================================================
+#
+# Version: v2.9.3 — HFP ρ Wiring & Staged Early-Exit
+#
+# Enhancements:
+# - v2.9.3: Real C/ρ tracker wired into settings (_hfp_prevC/_hfp_rho/_hfp_rho_smoothed/_hfp_ready),
+#           enabling ρ-adaptive abort windows and bounded A↔B debate.
+#           Belief pass-through for TEST predictions (align_dy_dx, block_mask, block_proj) so alternates are targeted.
+#           Candidate-pool + IoU diversity guard for non-tilers (useful disagreement > 0).
+#           Palette guard fixed (structure-safe mapping via _palette_map_from_train_pairs).
+#           attempt2_strategy honored (seeded candidate in alternates list).
+#           Staged runner now keeps best-so-far and early-exits when diversity achieved.
+#           Duplicate topology-hint block removed; telemetry cleaned.
+# - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
+__version__ = "v2.9.3"
 
-Complete implementation of M1-M7:
-- M1: Minimal DSL with 24 operations + interpreter
-- M2: Perception v0 with task feature extraction
-- M3: Octonion guidance with φ embedding
-- M4: Associator tension tracking + OCO cost overlay
-- M5: OCO-guided beam search
-- M6: Controller rotation (Observer/Navigator/Explorer)
-- M7: ARC I/O + telemetry + submission packaging
+from __future__ import annotations
 
-Version: v2.9.2 — Debate & Palette Guard
-Enhancements:
-- v2.9.2: Two-attempt debate with diversity guard, rho-adaptive aborts, palette safety, and
-  stage-aware scheduling.
-- v2.9.1: Looser late auto-refiners with additional keep_n_largest(2), symmetry-friendly
-  alternates, and faster stall cutoff for small grids.
-- v2.9.0: Policy prior hook for beam expansion, late auto-refiners, optional trace tap for operator deltas.
-- v2.8.7: Schedule search helper, topology side-channel hardening, two-attempts default, and replay hooks.
-- v2.8.6: Topology side-channel (_topo_hint) fixes conditional refiner gating while keeping φ at 8-D.
-- v2.3.1: Centroid-biased shift enumeration for training search
-- v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
-- v2.5: Block-mask finisher learns k×k (3×3 or 5×5) block-presence masks from
-  training targets via majority vote, zeros unwanted tiled blocks for sparse
-  tiling tasks, applied after alignment and before palette remapping
-- v2.6: Blockwise color finisher learns k×k dominant-color projection from training
-  targets, projects each block to learned dominant color for sparse/alternating
-  block patterns, applied after alignment/block-mask and before palette
-- v2.7: Added tile_masked operation for sparse lattice patterns (cross/border modes),
-  enables plus-frame and perimeter-only tiling patterns, controller tuning for
-  improved exploration (rotate at 0.98, explorer beam 384)
-- v2.7.1: Shape-stage accuracy bias: when pred.shape == target.shape, downweight
-  OCO (λ2 × 0.3) and add pixel accuracy bonus (β=0.05), plus early good-enough
-  latch for seeds (acc >= 0.80) and mild tile_masked prior (-0.02) during shape stage
-- v2.7.2: Baked phase-tile tension vectors (all tiling ops get [1,0,0,0,0,0,1,0] 
-  to avoid zero-tension free ride), downweight both λ₁ (×0.50) and λ₂ (×0.30) when
-  shape matches, enhanced early latch with palette finisher attempt and tile_masked
-  tie-breaker (-0.02) for stable beam expansion on high-accuracy seeds
-- v2.7.3: Seed-primed beam initialization via _quick_shape_candidates helper that
-  scores all single-step tiling variants (tile, tile_masked, phase_tile_*) by pixel
-  accuracy, early-latch returns immediately if seed+palette is exact, beam starts
-  from top-3 accuracy-ranked seeds plus empty fallback for robust exploration
-- v2.7.4: Consensus one-step sweep at solve_task start evaluates all tiling variants
-  across ALL training pairs, accepts if mean accuracy >= 0.80 (fast path), optional
-  shift micro-refinement tries ±1 deltas for tile_masked consensus solutions to fix
-  off-by-one placement, beam search only runs if consensus fails or is weak
-- v2.7.5: Conditional smart refiner in beam loop adds up to 3 targeted branches when
-  shape matches and depth < 2 with acc >= 0.60: (1) alignment-guided shift from
-  bbox+xcorr, (2) alternate tile_masked mode (swap cross/border), (3) mirror when
-  acc >= 0.70; supplements standard successors without changing gating or finishers
-- v2.7.6: Pareto-safe palette guard validates palette mapping on all training pairs,
-  only applies to test predictions if it maintains or improves accuracy on every
-  training pair (prevents palette-induced regressions)
-- v2.7.7b: Automatic two-attempts for tile_masked programs ending with mode m∈{0,1},
-  always emits {"attempt_1": primary, "attempt_2": alternate_mode} with independent
-  finisher application, no flag needed (automatic detection), fallback to attempt_1
-  if alternate fails, single-grid output for all other programs
-- v2.7.7c: Two-attempts backward scan - finds last tile_masked(ky,kx,m) in program
-  even when finishers (palette/shift/etc) follow it, swaps mode 0↔1 while preserving
-  all trailing steps for robust alternate attempt generation
-- v2.7.7d: Removed palette remapping from TEST predictions (kept Pareto-safe palette
-  guard for TRAIN evaluation), applies only alignment/block-mask/blockwise-projection
-  finishers to test outputs for cleaner generalization
-- v2.7.7e: Bypass ALL finishers on TEST for masked-tiling two-attempts (no alignment,
-  block-mask, blockwise-projection, or palette); emit raw program outputs to preserve
-  border≈0.852 vs cross≈0.630 distinction; finishers still applied for TRAIN-FIT and
-  single-attempt programs
-- v2.7.7f: Two-attempts use truncated shape-base programs cut after last tile_masked,
-  discarding any trailing finisher steps; both attempts use identical base transform
-  with only mode (0↔1) swapped, ensuring pure apples-to-apples comparison of border
-  vs cross patterns on TEST
-- v2.7.8: Early-abort when ⅓ budget spent without shape progress (returns best-so-far
-  or resize fallback); added keep_n_largest and keep_size_range component filter ops
-  for connected component selection/filtering in shape family
-- v2.7.8b: Added no-improvement early-abort (triggers when no cost improvement over
-  ⅓ window); dual abort mechanisms catch both no-shape-progress and optimization
-  stalls for faster failure on intractable tasks
-- v2.7.8c: Hard-cap timeout immediately returns best-so-far (or resize fallback) instead
-  of breaking from loop, eliminating any post-timeout overhead
-- v2.7.9: Pair sampling when consensus fails - beam search runs on first K training pairs
-  only (default K=2) instead of all pairs, preserving accuracy while cutting time on
-  slow tasks; program still evaluated on all pairs for generalization measurement
-"""
+last_best_program = None
 
 from __future__ import annotations
 
@@ -480,15 +415,6 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
     else:
         result = att1_ll
 
-    # Apply palette remapping as a finishing step (like solve_task does)
-    # This can improve accuracy by fixing color mismatches
-    if train_pairs and strategy not in ("palette_swap",):  # Don't double-apply
-        mapping = _palette_map_from_train_pairs(train_pairs)
-        if mapping:
-            result = _apply_palette_map_ll(result, mapping)
-            # In a production setting, you might want to score both and pick the best
-            # For now, we'll just return the palette-remapped version
-
     att2 = result
     try:
         if fam_hint in ("alignment", "geometry"):
@@ -810,10 +736,10 @@ def _structure_ok(a, b, train_pairs=None):
 
 def _palette_map_if_pareto_safe(grid, train_pairs, guard="structure"):
     try:
-        mapper = globals().get("map_palette") or globals().get("_map_palette")
-        if mapper is None:
+        mapping = _palette_map_from_train_pairs(train_pairs or [])
+        if not mapping:
             return grid, False
-        candidate = mapper(grid, train_pairs)
+        candidate = _apply_palette_map_ll(grid, mapping)
         if guard == "structure" and not _structure_ok(grid, candidate, train_pairs):
             return grid, False
         return candidate, True
@@ -855,11 +781,7 @@ def _maybe_escalate_K(cons_mean, rho_samples, settings, n_train_pairs):
 def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settings_proto=None):
     stages = [(24, 3, 4.0), (96, 7, 45.0), (128, 8, 120.0)]
     if seconds is not None:
-        if seconds < 10.0:
-            stages = [(96, 7, float(seconds))]
-        else:
-            stages = [(24, 3, 4.0), (96, 7, float(seconds))]
-
+        stages = [(24, 3, 4.0), (96, 7, float(seconds))] if seconds >= 10.0 else [(96, 7, float(seconds))]
     loader = globals().get("_load_test_challenges") or globals().get("load_tasks")
     if loader is None:
         raise RuntimeError("task loader not found")
@@ -867,25 +789,34 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
     tids = list(panel_ids) if panel_ids else list(challenges.keys())
     outputs = {}
 
+    def _score(preds):
+        if not preds:
+            return (0, 0.0)
+        if isinstance(preds[0], dict) and "attempt_1" in preds[0]:
+            ious = [_pixel_iou(d["attempt_1"], d["attempt_2"]) for d in preds]
+            div = 1.0 - float(sum(ious) / len(ious))
+            return (2, div)
+        return (1, 0.0)
+
     for tid in tids:
         task_json = challenges[tid]
+        best, best_tag = None, (0, 0.0)
         for beam, depth, secs in stages:
             proto = settings_proto or SearchSettings()
-            stage_settings = replace(
-                proto,
-                beam_width=beam,
-                max_depth=depth,
-                max_seconds=secs,
-                use_meta_controller=True,
-            )
+            stage_settings = replace(proto, beam_width=beam, max_depth=depth, max_seconds=secs, use_meta_controller=True)
             start = time.time()
             res = solve_task(tid, task_json, stage_settings, logger=logger)
             elapsed = time.time() - start
-            outputs[tid] = res
             try:
                 _telemetry_note(res if isinstance(res, dict) else {}, stage_time=elapsed, stage=(beam, depth, secs))
             except Exception:
                 pass
+            sc = _score(res)
+            if best is None or sc > best_tag:
+                best, best_tag = res, sc
+                outputs[tid] = best
+            if best_tag[0] == 2 and best_tag[1] >= 0.03:
+                break
     return outputs
 
 def _build_train_test_lookups(tasks_dir):
@@ -925,6 +856,9 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             if isinstance(pred, dict) and "attempt_1" in pred:
                 base = pred["attempt_1"]
                 meta = pred
+            elif isinstance(pred, dict) and "grid" in pred:
+                base = pred["grid"]
+                meta = pred.get("meta", pred)
             else:
                 base = pred
                 meta = pred if isinstance(pred, dict) else {}
@@ -955,7 +889,14 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                 except Exception:
                     pass
             else:
-                candidates = _alternates_from_belief(base, test_in, belief, pairs)
+                candidates = []
+                if strategy and strategy != "oco_auto":
+                    try:
+                        forced = _attempt2_from_strategy(base, strategy, phi, pairs, test_in)
+                        candidates.append({"tag": f"forced:{strategy}", "grid": forced, "conf": _surrogate_conf(forced, belief)})
+                    except Exception:
+                        pass
+                candidates.extend(_alternates_from_belief(base, test_in, belief, pairs))
                 lambda_div = getattr(settings, "div_lambda", 0.20) if settings else 0.20
                 iou_cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
                 att1_sel, att2_sel, choice = _select_best_pair(base, candidates, belief, lambda_div=lambda_div, iou_cap=iou_cap)
@@ -3416,6 +3357,54 @@ class StepLogger:
 # ============ solver/task_solver.py ============
 # ============================================================================
 
+
+def _compute_train_px_err(best_program, train_pairs, phi, settings):
+    if best_program is None or not train_pairs:
+        return 1.0, 1.0, 0.0
+    errs = []
+    shape_hits = 0
+    for (xi, yi) in train_pairs:
+        try:
+            pred = interpret_program(best_program, xi)
+            if pred.shape == yi.shape:
+                shape_hits += 1
+                errs.append(float((pred != yi).mean()))
+            else:
+                errs.append(1.0)
+        except Exception:
+            errs.append(1.0)
+    mean_err = float(sum(errs) / len(errs)) if errs else 1.0
+    var_err = float(np.var(errs)) if errs else 1.0
+    shape_rate = float(shape_hits / max(1, len(train_pairs)))
+    return mean_err, var_err, shape_rate
+
+
+def _update_rho(settings, best_program, train_pairs, phi, palette_is_safe):
+    eps = 1e-3
+    mean_err, var_err, shape_rate = _compute_train_px_err(best_program, train_pairs, phi, settings)
+    t = max(eps, 1.0 - mean_err)
+    r = 1.0 / (1.0 + max(0.0, min(1.0, var_err)))
+    u_len = 1.0 / (1.0 + (len(best_program.steps) / 10.0)) if best_program else 0.5
+    try:
+        tens = compute_program_tension(best_program, phi) if best_program else 0.0
+        u_ten = 1.0 / (1.0 + tens / 10.0)
+    except Exception:
+        u_ten = 0.7
+    u = max(eps, 0.5 * u_len + 0.5 * u_ten)
+    p = max(eps, shape_rate)
+    a = 1.0 if palette_is_safe else 0.9
+    C = max(eps, p * t * r * u * a)
+    prevC = getattr(settings, "_hfp_prevC", None)
+    rho = (C / prevC) if (prevC is not None and prevC > 0) else 1.0
+    setattr(settings, "_hfp_prevC", float(C))
+    setattr(settings, "_hfp_rho", float(rho))
+    hist = list(getattr(settings, "_rho_samples", []))
+    hist.append(float(rho))
+    setattr(settings, "_rho_samples", hist)
+    if len(hist) >= 2:
+        setattr(settings, "_hfp_ready", True)
+    return rho
+
 def solve_task(
     task_id: str,
     task_json: Dict,
@@ -3450,35 +3439,6 @@ def solve_task(
     features = task_features(train_pairs)
     phi = compute_phi(features)
     rho_samples = list(getattr(settings, "_rho_samples", []))
-
-    if getattr(settings, "_policy_prior", None) is None:
-        settings._policy_prior = _DEFAULT_POLICY_PRIOR
-
-    trace = getattr(settings, "_trace_ops", False)
-    settings._trace_buffer = []
-
-    # --- Topology hint (side-channel): averages over train pairs ---
-    dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
-    for xi, yi in train_pairs:
-        try:
-            xg = np.asarray(xi)
-            yg = np.asarray(yi)
-            dholes_g += _holes_count(yg) - _holes_count(xg)
-            dcomps_g += _component_count(yg) - _component_count(xg)
-            dholes_pc += _holes_count(yg)
-            dcomps_pc += _component_count(yg)
-        except Exception:
-            pass
-    n = float(max(1, len(train_pairs)))
-    settings._topo_hint = (dholes_g / n, dcomps_g / n, dholes_pc / n, dcomps_pc / n)
-
-    # Meta-controller (opt-in)
-    meta = None
-    if settings.use_meta_controller:
-        meta = getattr(solve_task, "_META", None)
-        if meta is None:
-            meta = MetaControllerUCB()
-            solve_task._META = meta
 
     if getattr(settings, "_policy_prior", None) is None:
         settings._policy_prior = _DEFAULT_POLICY_PRIOR
@@ -3786,6 +3746,10 @@ def solve_task(
         # Palette is safe if it helps or maintains accuracy on all training pairs
         palette_is_safe = (safe_count == len(train_pairs))
     
+    _update_rho(settings, best_program, train_pairs, phi, palette_is_safe)
+    _smooth_rho(settings, getattr(settings, "_hfp_rho", None))
+    prog_tension = float(compute_program_tension(best_program, phi)) if best_program is not None else 0.0
+
     # Check if we should generate two attempts using truncated shape-base
     # Truncate program at last tile_masked to get pure shape transformation
     base_steps, ky, kx, m = _truncate_at_last_tile_masked(best_program)
@@ -3851,7 +3815,52 @@ def solve_task(
                     pred1 = _apply_blockwise_projection(pred1, ky, kx, D)
 
             # Single-output mode
-            predictions.append(pred1)
+            pred_np = np.asarray(pred1)
+            meta = {
+                "bg": 0,
+                "prog_len": (len(best_program.steps) if best_program else 0),
+                "tension": prog_tension,
+                "align_dy_dx": align,
+                "block_mask": (learned_block_mask[2] if ("learned_block_mask" in locals() and learned_block_mask is not None) else None),
+                "block_proj": (lambda g, ky=learned_blockwise_proj[0], kx=learned_blockwise_proj[1], D=learned_blockwise_proj[2]: _apply_blockwise_projection(g, ky, kx, D)) if ("learned_blockwise_proj" in locals() and learned_blockwise_proj is not None) else None,
+                "palette_safe": bool(palette_is_safe),
+            }
+            predictions.append({"grid": pred_np.tolist(), "meta": meta})
+
+    # v2.8.7: expose last program for replay/debugging
+    try:
+        globals()["last_best_program"] = best_program
+    except Exception:
+        pass
+
+    # v2.8.7: universal two-attempts for non-tiling programs
+    if (
+        settings.always_two_attempts
+        and predictions
+        and not (isinstance(predictions[0], dict) and ("attempt_1" in predictions[0] or "grid" in predictions[0]))
+    ):
+        enhanced = []
+        for grid in predictions:
+            try:
+                g = np.asarray(grid)
+                alt_cands = [
+                    np.rot90(g, k=1),
+                    np.rot90(g, k=2),
+                    np.rot90(g, k=3),
+                    np.fliplr(g),
+                    np.flipud(g),
+                ]
+                attempt_2 = alt_cands[0]
+                enhanced.append(
+                    {
+                        "attempt_1": g.tolist(),
+                        "attempt_2": attempt_2.tolist(),
+                    }
+                )
+            except Exception:
+                fallback = grid.tolist() if hasattr(grid, "tolist") else grid
+                enhanced.append({"attempt_1": fallback, "attempt_2": fallback})
+        predictions = enhanced
 
     # v2.8.7: expose last program for replay/debugging
     try:
