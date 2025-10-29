@@ -3480,6 +3480,35 @@ def solve_task(
             meta = MetaControllerUCB()
             solve_task._META = meta
 
+    if getattr(settings, "_policy_prior", None) is None:
+        settings._policy_prior = _DEFAULT_POLICY_PRIOR
+
+    trace = getattr(settings, "_trace_ops", False)
+    settings._trace_buffer = []
+
+    # --- Topology hint (side-channel): averages over train pairs ---
+    dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+    for xi, yi in train_pairs:
+        try:
+            xg = np.asarray(xi)
+            yg = np.asarray(yi)
+            dholes_g += _holes_count(yg) - _holes_count(xg)
+            dcomps_g += _component_count(yg) - _component_count(xg)
+            dholes_pc += _holes_count(yg)
+            dcomps_pc += _component_count(yg)
+        except Exception:
+            pass
+    n = float(max(1, len(train_pairs)))
+    settings._topo_hint = (dholes_g / n, dcomps_g / n, dholes_pc / n, dcomps_pc / n)
+
+    # Meta-controller (opt-in)
+    meta = None
+    if settings.use_meta_controller:
+        meta = getattr(solve_task, "_META", None)
+        if meta is None:
+            meta = MetaControllerUCB()
+            solve_task._META = meta
+
     # --- Consensus one-step sweep (fast path) ---
     cons_prog, cons_mean = _consensus_one_step_candidate(train_pairs)
 
