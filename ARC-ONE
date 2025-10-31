@@ -24,7 +24,7 @@ from __future__ import annotations
 # - Preserves v2.9.5 hard caps, octonion prior, two-attempt policy, and palette rules.
 #
 # v2.9.5
-# - Enforce hard per-stage time caps: solve_task respects settings.max_seconds via a deadline check.
+# - Enforce hard per-stage time caps: _solve_task_internal respects settings.max_seconds via a deadline check.
 # - Task telemetry: budget_sec, elapsed_sec, hit_deadline (True if deadline reached).
 # - Emit finalized program sequence for sidecar analysis: ops_tokens[], ops_families[].
 # - Keeps v2.9.4 octonion palette8 prior and all previous policies unchanged.
@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.8"
+__version__ = "v2.9.9"
 
 last_best_program = None
 
@@ -1138,7 +1138,7 @@ def _maybe_escalate_K(cons_mean, rho_samples, settings, n_train_pairs):
     return min(n_train_pairs, K)
 
 
-def _compute_octo_multiplier_for_task(task_json: dict, settings: "SearchSettings"):
+def _compute_octo_multiplier_for_task(task_json: dict, settings: "_InternalSearchSettings"):
     train_pairs = task_json.get("train") or task_json.get("data") or []
     if not train_pairs:
         return 0.0, 0.0, 1.0
@@ -1191,7 +1191,7 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
     challenges = loader(tasks_dir)
     tids = list(panel_ids) if panel_ids else list(challenges.keys())
     outputs = {}
-    base_settings = settings_proto or SearchSettings()
+    base_settings = settings_proto or _InternalSearchSettings()
 
     for tid in tids:
         task_json = challenges[tid]
@@ -1256,9 +1256,9 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
 
             start = time.perf_counter()
             try:
-                stage_output = solve_task(tid, task_json, stage_settings, logger=logger)
+                stage_output = _solve_task_internal(tid, task_json, stage_settings, logger=logger)
             except TypeError:
-                stage_output = solve_task(tid, task_json, stage_settings)
+                stage_output = _solve_task_internal(tid, task_json, stage_settings)
             stage_times[name] = float(round(time.perf_counter() - start, 3))
 
             pair = _normalize_two_attempts(stage_output)
@@ -1425,7 +1425,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                 att1_deb, att2_deb, bounces = _bounded_debate(base, att2, test_in, belief, rho_sm, max_b)
                 base = att1_deb
                 att2 = att2_deb
-                base, att2, policy_tag = _apply_test_palette_policy_pair(base, att2, pairs, test_in, settings or SearchSettings())
+                base, att2, policy_tag = _apply_test_palette_policy_pair(base, att2, pairs, test_in, settings or _InternalSearchSettings())
 
                 telemetry_kwargs = {
                     "alt_tag": choice.get("tag") if choice else None,
@@ -2630,7 +2630,7 @@ def _is_identity_successor(program: Program, in_shape: Optional[Tuple[int, int]]
 
 
 def _gate_allowed_ops(
-    settings: SearchSettings,
+    settings: _InternalSearchSettings,
     depth: int,
     phi: Optional[np.ndarray],
     allowed_names: Iterable[str],
@@ -3005,7 +3005,7 @@ def state_to_vector(state: np.ndarray) -> np.ndarray:
 # ============================================================================
 
 @dataclass
-class SearchSettings:
+class _InternalSearchSettings:
     """Configuration for beam search with OCO."""
     beam_width: int = 128
     max_depth: int = 10
@@ -3058,7 +3058,7 @@ def compute_cost(
     input_grid: np.ndarray,
     target_grid: np.ndarray,
     phi: np.ndarray,
-    settings: SearchSettings
+    settings: _InternalSearchSettings
 ) -> float:
     """
     OCO-augmented cost function:
@@ -3350,7 +3350,7 @@ def beam_search_one_pair(
     input_grid: np.ndarray,
     target_grid: np.ndarray,
     phi: np.ndarray,
-    settings: SearchSettings,
+    settings: _InternalSearchSettings,
     logger: Optional[Any] = None,
     deadline: Optional[_Deadline] = None
 ) -> Optional[Program]:
@@ -3946,7 +3946,7 @@ class MetaControllerUCB:
         self.bandits[fam].update(arm, reward)
 
 
-def should_rotate(state: ControllerState, current_cost: float, settings: SearchSettings) -> bool:
+def should_rotate(state: ControllerState, current_cost: float, settings: _InternalSearchSettings) -> bool:
     """Decide if controller should rotate to next mode."""
     if settings._disable_rotation:
         return False
@@ -3970,7 +3970,7 @@ def rotate_mode(state: ControllerState) -> str:
     return modes[next_idx]
 
 
-def apply_mode_bias(settings: SearchSettings, mode: str) -> SearchSettings:
+def apply_mode_bias(settings: _InternalSearchSettings, mode: str) -> _InternalSearchSettings:
     """Adjust search settings based on controller mode."""
     from dataclasses import replace
 
@@ -4202,10 +4202,10 @@ def _update_rho(settings, best_program, train_pairs, phi, palette_is_safe):
         setattr(settings, "_hfp_ready", True)
     return rho
 
-def solve_task(
+def _solve_task_internal(
     task_id: str,
     task_json: Dict,
-    settings: SearchSettings,
+    settings: _InternalSearchSettings,
     logger: Optional[StepLogger] = None
 ) -> List[Any]:
     """
@@ -4268,10 +4268,10 @@ def solve_task(
     # Meta-controller (opt-in)
     meta = None
     if settings.use_meta_controller:
-        meta = getattr(solve_task, "_META", None)
+        meta = getattr(_solve_task_internal, "_META", None)
         if meta is None:
             meta = MetaControllerUCB()
-            solve_task._META = meta
+            _solve_task_internal._META = meta
 
     # --- Consensus one-step sweep (fast path) ---
     cons_prog, cons_mean = _consensus_one_step_candidate(train_pairs)
@@ -4787,7 +4787,7 @@ def solve_task_with_schedule(
             if hasattr(settings, attr):
                 setattr(sub, attr, getattr(settings, attr))
 
-        preds = solve_task(tid, task_json, sub, logger=logger)
+        preds = _solve_task_internal(tid, task_json, sub, logger=logger)
         last_preds = preds
         score = -1.0
         if truths is not None and preds is not None and len(truths) == len(preds):
@@ -4813,7 +4813,7 @@ def solve_task_with_schedule(
 
 def run_dir(
     tasks_dir: str,
-    settings: SearchSettings,
+    settings: _InternalSearchSettings,
     max_tasks: Optional[int] = None,
     logger: Optional[StepLogger] = None
 ) -> Dict[str, List[Any]]:
@@ -5166,7 +5166,7 @@ Examples:
     print("=" * 80)
     
     # Build settings
-    settings = SearchSettings(
+    settings = _InternalSearchSettings(
         beam_width=args.beam,
         max_depth=args.depth,
         max_seconds=args.seconds,
@@ -5233,6 +5233,158 @@ Examples:
     if args.jsonl:
         print(f"  Telemetry: {args.jsonl}")
     print("=" * 80)
+
+
+# === ARC-ONE public API shim (compat) =======================================
+# Provides: SearchSettings, solve_task(task_id, task_json, settings)
+# Normalizes outputs: list[{"grid": <2D list>, "_telemetry": {"ops_tokens": [...]}}]
+
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Tuple, Optional
+import numpy as np
+import inspect, sys
+
+# 1) Lightweight SearchSettings (safe defaults; ignored if unused downstream)
+@dataclass
+class SearchSettings:
+    beam_width: int = 64
+    max_depth: int = 8
+    max_seconds: float = 30.0
+    # GOF-9000 policy knobs (default ON; modules may ignore)
+    block_identity: bool = True
+    rails_scale_hard: bool = True
+    scale_hard_thresh: float = 1.0
+    scale_hard_steps: int = 3
+    early_palette_block_steps: int = 3
+    # Palette test policy (optional)
+    test_palette_policy: str = "second_only_guarded"
+
+_INTERNAL_SETTINGS_CLS = globals().get("_InternalSearchSettings")
+_SETTINGS_SYNC_ATTRS = (
+    "beam_width",
+    "max_depth",
+    "max_seconds",
+    "block_identity",
+    "rails_scale_hard",
+    "scale_hard_thresh",
+    "scale_hard_steps",
+    "early_palette_block_steps",
+    "test_palette_policy",
+)
+
+def _coerce_settings(settings_obj: Optional[Any]) -> Any:
+    if _INTERNAL_SETTINGS_CLS is None:
+        return settings_obj
+    if settings_obj is None:
+        return _INTERNAL_SETTINGS_CLS()
+    if isinstance(settings_obj, _INTERNAL_SETTINGS_CLS):
+        return settings_obj
+    if isinstance(settings_obj, SearchSettings):
+        coerced = _INTERNAL_SETTINGS_CLS()
+        for name in _SETTINGS_SYNC_ATTRS:
+            setattr(coerced, name, getattr(settings_obj, name))
+        return coerced
+    return settings_obj
+
+# 2) Discover an existing single-task solver in this module
+def _discover_solver() -> Tuple[Callable, int]:
+    mod = sys.modules[__name__]
+    candidates = (
+        "_solve_task_internal",
+        "solve_eval_one",
+        "solve_task",
+        "solve",
+        "run_task",
+        "infer_eval_one",
+        "evaluate_one",
+    )
+    for name in candidates:
+        fn = getattr(mod, name, None)
+        if callable(fn):
+            try:
+                arity = len(inspect.signature(fn).parameters)
+            except Exception:
+                arity = 2
+            return fn, arity
+    raise RuntimeError("No single-task solver found. Expected one of: "
+                       "_solve_task_internal / solve_eval_one / solve / run_task / infer_eval_one / evaluate_one.")
+
+_SOLVE_FN, _SOLVE_ARITY = _discover_solver()
+
+# 3) Telemetry & grid normalization helpers
+def _ops_tokens_from(first: Any) -> List[str]:
+    # Try nested telemetry
+    if isinstance(first, dict):
+        toks = first.get("_telemetry", {}).get("ops_tokens")
+        if isinstance(toks, list):
+            return [str(t) for t in toks]
+    # Try program-like forms
+    prog = first.get("program") if isinstance(first, dict) else getattr(first, "program", None)
+    if prog is not None:
+        for m in ("as_tokens", "to_tokens"):
+            if hasattr(prog, m):
+                try:
+                    toks = getattr(prog, m)() or []
+                    return [str(t) for t in toks]
+                except Exception:
+                    pass
+        steps = getattr(prog, "steps", None)
+        if steps:
+            try:
+                return [f"{getattr(s,'op',s)}({','.join(map(str, getattr(s,'args',[])))})" for s in steps]
+            except Exception:
+                pass
+    return []
+
+def _grid_from(first: Any) -> List[List[int]]:
+    if isinstance(first, dict):
+        if "grid" in first:
+            g = first["grid"]
+            return g.tolist() if isinstance(g, np.ndarray) else g
+        if "attempt_1" in first:
+            g = first["attempt_1"]
+            return g.tolist() if isinstance(g, np.ndarray) else g
+    # Fallback: bare array/list
+    return np.array(first).tolist() if not isinstance(first, dict) else [[0]]
+
+
+def _normalize_entry(entry: Any) -> Dict[str, Any]:
+    grid = _grid_from(entry)
+    telemetry = {}
+    if isinstance(entry, dict) and "_telemetry" in entry and isinstance(entry["_telemetry"], dict):
+        telemetry.update(entry["_telemetry"])
+    telemetry.setdefault("ops_tokens", _ops_tokens_from(entry))
+    return {"grid": grid, "_telemetry": telemetry}
+
+
+def _wrap_to_list(result: Any) -> List[Dict[str, Any]]:
+    """Ensure we return: list of dicts with 'grid' and '_telemetry.ops_tokens'."""
+    if isinstance(result, list):
+        return [_normalize_entry(item) for item in result] if result else []
+    return [_normalize_entry(result)]
+
+
+# 4) Public wrapper with stable signature
+def solve_task(task_id: str, task_json: Dict[str, Any], settings: Optional[SearchSettings] = None):
+    settings_obj = settings or SearchSettings()
+    coerced_settings = _coerce_settings(settings_obj)
+    if _SOLVE_ARITY >= 3:
+        raw = _SOLVE_FN(task_id, task_json, coerced_settings)
+    elif _SOLVE_ARITY == 2:
+        raw = _SOLVE_FN(task_id, task_json)
+    else:
+        raw = _SOLVE_FN(task_json)  # last-resort form
+    return _wrap_to_list(raw)
+
+
+# 5) One-time banner
+try:
+    _printed_banner
+except NameError:
+    _printed_banner = True
+    ver = globals().get("__version__", "(unknown)")
+    print(f"[ARC-ONE] API shim active — version {ver} | solve_task + SearchSettings normalized.")
+# === end API shim ============================================================
 
 
 if __name__ == "__main__":
