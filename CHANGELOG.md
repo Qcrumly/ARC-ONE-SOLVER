@@ -1,3 +1,10 @@
+## v2.9.12 — 2025-10-31
+- **Identity policy (shape-aware):** Block identity ops (`tile(1,1)`, `scale(1)`, `resize(H,W==in)`) when input/target shapes differ;
+  allow only on true identity layouts and suppress redundant depth-0 no-ops.
+- **Scale-rails enforcement:** Apply hard scale-sign gating (compression→extraction+alignment; expansion→tiling/resize+alignment)
+  directly within successor generation.
+- **Telemetry:** Added `rails_scale_sign`, `depth`, and `identity_policy` breadcrumbs to beam entries for mining.
+
 ## v2.9.11 — 2025-10-31
 - **A→B→A micro-debate (ρ-gated):** Selectively runs a single repair pass and reconciles {A,B,A′} only when ρ ≥ 0.55.
 - **Diversity guard:** Enforces minimum dissimilarity between attempt_1 and attempt_2 using token-Jaccard and grid dissimilarity; nudges attempt_2 policy when too similar.
