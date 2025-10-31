@@ -1,3 +1,12 @@
+## v2.9.11 — 2025-10-31
+- **A→B→A micro-debate (ρ-gated):** Selectively runs a single repair pass and reconciles {A,B,A′} only when ρ ≥ 0.55.
+- **Diversity guard:** Enforces minimum dissimilarity between attempt_1 and attempt_2 using token-Jaccard and grid dissimilarity; nudges attempt_2 policy when too similar.
+- **Seconds-aware schedule:** Expands max_seconds only when progress is healthy; caps at ~2× base.
+- **Determinism & banner:** Fixed seeds and OMP threads with one-line run banner.
+- **Submission helper:** `make_sample_submission(preds_by_tid)` for Kaggle schema.
+- **Telemetry:** Added `rho`, `debate`, `diversity_nudge`, `seconds_after_schedule`, and existing rails/object flags to `_telemetry`.
+- No DSL changes; behavior focuses on flipping “almosts” safely.
+
 ## v2.9.10 — 2025-10-31
 - **Telemetry**: Added `_telemetry_note` helper and ensured every returned result includes `_telemetry.ops_tokens`.
   - Synthesizes tokens from program steps if not explicitly recorded.
