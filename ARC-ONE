@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.9.8 — Constraint Pack (identity + hard scale rails)
+# Version: v2.9.10 — Telemetry & object-centric preference refinements
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.9"
+__version__ = "v2.9.10"
 
 last_best_program = None
 
@@ -923,12 +923,48 @@ def _apply_test_palette_policy_pair(att1, att2, train_pairs, test_x, settings):
     return att1, att2, "unknown_policy"
 
 
-def _telemetry_note(meta_or_res, **kw):
+# === Telemetry helpers (always available) ===================================
+def _ops_tokens_from_program(prog):
+    """
+    Extract a list[str] of 'op(arg,...)' tokens from a program object using
+    as_tokens()/to_tokens()/steps, in that order. Returns [] if unavailable.
+    """
     try:
-        if isinstance(meta_or_res, dict):
-            meta_or_res.setdefault("_telemetry", {}).update({k: v for k, v in kw.items() if v is not None})
+        for m in ("as_tokens", "to_tokens"):
+            if hasattr(prog, m):
+                toks = getattr(prog, m)() or []
+                return [str(t) for t in toks]
+        steps = getattr(prog, "steps", None)
+        if steps:
+            toks = []
+            for s in steps:
+                op = getattr(s, "op", s)
+                args = getattr(s, "args", [])
+                toks.append(f"{op}({','.join(map(str, args))})")
+            return toks
     except Exception:
         pass
+    return []
+
+
+def _telemetry_note(container, **kv):
+    """
+    Ensure container has a dict '_telemetry' and merge kv into it.
+    The 'container' can be a result dict or any object with attribute '_telemetry'.
+    """
+    try:
+        if isinstance(container, dict):
+            td = container.setdefault("_telemetry", {})
+            td.update({k: v for k, v in kv.items() if v is not None})
+            return
+        td = getattr(container, "_telemetry", None)
+        if not isinstance(td, dict):
+            td = {}
+            setattr(container, "_telemetry", td)
+        td.update({k: v for k, v in kv.items() if v is not None})
+    except Exception:
+        pass
+# === end Telemetry helpers ===================================================
 
 
 def _is_masked_tiling(meta):
@@ -1989,6 +2025,36 @@ class HeuristicPrior(PolicyPrior):
         elif family != "palette" and "palette" in op_name:
             score -= 0.15
 
+        # --- GOF-9000: object-centric soft preference ---
+        phi = None
+        try:
+            if "ctx" in locals() and isinstance(ctx, dict):
+                phi = ctx.get("phi")
+        except Exception:
+            phi = None
+
+        obj_mag = 0.0
+        if isinstance(phi, (list, tuple)) and len(phi) > 1:
+            try:
+                obj_mag = abs(float(phi[1]))
+            except Exception:
+                obj_mag = 0.0
+        else:
+            try:
+                if "ctx" in locals() and isinstance(ctx, dict) and ctx.get("has_shape_match"):
+                    obj_mag = max(obj_mag, 0.35)
+            except Exception:
+                pass
+
+        if obj_mag > 0.30:
+            if op_name in ("keep_n_largest", "remove_isolated"):
+                score += 0.35
+            elif op_name in ("fill_holes", "keep_rings", "largest", "center_largest"):
+                score += 0.30
+            elif op_name in ("mask",):
+                score += 0.20
+        # --- end object-centric soft preference ---
+
         return score
 
 
@@ -2657,6 +2723,24 @@ def _gate_allowed_ops(
                 names = names & (TOPOLOGY_OPS | ALIGNMENT_OPS)
             elif s >= thr:
                 names = names & (EXPANSION_OPS | ALIGNMENT_OPS)
+
+    # --- GOF-9000: keep object tools available when object signal is strong ---
+    try:
+        obj_mag = abs(float(phi[1])) if (phi is not None and len(phi) > 1) else 0.0
+    except Exception:
+        obj_mag = 0.0
+
+    object_soft_pref = obj_mag > 0.30
+    if object_soft_pref:
+        try:
+            names = set(names) | (TOPOLOGY_OPS & set(OP_REGISTRY.keys()))
+        except Exception:
+            names = set(names) | TOPOLOGY_OPS
+        try:
+            setattr(settings, "_object_soft_pref", True)
+        except Exception:
+            pass
+    # --- end widen ---
 
     return names
 
@@ -4228,6 +4312,7 @@ def _solve_task_internal(
     t0 = _now()
     hit_deadline = False
     setattr(settings, "_deadline_hit", False)
+    setattr(settings, "_object_soft_pref", False)
 
     # Extract training pairs and test inputs
     train_pairs = trains_from_task(task_json)
@@ -4723,6 +4808,7 @@ def _solve_task_internal(
         for step in best_program.steps:
             ops_tokens.append(_format_step_token(step))
             ops_families.append(_op_family_tag(step))
+    object_soft_pref_flag = bool(getattr(settings, "_object_soft_pref", False))
     payload = {
         "budget_sec": budget,
         "elapsed_sec": float(elapsed),
@@ -4730,6 +4816,7 @@ def _solve_task_internal(
         "ops_tokens": ops_tokens,
         "ops_families": ops_families,
         "program_len": int(len(ops_tokens)),
+        "object_soft_pref": object_soft_pref_flag,
     }
     if logger and hasattr(logger, "log_kv"):
         try:
@@ -5311,57 +5398,42 @@ def _discover_solver() -> Tuple[Callable, int]:
 
 _SOLVE_FN, _SOLVE_ARITY = _discover_solver()
 
-# 3) Telemetry & grid normalization helpers
-def _ops_tokens_from(first: Any) -> List[str]:
-    # Try nested telemetry
-    if isinstance(first, dict):
-        toks = first.get("_telemetry", {}).get("ops_tokens")
-        if isinstance(toks, list):
-            return [str(t) for t in toks]
-    # Try program-like forms
-    prog = first.get("program") if isinstance(first, dict) else getattr(first, "program", None)
-    if prog is not None:
-        for m in ("as_tokens", "to_tokens"):
-            if hasattr(prog, m):
-                try:
-                    toks = getattr(prog, m)() or []
-                    return [str(t) for t in toks]
-                except Exception:
-                    pass
-        steps = getattr(prog, "steps", None)
-        if steps:
-            try:
-                return [f"{getattr(s,'op',s)}({','.join(map(str, getattr(s,'args',[])))})" for s in steps]
-            except Exception:
-                pass
-    return []
-
-def _grid_from(first: Any) -> List[List[int]]:
-    if isinstance(first, dict):
-        if "grid" in first:
-            g = first["grid"]
-            return g.tolist() if isinstance(g, np.ndarray) else g
-        if "attempt_1" in first:
-            g = first["attempt_1"]
-            return g.tolist() if isinstance(g, np.ndarray) else g
-    # Fallback: bare array/list
-    return np.array(first).tolist() if not isinstance(first, dict) else [[0]]
-
-
-def _normalize_entry(entry: Any) -> Dict[str, Any]:
-    grid = _grid_from(entry)
-    telemetry = {}
-    if isinstance(entry, dict) and "_telemetry" in entry and isinstance(entry["_telemetry"], dict):
-        telemetry.update(entry["_telemetry"])
-    telemetry.setdefault("ops_tokens", _ops_tokens_from(entry))
-    return {"grid": grid, "_telemetry": telemetry}
-
-
 def _wrap_to_list(result: Any) -> List[Dict[str, Any]]:
     """Ensure we return: list of dicts with 'grid' and '_telemetry.ops_tokens'."""
+
+    def _grid_from(first: Any):
+        import numpy as _np
+
+        if isinstance(first, dict):
+            if "grid" in first:
+                g = first["grid"]
+                return g.tolist() if isinstance(g, _np.ndarray) else g
+            if "attempt_1" in first:
+                g = first["attempt_1"]
+                return g.tolist() if isinstance(g, _np.ndarray) else g
+        return _np.array(first).tolist() if not isinstance(first, dict) else [[0]]
+
+    # Already a non-empty list
+    if isinstance(result, list) and result:
+        first = result[0]
+        if isinstance(first, dict):
+            td = first.setdefault("_telemetry", {})
+            if "ops_tokens" not in td:
+                prog = first.get("program", None)
+                if prog is not None:
+                    td["ops_tokens"] = _ops_tokens_from_program(prog)
+            td.setdefault("ops_tokens", td.get("ops_tokens", []))
+            return result
+        first_norm = {"grid": _grid_from(first), "_telemetry": {}}
+        first_norm["_telemetry"]["ops_tokens"] = _ops_tokens_from_program(getattr(first, "program", None))
+        return [first_norm]
+
     if isinstance(result, list):
-        return [_normalize_entry(item) for item in result] if result else []
-    return [_normalize_entry(result)]
+        return []
+
+    first_norm = {"grid": _grid_from(result), "_telemetry": {}}
+    first_norm["_telemetry"]["ops_tokens"] = _ops_tokens_from_program(getattr(result, "program", None))
+    return [first_norm]
 
 
 # 4) Public wrapper with stable signature
