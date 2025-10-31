@@ -1,82 +1,43 @@
-"""
-================================================================================
-ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
-================================================================================
+from __future__ import annotations
+# ==================================================================================
+# ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
+# ==================================================================================
+#
+# Version: v2.9.6 — Stage Controls + Per-Stage Timings
+#
+# v2.9.6
+# - Stage controls: --no_polish to skip the third stage, and --stop_if_diversity <thr>
+#   to stop after skim/main when A/B diversity (1 - IoU) >= thr (default 0.20).
+# - Telemetry: per-stage timings t_skim, t_main, t_polish and skipped_polish flag.
+# - Preserves v2.9.5 hard caps, octonion prior, two-attempt policy, and palette rules.
+#
+# v2.9.5
+# - Enforce hard per-stage time caps: solve_task respects settings.max_seconds via a deadline check.
+# - Task telemetry: budget_sec, elapsed_sec, hit_deadline (True if deadline reached).
+# - Emit finalized program sequence for sidecar analysis: ops_tokens[], ops_families[].
+# - Keeps v2.9.4 octonion palette8 prior and all previous policies unchanged.
+#
+# v2.9.4
+# - Optional (default ON) palette8 octonion distance–based difficulty prior for training-stage time allocation.
+#   * Scales Stage-2/3 seconds per task by a clamp of (1 + alpha * z), z = z-scored mean palette-distance over TRAIN pairs.
+#   * Uses only TRAIN examples (Kaggle-safe); does not alter TEST packaging/policy or DSL semantics.
+#   * Adds telemetry fields: octo_dist_mean, octo_z, octo_mult.
+#   * Disable with --no_octo_prior; tune with --octo_alpha and --octo_clip.
+#
+# Enhancements:
+# - v2.9.3: Real C/ρ tracker wired into settings (_hfp_prevC/_hfp_rho/_hfp_rho_smoothed/_hfp_ready),
+#           enabling ρ-adaptive abort windows and bounded A↔B debate.
+#           Belief pass-through for TEST predictions (align_dy_dx, block_mask, block_proj) so alternates are targeted.
+#           Candidate-pool + IoU diversity guard for non-tilers (useful disagreement > 0).
+#           Palette guard fixed (structure-safe mapping via _palette_map_from_train_pairs).
+#           attempt2_strategy honored (seeded candidate in alternates list).
+#           Staged runner now keeps best-so-far and early-exits when diversity achieved.
+#           Duplicate topology-hint block removed; telemetry cleaned.
+# - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-Complete implementation of M1-M7:
-- M1: Minimal DSL with 24 operations + interpreter
-- M2: Perception v0 with task feature extraction
-- M3: Octonion guidance with φ embedding
-- M4: Associator tension tracking + OCO cost overlay
-- M5: OCO-guided beam search
-- M6: Controller rotation (Observer/Navigator/Explorer)
-- M7: ARC I/O + telemetry + submission packaging
+__version__ = "v2.9.6"
 
-Version: v2.7.9 - pair sampling when consensus fails (beam on first K pairs only)
-Enhancements:
-- v2.3.1: Centroid-biased shift enumeration for training search
-- v2.4: Alignment finisher using bbox + cross-correlation with median aggregation
-- v2.5: Block-mask finisher learns k×k (3×3 or 5×5) block-presence masks from
-  training targets via majority vote, zeros unwanted tiled blocks for sparse
-  tiling tasks, applied after alignment and before palette remapping
-- v2.6: Blockwise color finisher learns k×k dominant-color projection from training
-  targets, projects each block to learned dominant color for sparse/alternating
-  block patterns, applied after alignment/block-mask and before palette
-- v2.7: Added tile_masked operation for sparse lattice patterns (cross/border modes),
-  enables plus-frame and perimeter-only tiling patterns, controller tuning for
-  improved exploration (rotate at 0.98, explorer beam 384)
-- v2.7.1: Shape-stage accuracy bias: when pred.shape == target.shape, downweight
-  OCO (λ2 × 0.3) and add pixel accuracy bonus (β=0.05), plus early good-enough
-  latch for seeds (acc >= 0.80) and mild tile_masked prior (-0.02) during shape stage
-- v2.7.2: Baked phase-tile tension vectors (all tiling ops get [1,0,0,0,0,0,1,0] 
-  to avoid zero-tension free ride), downweight both λ₁ (×0.50) and λ₂ (×0.30) when
-  shape matches, enhanced early latch with palette finisher attempt and tile_masked
-  tie-breaker (-0.02) for stable beam expansion on high-accuracy seeds
-- v2.7.3: Seed-primed beam initialization via _quick_shape_candidates helper that
-  scores all single-step tiling variants (tile, tile_masked, phase_tile_*) by pixel
-  accuracy, early-latch returns immediately if seed+palette is exact, beam starts
-  from top-3 accuracy-ranked seeds plus empty fallback for robust exploration
-- v2.7.4: Consensus one-step sweep at solve_task start evaluates all tiling variants
-  across ALL training pairs, accepts if mean accuracy >= 0.80 (fast path), optional
-  shift micro-refinement tries ±1 deltas for tile_masked consensus solutions to fix
-  off-by-one placement, beam search only runs if consensus fails or is weak
-- v2.7.5: Conditional smart refiner in beam loop adds up to 3 targeted branches when
-  shape matches and depth < 2 with acc >= 0.60: (1) alignment-guided shift from
-  bbox+xcorr, (2) alternate tile_masked mode (swap cross/border), (3) mirror when
-  acc >= 0.70; supplements standard successors without changing gating or finishers
-- v2.7.6: Pareto-safe palette guard validates palette mapping on all training pairs,
-  only applies to test predictions if it maintains or improves accuracy on every
-  training pair (prevents palette-induced regressions)
-- v2.7.7b: Automatic two-attempts for tile_masked programs ending with mode m∈{0,1},
-  always emits {"attempt_1": primary, "attempt_2": alternate_mode} with independent
-  finisher application, no flag needed (automatic detection), fallback to attempt_1
-  if alternate fails, single-grid output for all other programs
-- v2.7.7c: Two-attempts backward scan - finds last tile_masked(ky,kx,m) in program
-  even when finishers (palette/shift/etc) follow it, swaps mode 0↔1 while preserving
-  all trailing steps for robust alternate attempt generation
-- v2.7.7d: Removed palette remapping from TEST predictions (kept Pareto-safe palette
-  guard for TRAIN evaluation), applies only alignment/block-mask/blockwise-projection
-  finishers to test outputs for cleaner generalization
-- v2.7.7e: Bypass ALL finishers on TEST for masked-tiling two-attempts (no alignment,
-  block-mask, blockwise-projection, or palette); emit raw program outputs to preserve
-  border≈0.852 vs cross≈0.630 distinction; finishers still applied for TRAIN-FIT and
-  single-attempt programs
-- v2.7.7f: Two-attempts use truncated shape-base programs cut after last tile_masked,
-  discarding any trailing finisher steps; both attempts use identical base transform
-  with only mode (0↔1) swapped, ensuring pure apples-to-apples comparison of border
-  vs cross patterns on TEST
-- v2.7.8: Early-abort when ⅓ budget spent without shape progress (returns best-so-far
-  or resize fallback); added keep_n_largest and keep_size_range component filter ops
-  for connected component selection/filtering in shape family
-- v2.7.8b: Added no-improvement early-abort (triggers when no cost improvement over
-  ⅓ window); dual abort mechanisms catch both no-shape-progress and optimization
-  stalls for faster failure on intractable tasks
-- v2.7.8c: Hard-cap timeout immediately returns best-so-far (or resize fallback) instead
-  of breaking from loop, eliminating any post-timeout overhead
-- v2.7.9: Pair sampling when consensus fails - beam search runs on first K training pairs
-  only (default K=2) instead of all pairs, preserving accuracy while cutting time on
-  slow tasks; program still evaluated on all pairs for generalization measurement
-"""
+last_best_program = None
 
 _NUMPY_IMPORT_ERROR = (
     "ARC-ONE requires the 'numpy' package. Install it with `pip install numpy` "
@@ -99,12 +60,13 @@ except ModuleNotFoundError:  # pragma: no cover - depends on environment
             raise ModuleNotFoundError(_NUMPY_IMPORT_ERROR)
 
     np = _MissingNumpy()  # type: ignore
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Tuple, Optional, Any, Set, Iterable
 from collections import deque, defaultdict
 import itertools
 import math
 import time
+import statistics as _stats
 import json
 import os
 import glob
@@ -113,6 +75,7 @@ import argparse
 import tempfile
 import shutil
 import hashlib
+from scipy.ndimage import label as _cc_label
 
 
 # ==================================================================================
@@ -145,25 +108,37 @@ def _symmetry_flags_np(grid_ll):
 
 
 def _center_on_mass_np(grid_ll):
-    g = np.array(grid_ll)
+    """
+    Center non-zero mass of a predicted grid. Guaranteed no-crash:
+    - No-op if grid is not 2D
+    - No-op if mask empty or indices weird
+    """
+    g = np.asarray(grid_ll)
+    # Guard: only operate on 2-D grids
+    if g.ndim != 2:
+        return g.tolist() if hasattr(g, "tolist") else grid_ll
+
     mask = (g != 0)
     if not mask.any():
         return g.tolist()
+
     ys, xs = np.where(mask)
+    # Extra guard: require 1D coordinate arrays
+    if ys.ndim != 1 or xs.ndim != 1 or ys.size == 0 or xs.size == 0:
+        return g.tolist()
+
     cy, cx = int(np.round(ys.mean())), int(np.round(xs.mean()))
     H, W = g.shape
-    ty = (H // 2) - cy
-    tx = (W // 2) - cx
-    out = np.zeros_like(g)
-    y_src0 = max(0, -ty)
-    y_dst0 = max(0, ty)
-    x_src0 = max(0, -tx)
-    x_dst0 = max(0, tx)
-    h = min(H - y_dst0, H - y_src0)
-    w = min(W - x_dst0, W - x_src0)
-    if h > 0 and w > 0:
-        out[y_dst0:y_dst0 + h, x_dst0:x_dst0 + w] = g[y_src0:y_src0 + h, x_src0:x_src0 + w]
-    return out.tolist()
+    dy, dx = H // 2 - cy, W // 2 - cx
+    g2 = np.roll(np.roll(g, dy, axis=0), dx, axis=1)
+    return g2.tolist()
+
+
+def _rot90_np(grid_ll):
+    g = np.asarray(grid_ll)
+    if g.ndim != 2:
+        return g.tolist() if hasattr(g, "tolist") else g
+    return np.rot90(g, 1).tolist()
 
 
 def _translate_toward_input_centroid_np(pred_ll, x_in_ll):
@@ -278,9 +253,24 @@ def _majority_palette_mapping(train_pairs):
 def _palette_map_from_train_pairs(train_pairs):
     """Try optimal bijection first (balanced small palettes), else majority."""
     m = _optimal_bijection_mapping(train_pairs, max_colors=5)
-    if m: 
+    if m:
         return m
     return _majority_palette_mapping(train_pairs)
+
+
+def _palette_map_is_unanimous(train_pairs, mapping):
+    if not mapping or not train_pairs:
+        return False
+    if len(set(mapping.values())) != len(mapping):
+        return False
+    for pair in train_pairs:
+        local = _optimal_bijection_mapping([pair], max_colors=5)
+        if not local:
+            return False
+        for src, dst in mapping.items():
+            if src in local and local[src] != dst:
+                return False
+    return True
 
 
 def _apply_palette_map_ll(grid_ll, mapping):
@@ -323,7 +313,7 @@ def _alt_mode_program(prog):
     return Program(new_steps)
 
 
-def _alt_mode_program_scan(prog: Program):
+def _alt_mode_program_scan(prog):  # type: ignore[override]
     """
     Return an alternate Program by swapping the last tile_masked(ky,kx,m) where m∈{0,1},
     even if color/shift steps follow it. Keep trailing steps intact. If not found, return None.
@@ -362,6 +352,12 @@ def _truncate_at_last_tile_masked(prog):
 
 def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_ll):
     g = np.array(att1_ll)
+    fam_hint = None
+    if phi_arr is not None:
+        try:
+            fam_hint = phi_to_family(np.asarray(phi_arr))
+        except Exception:
+            fam_hint = None
 
     if strategy == "rotate90":
         result = np.rot90(g, 1).tolist()
@@ -405,9 +401,9 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
             result = _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
         else:
             a = np.abs(np.array(phi_arr))
-            scores = {"geom": float(a[3]), "palette": float(a[2]), "align": float(a[4]), "objectness": float(a[1])}
+            scores = {"geometry": float(a[3]), "palette": float(a[2]), "alignment": float(a[4]), "objectness": float(a[1])}
             fam = max(scores.items(), key=lambda kv: kv[1])[0]
-            if fam == "geom":
+            if fam == "geometry":
                 if test_input_ll is not None:
                     Hs, Vs, Rs = _symmetry_flags_np(test_input_ll)
                     if Rs:
@@ -426,8 +422,11 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
                     result = _apply_palette_map_ll(att1_ll, mapping)
                 else:
                     result = _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
-            elif fam == "align":
-                result = _center_on_mass_np(att1_ll)
+            elif fam == "alignment":
+                try:
+                    result = _center_on_mass_np(att1_ll)
+                except Exception:
+                    result = att1_ll
             elif fam == "objectness":
                 if test_input_ll is not None:
                     result = _translate_toward_input_centroid_np(att1_ll, test_input_ll)
@@ -435,21 +434,796 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
                     result = _center_on_mass_np(att1_ll)
             else:
                 result = _attempt2_from_strategy(att1_ll, "auto", None, train_pairs, test_input_ll)
+    elif fam_hint in ("alignment", "geometry"):
+        try:
+            result = _rot90_np(att1_ll)
+        except Exception:
+            result = att1_ll
     else:
         result = att1_ll
 
-    # Apply palette remapping as a finishing step (like solve_task does)
-    # This can improve accuracy by fixing color mismatches
-    if train_pairs and strategy not in ("palette_swap",):  # Don't double-apply
-        mapping = _palette_map_from_train_pairs(train_pairs)
-        if mapping:
-            result_with_palette = _apply_palette_map_ll(result, mapping)
-            # In a production setting, you might want to score both and pick the best
-            # For now, we'll just return the palette-remapped version
-            return result_with_palette
-    
-    return result
+    att2 = result
+    try:
+        if fam_hint in ("alignment", "geometry"):
+            base_np = np.asarray(att1_ll)
+            res_np = np.asarray(att2)
+            if res_np.ndim != 2 or np.array_equal(res_np, base_np):
+                att2 = _rot90_np(att1_ll)
+    except Exception:
+        att2 = att1_ll
 
+    att2_np = np.asarray(att2)
+    if att2_np.ndim != 2:
+        return att1_ll
+    return att2_np.tolist()
+
+
+def _pixel_iou(a, b):
+    """Micro-averaged IoU across colors. Returns 0.0 if shapes differ or empty."""
+    if a is None or b is None:
+        return 0.0
+    if len(a) == 0 or len(b) == 0:
+        return 0.0
+    H1, W1 = len(a), len(a[0]) if a[0] else 0
+    H2, W2 = len(b), len(b[0]) if b[0] else 0
+    if H1 != H2 or W1 != W2:
+        return 0.0
+    colors = set()
+    for i in range(H1):
+        for j in range(W1):
+            colors.add(a[i][j])
+            colors.add(b[i][j])
+    if not colors:
+        return 0.0
+    inter_sum = 0
+    union_sum = 0
+    for c in colors:
+        inter = 0
+        union = 0
+        for i in range(H1):
+            for j in range(W1):
+                in_a = a[i][j] == c
+                in_b = b[i][j] == c
+                if in_a and in_b:
+                    inter += 1
+                if in_a or in_b:
+                    union += 1
+        if union > 0:
+            inter_sum += inter
+            union_sum += union
+    return (inter_sum / union_sum) if union_sum > 0 else 0.0
+
+
+def _normalize_two_attempts(out):
+    """Return canonical {attempt_1, attempt_2} dict regardless of input schema."""
+
+    def _as_grid(val):
+        arr = np.asarray(val)
+        if arr.ndim != 2:
+            return np.zeros((1, 1), dtype=int)
+        return arr
+
+    def _rot180(arr):
+        return np.rot90(arr, 2) if arr.ndim == 2 else arr
+
+    if isinstance(out, dict):
+        if "attempt_1" in out:
+            a1 = _as_grid(out["attempt_1"])
+            a2 = _as_grid(out.get("attempt_2", _rot180(a1)))
+            return {"attempt_1": a1.tolist(), "attempt_2": a2.tolist()}
+        for key in ("output", "grid", "pred", "prediction"):
+            if key in out:
+                base = _as_grid(out[key])
+                return {"attempt_1": base.tolist(), "attempt_2": _rot180(base).tolist()}
+        for key in ("attempts", "outputs", "preds", "predictions", "results"):
+            if key in out and isinstance(out[key], list) and out[key]:
+                return _normalize_two_attempts(out[key][0])
+        for value in out.values():
+            arr = np.asarray(value)
+            if arr.ndim == 2:
+                return {"attempt_1": arr.tolist(), "attempt_2": _rot180(arr).tolist()}
+        return {"attempt_1": [[0]], "attempt_2": [[0]]}
+
+    if isinstance(out, list) and out:
+        first = out[0]
+        if isinstance(first, dict):
+            return _normalize_two_attempts(first)
+        arr = np.asarray(first)
+        if arr.ndim == 2:
+            return {"attempt_1": arr.tolist(), "attempt_2": _rot180(arr).tolist()}
+        return {"attempt_1": [[0]], "attempt_2": [[0]]}
+
+    arr = np.asarray(out)
+    if arr.ndim == 2:
+        return {"attempt_1": arr.tolist(), "attempt_2": _rot180(arr).tolist()}
+    return {"attempt_1": [[0]], "attempt_2": [[0]]}
+
+
+def _pixel_iou_ll(a, b):
+    import numpy as np
+
+    A = np.asarray(a)
+    B = np.asarray(b)
+    if A.shape != B.shape or A.ndim != B.ndim:
+        return 0.0
+    if A.size == 0:
+        return 0.0
+    return float((A == B).sum()) / float(A.size)
+
+
+def _regenerate_alt_from_different_bucket(base_grid, belief, pairs):
+    import numpy as np
+
+    try:
+        base_np = np.asarray(base_grid)
+    except Exception:
+        return base_grid
+    if base_np.ndim != 2:
+        return base_grid
+
+    candidates = []
+    try:
+        align = belief.get("align_dy_dx")
+        if isinstance(align, (tuple, list)) and len(align) == 2:
+            dy, dx = int(align[0]), int(align[1])
+            candidates.append(("align", _op_shift(base_np, dy, dx)))
+    except Exception:
+        pass
+    try:
+        ky_kx = belief.get("ky_kx")
+        mask = belief.get("block_mask")
+        if mask is not None and isinstance(ky_kx, (tuple, list)) and len(ky_kx) == 2:
+            ky, kx = int(ky_kx[0]), int(ky_kx[1])
+            candidates.append(("mask", _apply_block_mask(base_np, ky, kx, mask)))
+    except Exception:
+        pass
+    try:
+        proj = belief.get("block_proj")
+        ky_kx = belief.get("ky_kx")
+        if callable(proj) and isinstance(ky_kx, (tuple, list)) and len(ky_kx) == 2:
+            proj_out = proj(base_np)
+            candidates.append(("blockproj", np.asarray(proj_out)))
+    except Exception:
+        pass
+    try:
+        candidates.append(("mirrorH", np.fliplr(base_np)))
+    except Exception:
+        pass
+    try:
+        candidates.append(("rot180", np.rot90(base_np, 2)))
+    except Exception:
+        pass
+    try:
+        keep_arr = _op_keep_n_largest(base_np, 1)
+        candidates.append(("keep1", keep_arr))
+    except Exception:
+        pass
+
+    threshold = 0.97
+    for tag, cand in candidates:
+        try:
+            cand_np = np.asarray(cand)
+        except Exception:
+            continue
+        if cand_np.ndim != 2 or cand_np.shape != base_np.shape:
+            continue
+        if _pixel_iou_ll(base_np, cand_np) < threshold:
+            return cand_np.tolist() if hasattr(cand_np, "tolist") else cand_np
+    return base_np.tolist() if hasattr(base_np, "tolist") else base_np
+
+
+def _is_degenerate_grid(grid, bg=0, max_bg_frac=0.95):
+    import numpy as np
+
+    A = np.asarray(grid)
+    if A.size == 0:
+        return True
+    frac_bg = float((A == bg).sum()) / float(A.size)
+    colors = np.unique(A)
+    return frac_bg >= max_bg_frac or colors.size <= 1
+
+
+def _salvage_degenerate(base_grid, belief, pairs):
+    import numpy as np
+
+    bg = belief.get("bg", 0) if isinstance(belief, dict) else 0
+    try:
+        align = belief.get("align_dy_dx") if isinstance(belief, dict) else None
+        if isinstance(align, (tuple, list)) and len(align) == 2:
+            dy, dx = int(align[0]), int(align[1])
+            shifted = _op_shift(np.asarray(base_grid), dy, dx)
+            cand = shifted.tolist() if hasattr(shifted, "tolist") else shifted
+            if not _is_degenerate_grid(cand, bg=bg):
+                return cand
+    except Exception:
+        pass
+    try:
+        ky_kx = belief.get("ky_kx") if isinstance(belief, dict) else None
+        mask = belief.get("block_mask") if isinstance(belief, dict) else None
+        if mask is not None and isinstance(ky_kx, (tuple, list)) and len(ky_kx) == 2:
+            ky, kx = int(ky_kx[0]), int(ky_kx[1])
+            masked = _apply_block_mask(np.asarray(base_grid), ky, kx, mask)
+            cand = masked.tolist() if hasattr(masked, "tolist") else masked
+            if not _is_degenerate_grid(cand, bg=bg):
+                return cand
+    except Exception:
+        pass
+    try:
+        proj = belief.get("block_proj") if isinstance(belief, dict) else None
+        if callable(proj):
+            proj_out = proj(np.asarray(base_grid))
+            cand = np.asarray(proj_out).tolist()
+            if not _is_degenerate_grid(cand, bg=bg):
+                return cand
+    except Exception:
+        pass
+    try:
+        keep_arr = _op_keep_n_largest(np.asarray(base_grid), 1)
+        cand = keep_arr.tolist() if hasattr(keep_arr, "tolist") else keep_arr
+        if not _is_degenerate_grid(cand, bg=bg):
+            return cand
+    except Exception:
+        pass
+    return base_grid
+
+
+def _now() -> float:
+    """Monotonic helper for enforcing per-stage deadlines."""
+    return time.perf_counter()
+
+
+class _Deadline:
+    __slots__ = ("t_end",)
+
+    def __init__(self, seconds: float):
+        self.t_end = _now() + max(0.0, float(seconds))
+
+    def time_left(self) -> float:
+        return self.t_end - _now()
+
+    def expired(self) -> bool:
+        return _now() >= self.t_end
+
+
+def _grid_shape(grid):
+    if grid is None or len(grid) == 0:
+        return (0, 0)
+    return len(grid), len(grid[0]) if grid[0] else 0
+
+
+def _shift_grid(grid, dy, dx, fill=0):
+    H, W = _grid_shape(grid)
+    if H == 0 or W == 0:
+        return grid
+    out = [[fill] * W for _ in range(H)]
+    for i in range(H):
+        for j in range(W):
+            ni, nj = i + dy, j + dx
+            if 0 <= ni < H and 0 <= nj < W:
+                out[ni][nj] = grid[i][j]
+    return out
+
+
+def _rot180(grid):
+    return [row[::-1] for row in grid[::-1]] if grid else grid
+
+
+def _mirror_lr(grid):
+    return [row[::-1] for row in grid] if grid else grid
+
+
+def _largest_component_only(grid, bg=0):
+    """Keep the largest 4-connected component across all non-bg pixels; zero elsewhere."""
+    H, W = _grid_shape(grid)
+    if H == 0 or W == 0:
+        return grid
+    seen = [[False] * W for _ in range(H)]
+    best_area = 0
+    best_pts = None
+    best_color = bg
+    for i in range(H):
+        for j in range(W):
+            if grid[i][j] == bg or seen[i][j]:
+                continue
+            color = grid[i][j]
+            stack = [(i, j)]
+            seen[i][j] = True
+            pts = [(i, j)]
+            while stack:
+                y, x = stack.pop()
+                for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                    if 0 <= ny < H and 0 <= nx < W and not seen[ny][nx] and grid[ny][nx] == color:
+                        seen[ny][nx] = True
+                        stack.append((ny, nx))
+                        pts.append((ny, nx))
+            if len(pts) > best_area:
+                best_area = len(pts)
+                best_pts = pts
+                best_color = color
+    if best_pts is None:
+        return grid
+    out = [[bg] * W for _ in range(H)]
+    for y, x in best_pts:
+        out[y][x] = best_color
+    return out
+
+
+def _surrogate_conf(pred, belief):
+    """Cheap [0,1] confidence surrogate from belief metadata."""
+    H, W = _grid_shape(pred)
+    if H * W == 0:
+        return 0.0
+    bg = belief.get("bg", 0) if belief else 0
+    occ = 0.0
+    if H > 0 and W > 0:
+        occ = sum(1 for i in range(H) for j in range(W) if pred[i][j] != bg) / (H * W)
+    prog_len = max(1, int(belief.get("prog_len", 10))) if belief else 1
+    prior_len = 1.0 / (1.0 + prog_len / 10.0)
+    tension = 1.0 - min(1.0, float(belief.get("tension", 0.5))) if belief else 0.5
+    varp = 1.0 - min(1.0, float(belief.get("train_cost_var", 0.5))) if belief else 0.5
+    pal = 1.0 if belief and belief.get("palette_safe", False) else 0.0
+    conf = 0.25 * occ + 0.20 * prior_len + 0.25 * tension + 0.20 * varp + 0.10 * pal
+    return max(0.0, min(1.0, conf))
+
+
+def _build_belief(meta, train_pairs=None, phi=None, palette_safe=None, learned_mask=None, learned_proj=None, align=None):
+    belief = {
+        "ky_kx": meta.get("ky_kx") if isinstance(meta, dict) else None,
+        "block_mask": learned_mask if learned_mask is not None else (meta.get("block_mask") if isinstance(meta, dict) else None),
+        "block_proj": learned_proj if learned_proj is not None else (meta.get("block_proj") if isinstance(meta, dict) else None),
+        "align_dy_dx": align if align is not None else (meta.get("align_dy_dx") if isinstance(meta, dict) else None),
+        "palette_safe": bool(palette_safe if palette_safe is not None else (meta.get("palette_safe", False) if isinstance(meta, dict) else False)),
+        "prog_len": meta.get("prog_len", 10) if isinstance(meta, dict) else 10,
+        "tension": meta.get("tension", 0.5) if isinstance(meta, dict) else 0.5,
+        "train_cost_var": meta.get("train_cost_var", 0.5) if isinstance(meta, dict) else 0.5,
+        "family": meta.get("family") if isinstance(meta, dict) else None,
+        "bg": meta.get("bg", 0) if isinstance(meta, dict) else 0,
+    }
+    return belief
+
+
+def _alternates_from_belief(att1, test_x, belief, train_pairs):
+    alts = []
+    dy, dx = (0, 0)
+    if belief.get("align_dy_dx") and len(belief["align_dy_dx"]) == 2:
+        dy, dx = belief["align_dy_dx"]
+    alts.append({"tag": "align_shift", "grid": _shift_grid(att1, dy, dx, fill=belief.get("bg", 0))})
+
+    block_mask = belief.get("block_mask")
+    if block_mask is not None and _grid_shape(block_mask) == _grid_shape(att1):
+        H, W = _grid_shape(att1)
+        bg = belief.get("bg", 0)
+        masked = [[att1[i][j] if block_mask[i][j] else bg for j in range(W)] for i in range(H)]
+        alts.append({"tag": "block_mask", "grid": masked})
+
+    block_proj = belief.get("block_proj")
+    if block_proj is not None and callable(block_proj):
+        try:
+            alts.append({"tag": "block_proj", "grid": block_proj(att1)})
+        except Exception:
+            pass
+
+    alts.append({"tag": "rot180", "grid": _rot180(att1)})
+    alts.append({"tag": "mirror", "grid": _mirror_lr(att1)})
+    alts.append({"tag": "keep_n_largest(1)", "grid": _largest_component_only(att1, bg=belief.get("bg", 0))})
+
+    for alt in alts:
+        alt["conf"] = _surrogate_conf(alt["grid"], belief)
+    return alts
+
+
+def _select_best_pair(att1, candidates, belief, lambda_div=0.20, iou_cap=0.97):
+    confA = _surrogate_conf(att1, belief)
+    best_choice = None
+    best_grid = None
+    best_score = -1e9
+    for alt in candidates:
+        grid = alt.get("grid")
+        if grid is None:
+            continue
+        iou = _pixel_iou(att1, grid)
+        if iou >= iou_cap:
+            continue
+        confB = alt.get("conf", _surrogate_conf(grid, belief))
+        score = confA + confB + lambda_div * (1.0 - iou)
+        if score > best_score:
+            best_score = score
+            best_grid = grid
+            best_choice = {"tag": alt.get("tag", "?"), "iou": iou, "conf1": confA, "conf2": confB}
+    if best_grid is None:
+        if candidates:
+            fallback = min(candidates, key=lambda c: _pixel_iou(att1, c.get("grid")))
+            best_grid = fallback.get("grid", att1)
+            best_choice = {"tag": fallback.get("tag", "fallback"), "iou": _pixel_iou(att1, best_grid), "conf1": confA, "conf2": _surrogate_conf(best_grid, belief)}
+        else:
+            best_grid = att1
+            best_choice = {"tag": "self", "iou": 1.0, "conf1": confA, "conf2": confA}
+    return att1, best_grid, best_choice
+
+
+def _smooth_rho(settings, rho_raw):
+    if rho_raw is None:
+        return getattr(settings, "_hfp_rho_smoothed", None)
+    prev = getattr(settings, "_hfp_rho_smoothed", None)
+    smoothed = 0.5 * (prev if prev is not None else rho_raw) + 0.5 * rho_raw
+    setattr(settings, "_hfp_rho_smoothed", smoothed)
+    return smoothed
+
+
+def _rho_band(rho):
+    if rho is None:
+        return "<0.70"
+    if rho < 0.70:
+        return "<0.70"
+    if rho < 0.95:
+        return "0.70–0.95"
+    return "≥0.95"
+
+
+def _cheap_revision(grid, belief, which="align_or_block"):
+    if which == "align_or_block":
+        align = belief.get("align_dy_dx") if belief else None
+        if isinstance(align, (tuple, list)) and len(align) == 2:
+            dy, dx = align
+            return _shift_grid(grid, dy, dx, fill=belief.get("bg", 0) if belief else 0)
+        bm = belief.get("block_mask") if belief else None
+        if bm is not None and _grid_shape(bm) == _grid_shape(grid):
+            H, W = _grid_shape(grid)
+            bg = belief.get("bg", 0) if belief else 0
+            return [[grid[i][j] if bm[i][j] else bg for j in range(W)] for i in range(H)]
+    return _mirror_lr(grid)
+
+
+def _bounded_debate(att1, att2, test_x, belief, rho_s, max_bounces):
+    bounces = 0
+    if rho_s is None or rho_s < 0.70:
+        return att1, att2, bounces
+    cap = 1 if rho_s < 0.95 else 2
+    if isinstance(max_bounces, int) and max_bounces >= 0:
+        cap = min(cap, max_bounces)
+    confA = _surrogate_conf(att1, belief)
+    confB = _surrogate_conf(att2, belief)
+    if confB <= confA + 0.03:
+        return att1, att2, bounces
+    A1 = _cheap_revision(att1, belief, "align_or_block")
+    bounces += 1
+    if bounces >= cap:
+        return A1, att2, bounces
+    confA1 = _surrogate_conf(A1, belief)
+    if confA1 > confB + 0.03:
+        B1 = _cheap_revision(att2, belief, "align_or_block")
+        bounces += 1
+        return A1, B1, bounces
+    return A1, att2, bounces
+
+
+def _apply_test_palette_policy_pair(att1, att2, train_pairs, test_x, settings):
+    policy = getattr(settings, "test_palette_policy", "second_only_guarded") if settings else "second_only_guarded"
+    if policy in (None, "none"):
+        return att1, att2, "no_palette"
+    if policy == "both":
+        policy = "second_only_guarded"
+    mapped, ok = _palette_map_if_pareto_safe(att2, train_pairs)
+    if policy == "second_only":
+        return att1, (mapped if ok else att2), "second_only" if ok else "second_only(noop)"
+    if policy == "second_only_guarded":
+        return att1, (mapped if ok else att2), "second_only_guarded" if ok else "guard_blocked"
+    return att1, att2, "unknown_policy"
+
+
+def _telemetry_note(meta_or_res, **kw):
+    try:
+        if isinstance(meta_or_res, dict):
+            meta_or_res.setdefault("_telemetry", {}).update({k: v for k, v in kw.items() if v is not None})
+    except Exception:
+        pass
+
+
+def _is_masked_tiling(meta):
+    if isinstance(meta, dict):
+        if meta.get("path_tag") == "masked_tiling":
+            return True
+        if meta.get("tile_masked"):
+            return True
+        if meta.get("ky_kx") and meta.get("block_mask") is not None and meta.get("no_finishers", True):
+            return True
+    return False
+
+
+def _masked_tiling_alternate(att1, meta):
+    H, W = _grid_shape(att1)
+    if H * W == 0:
+        return att1
+    bm = meta.get("block_mask") if isinstance(meta, dict) else None
+    if bm is not None and _grid_shape(bm) == (H, W):
+        return [[att1[i][j] if not bm[i][j] else 0 for j in range(W)] for i in range(H)]
+    return [[0 if att1[i][j] != 0 else 1 for j in range(W)] for i in range(H)]
+
+
+def _structure_ok(a, b, train_pairs=None):
+    if _grid_shape(a) != _grid_shape(b):
+        return False
+    Ha, Wa = _grid_shape(a)
+    if Ha * Wa == 0:
+        return True
+    def _checksum(g):
+        H, W = _grid_shape(g)
+        return sum((i + 1) * (j + 1) * g[i][j] for i in range(H) for j in range(W))
+    return _checksum(a) == _checksum(b)
+
+
+def _palette_map_if_pareto_safe(grid, train_pairs):
+    try:
+        mapping = _palette_map_from_train_pairs(train_pairs or [])
+        if not mapping:
+            return grid, False
+        if not _palette_map_is_unanimous(train_pairs or [], mapping):
+            return grid, False
+        candidate = _apply_palette_map_ll(grid, mapping)
+        if not _structure_ok(grid, candidate, train_pairs):
+            return grid, False
+        return candidate, True
+    except Exception:
+        return grid, False
+
+
+# === Octonion palette8 encoding & running stats ===============================
+
+def _palette8_vec(grid: np.ndarray) -> np.ndarray:
+    """Palette8 embedding of a 2-D grid."""
+    g = np.asarray(grid)
+    if g.ndim != 2:
+        raise ValueError(f"_palette8_vec expects 2D grid, got {g.shape}")
+    H, W = g.shape
+    if H * W == 0:
+        return np.zeros(8, dtype=float)
+
+    fg = g != 0
+    density = float(fg.mean())
+
+    hist = np.zeros(10, dtype=float)
+    if fg.any():
+        vals, counts = np.unique(g[fg], return_counts=True)
+        for v, c in zip(vals, counts):
+            if 0 < v < 10:
+                hist[int(v)] = c
+        total = float(hist.sum())
+        if total > 0.0:
+            hist /= total
+    top6 = -np.sort(-hist)[:6]
+    if top6.size < 6:
+        top6 = np.pad(top6, (0, 6 - top6.size), constant_values=0.0)
+
+    if fg.any():
+        h_eq = g[:, 1:] == g[:, :-1]
+        h_ok = (g[:, 1:] != 0) & (g[:, :-1] != 0)
+        v_eq = g[1:, :] == g[:-1, :]
+        v_ok = (g[1:, :] != 0) & (g[:-1, :] != 0)
+        same = int((h_eq & h_ok).sum() + (v_eq & v_ok).sum())
+        tot = int(h_ok.sum() + v_ok.sum())
+        same_ratio = float(same) / float(tot) if tot > 0 else 0.0
+    else:
+        same_ratio = 0.0
+
+    v8 = np.zeros(8, dtype=float)
+    v8[0] = density
+    v8[1:7] = top6
+    v8[7] = same_ratio
+    return v8
+
+
+def _palette8_distance(x: np.ndarray, y: np.ndarray) -> float:
+    diff = _palette8_vec(x) - _palette8_vec(y)
+    return float(np.sqrt((diff * diff).sum() + 1e-12))
+
+
+class _RunningStats:
+    """Welford online mean/variance for palette difficulty prior."""
+
+    __slots__ = ("n", "_mean", "_M2")
+
+    def __init__(self):
+        self.n = 0
+        self._mean = 0.0
+        self._M2 = 0.0
+
+    def update(self, x: float) -> None:
+        self.n += 1
+        delta = x - self._mean
+        self._mean += delta / self.n
+        delta2 = x - self._mean
+        self._M2 += delta * delta2
+
+    @property
+    def mean(self) -> float:
+        return self._mean
+
+    @property
+    def std(self) -> float:
+        return math.sqrt(self._M2 / max(self.n - 1, 1)) if self.n > 1 else 1.0
+
+
+def _adjust_abort_windows(settings, seconds, have_shape_match):
+    stall = seconds / 3.0
+    abort_after = seconds / 3.0
+    rho_s = getattr(settings, "_hfp_rho_smoothed", None)
+    ready = bool(getattr(settings, "_hfp_ready", False))
+    if rho_s is not None and rho_s >= 0.95:
+        stall = max(stall, 0.80 * seconds)
+        abort_after = max(abort_after, 0.80 * seconds)
+    if ready and rho_s is not None and rho_s < 0.70:
+        stall = min(stall, 0.20 * seconds)
+        abort_after = min(abort_after, 0.20 * seconds)
+    return stall, abort_after
+
+
+def _median2(values):
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return float(values[-1])
+    return float(_stats.median(values[-2:]))
+
+
+def _maybe_escalate_K(cons_mean, rho_samples, settings, n_train_pairs):
+    K = getattr(settings, "max_train_pairs_for_beam", 2)
+    cons_mean = cons_mean or 0.0
+    rho_med = _median2(rho_samples)
+    if cons_mean >= 0.70 or rho_med >= 0.90:
+        K = max(3, K)
+    return min(n_train_pairs, K)
+
+
+def _compute_octo_multiplier_for_task(task_json: dict, settings: "SearchSettings"):
+    train_pairs = task_json.get("train") or task_json.get("data") or []
+    if not train_pairs:
+        return 0.0, 0.0, 1.0
+
+    dists = []
+    for ex in train_pairs:
+        xi = np.asarray(ex.get("input"))
+        yi = np.asarray(ex.get("output"))
+        if xi.ndim != 2 or yi.ndim != 2:
+            continue
+        try:
+            dists.append(_palette8_distance(xi, yi))
+        except Exception:
+            continue
+    if not dists:
+        return 0.0, 0.0, 1.0
+
+    odist_mean = float(np.mean(dists))
+    stats = settings._octo_stats or _RunningStats()
+    stats.update(odist_mean)
+    settings._octo_stats = stats
+    mu = stats.mean
+    sd = max(stats.std, 1e-6)
+    z = (odist_mean - mu) / sd
+    z = float(max(-settings.octo_clip, min(settings.octo_clip, z)))
+    mult = 1.0 + settings.octo_alpha * z
+    mult = float(min(1.5, max(0.7, mult)))
+    return odist_mean, z, mult
+
+
+def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settings_proto=None):
+    schedules = [
+        ("skim", 24, 3, 4.0),
+        ("main", 96, 7, 45.0),
+        ("polish", 128, 8, 120.0),
+    ]
+    if seconds is not None:
+        if seconds >= 10.0:
+            schedules = [
+                ("skim", 24, 3, 4.0),
+                ("main", 96, 7, float(seconds)),
+                ("polish", 128, 8, 120.0),
+            ]
+        else:
+            schedules = [("main", 96, 7, float(seconds))]
+
+    loader = globals().get("_load_test_challenges") or globals().get("load_tasks")
+    if loader is None:
+        raise RuntimeError("task loader not found")
+    challenges = loader(tasks_dir)
+    tids = list(panel_ids) if panel_ids else list(challenges.keys())
+    outputs = {}
+    base_settings = settings_proto or SearchSettings()
+
+    for tid in tids:
+        task_json = challenges[tid]
+        odist_mean = z = 0.0
+        mult = 1.0
+        if base_settings.use_octo_prior:
+            odist_mean, z, mult = _compute_octo_multiplier_for_task(task_json, base_settings)
+            if logger and hasattr(logger, "log_kv"):
+                try:
+                    logger.log_kv("octo_dist_mean", float(odist_mean))
+                    logger.log_kv("octo_z", float(z))
+                    logger.log_kv("octo_mult", float(mult))
+                except Exception:
+                    pass
+
+        stage_times = {"skim": 0.0, "main": 0.0, "polish": 0.0}
+        ran_polish = False
+        best_pair = None
+        best_div = -1.0
+        best_stage = None
+
+        for name, beam, depth, base_sec in schedules:
+            if name == "polish":
+                if getattr(base_settings, "no_polish", False):
+                    continue
+                ran_polish = True
+
+            if name == "skim":
+                stage_seconds = base_sec
+            else:
+                stage_seconds = base_sec * (mult if base_settings.use_octo_prior else 1.0)
+
+            stage_settings = replace(
+                base_settings,
+                beam_width=beam,
+                max_depth=depth,
+                max_seconds=float(stage_seconds),
+                use_meta_controller=True,
+            )
+            for attr in ("_truths_provider", "_policy_prior", "_trace_ops"):
+                if hasattr(base_settings, attr):
+                    setattr(stage_settings, attr, getattr(base_settings, attr))
+
+            start = time.perf_counter()
+            try:
+                stage_output = solve_task(tid, task_json, stage_settings, logger=logger)
+            except TypeError:
+                stage_output = solve_task(tid, task_json, stage_settings)
+            stage_times[name] = float(round(time.perf_counter() - start, 3))
+
+            pair = _normalize_two_attempts(stage_output)
+            diversity = 1.0 - _pixel_iou(pair["attempt_1"], pair["attempt_2"])
+
+            if best_pair is None or diversity > best_div:
+                best_pair = pair
+                best_div = diversity
+                best_stage = name
+                outputs[tid] = [best_pair]
+
+            threshold = float(getattr(base_settings, "stop_if_diversity", 0.20))
+            if diversity >= threshold and name != "polish":
+                break
+
+        if best_pair is None:
+            best_pair = _normalize_two_attempts([[0]])
+            best_div = 0.0
+            best_stage = "skim"
+            outputs[tid] = [best_pair]
+
+        skipped_polish = not ran_polish or stage_times.get("polish", 0.0) == 0.0
+
+        if logger and hasattr(logger, "log_kv"):
+            try:
+                logger.log_kv("t_skim", float(stage_times.get("skim", 0.0)))
+                logger.log_kv("t_main", float(stage_times.get("main", 0.0)))
+                logger.log_kv("t_polish", float(stage_times.get("polish", 0.0)))
+                logger.log_kv("skipped_polish", bool(skipped_polish))
+                logger.log_kv("chosen_stage", best_stage)
+                logger.log_kv("diversity", float(best_div))
+            except Exception:
+                pass
+
+        _telemetry_note(
+            best_pair,
+            t_skim=float(stage_times.get("skim", 0.0)),
+            t_main=float(stage_times.get("main", 0.0)),
+            t_polish=float(stage_times.get("polish", 0.0)),
+            skipped_polish=bool(skipped_polish),
+            chosen_stage=best_stage,
+            diversity=float(best_div),
+            octo_dist_mean=float(odist_mean),
+            octo_z=float(z),
+            octo_mult=float(mult),
+        )
+
+    return outputs
 
 def _build_train_test_lookups(tasks_dir):
     train_lookup = {}
@@ -462,27 +1236,136 @@ def _build_train_test_lookups(tasks_dir):
     return train_lookup, test_lookup
 
 
-def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto"):
+def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings=None):
     train_lookup, test_lookup = _build_train_test_lookups(tasks_dir)
     out = {}
-    for tid, outs in results.items():
-        pairs = train_lookup.get(tid, [])
-        if pairs:
-            tf = task_features(pairs)
-            phi = compute_phi(tf)
-        else:
-            phi = None
-        if tid not in test_lookup:
+    for tid, pred_ll in results.items():
+        base_obj = pred_ll
+        if isinstance(base_obj, dict) and "attempt_1" in base_obj and "attempt_2" in base_obj:
+            out[tid] = [{"attempt_1": base_obj["attempt_1"], "attempt_2": base_obj["attempt_2"]}]
             continue
-        if not isinstance(outs, list):
-            outs = [outs]
+        if isinstance(base_obj, list) and len(base_obj) == 1 and isinstance(base_obj[0], dict) and "attempt_1" in base_obj[0] and "attempt_2" in base_obj[0]:
+            out[tid] = [{"attempt_1": base_obj[0]["attempt_1"], "attempt_2": base_obj[0]["attempt_2"]}]
+            continue
+
+        pairs = train_lookup.get(tid, [])
+        phi = None
+        if pairs:
+            try:
+                phi = compute_phi(task_features(pairs))
+            except Exception:
+                phi = None
+        tests = test_lookup.get(tid, [])
+        outs = base_obj if isinstance(base_obj, list) else [base_obj]
         out_two = []
-        for idx, pred_ll in enumerate(outs):
-            tin = None
-            if test_lookup[tid] and idx < len(test_lookup[tid]):
-                tin = test_lookup[tid][idx]
-            a2 = _attempt2_from_strategy(pred_ll, strategy, phi, pairs, tin)
-            out_two.append({"attempt_1": pred_ll, "attempt_2": a2})
+        for idx, pred in enumerate(outs):
+            if isinstance(pred, dict) and "attempt_1" in pred:
+                base = pred["attempt_1"]
+                meta = pred
+            elif isinstance(pred, dict) and "grid" in pred:
+                base = pred["grid"]
+                meta = pred.get("meta", pred)
+            else:
+                base = pred
+                meta = pred if isinstance(pred, dict) else {}
+            base_np = np.asarray(base)
+            if base_np.ndim != 2:
+                base_list = base_np.tolist() if hasattr(base_np, "tolist") else base
+                out_two.append({"attempt_1": base_list, "attempt_2": base_list})
+                continue
+
+            test_in = tests[idx] if tests and idx < len(tests) else None
+            meta_dict = meta if isinstance(meta, dict) else {}
+            belief = _build_belief(meta_dict, train_pairs=pairs)
+
+            if _is_masked_tiling(meta_dict):
+                att2 = _masked_tiling_alternate(base, meta)
+                policy_tag = "masked_raw"
+                bounces = 0
+                try:
+                    _telemetry_note(
+                        meta_dict,
+                        iou=_pixel_iou(base, att2),
+                        alt_tag="masked_raw_pair",
+                        conf1=None,
+                        conf2=None,
+                        bounces=bounces,
+                        rho_band=_rho_band(None),
+                        attempt_policy=policy_tag,
+                    )
+                except Exception:
+                    pass
+            else:
+                candidates = []
+                if strategy and strategy != "oco_auto":
+                    try:
+                        forced = _attempt2_from_strategy(base, strategy, phi, pairs, test_in)
+                        candidates.append({"tag": f"forced:{strategy}", "grid": forced, "conf": _surrogate_conf(forced, belief)})
+                    except Exception:
+                        pass
+                candidates.extend(_alternates_from_belief(base, test_in, belief, pairs))
+                lambda_div = getattr(settings, "div_lambda", 0.20) if settings else 0.20
+                iou_cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
+                att1_sel, att2_sel, choice = _select_best_pair(base, candidates, belief, lambda_div=lambda_div, iou_cap=iou_cap)
+                base = att1_sel
+                att2 = att2_sel
+                rho_raw = getattr(settings, "_hfp_rho", None) if settings else None
+                rho_sm = _smooth_rho(settings, rho_raw) if settings else rho_raw
+                max_b = getattr(settings, "max_bounces", -1) if settings else -1
+                att1_deb, att2_deb, bounces = _bounded_debate(base, att2, test_in, belief, rho_sm, max_b)
+                base = att1_deb
+                att2 = att2_deb
+                base, att2, policy_tag = _apply_test_palette_policy_pair(base, att2, pairs, test_in, settings or SearchSettings())
+
+                telemetry_kwargs = {
+                    "alt_tag": choice.get("tag") if choice else None,
+                    "conf1": choice.get("conf1") if choice else None,
+                    "conf2": choice.get("conf2") if choice else None,
+                    "bounces": bounces,
+                    "rho_band": _rho_band(rho_sm),
+                    "attempt_policy": policy_tag,
+                }
+
+                bg_val = belief.get("bg", 0)
+                for key_name, grid_val in (("attempt_1", base), ("attempt_2", att2)):
+                    try:
+                        if _is_degenerate_grid(grid_val, bg=bg_val):
+                            salvaged = _salvage_degenerate(grid_val, belief, pairs)
+                            if key_name == "attempt_1":
+                                base = salvaged
+                            else:
+                                att2 = salvaged
+                    except Exception:
+                        pass
+
+                try:
+                    cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
+                    if _pixel_iou_ll(base, att2) >= cap:
+                        try:
+                            regenerated = _regenerate_alt_from_different_bucket(base, belief, pairs)
+                            att2 = regenerated
+                        except Exception:
+                            att2 = np.rot90(np.asarray(base), 2).tolist()
+                except Exception:
+                    try:
+                        att2 = np.rot90(np.asarray(base), 2).tolist()
+                    except Exception:
+                        att2 = base
+
+                try:
+                    _telemetry_note(
+                        meta_dict,
+                        iou=_pixel_iou(base, att2),
+                        **telemetry_kwargs,
+                    )
+                except Exception:
+                    pass
+
+            base_np = np.asarray(base)
+            att2_np = np.asarray(att2)
+            if att2_np.ndim != 2 or att2_np.shape != base_np.shape:
+                att2_np = base_np
+            out_two.append({"attempt_1": base_np.tolist(), "attempt_2": att2_np.tolist()})
         out[tid] = out_two
     return out
 
@@ -855,6 +1738,194 @@ def _conn_comps(arr):
                 comps.append((color, pts))
     return comps
 
+
+def _flood_holes_mask(mask: np.ndarray) -> np.ndarray:
+    """Return a boolean mask marking interior background pixels (holes) of a binary mask."""
+    H, W = mask.shape
+    bg = mask == 0
+    ext = np.zeros_like(bg, dtype=bool)
+    q = deque()
+
+    for x in range(W):
+        if bg[0, x]:
+            q.append((0, x))
+        if bg[H - 1, x]:
+            q.append((H - 1, x))
+    for y in range(H):
+        if bg[y, 0]:
+            q.append((y, 0))
+        if bg[y, W - 1]:
+            q.append((y, W - 1))
+
+    while q:
+        y, x = q.popleft()
+        if not (0 <= y < H and 0 <= x < W):
+            continue
+        if ext[y, x] or not bg[y, x]:
+            continue
+        ext[y, x] = True
+        for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            q.append((y + dy, x + dx))
+
+    return bg & ~ext
+
+
+def _holes_count(grid: np.ndarray) -> int:
+    """Count interior holes (background regions fully enclosed by non-zero cells)."""
+    mask = (grid != 0).astype(np.uint8)
+    return int(_flood_holes_mask(mask).sum())
+
+
+def _component_count(grid: np.ndarray) -> int:
+    """Return number of connected non-zero components (4-conn)."""
+    from scipy.ndimage import label
+
+    return int(label(grid != 0)[1])
+
+
+def _pixel_acc(pred_item, truth_np: np.ndarray) -> float:
+    """Best-of-two if dict; otherwise single. Shapes must match."""
+    if isinstance(pred_item, dict) and "attempt_1" in pred_item:
+        p1 = np.asarray(pred_item["attempt_1"])
+        p2 = np.asarray(pred_item["attempt_2"])
+
+        def _acc(p):
+            return float((p == truth_np).mean()) if p.shape == truth_np.shape else 0.0
+
+        return max(_acc(p1), _acc(p2))
+    p = np.asarray(pred_item)
+    return float((p == truth_np).mean()) if p.shape == truth_np.shape else 0.0
+
+
+def get_test_truths(solutions_obj: dict, tid: str):
+    """
+    Local notebook helper (submission-safe): robustly load test truths across common shapes.
+    • {"tid": {"test":[...grids...]}}
+    • {"tid": [...grids...]}
+    • {"tid": {"outputs":[...grids...]}}  # rare legacy
+    Each entry may be {"output":[...]} or the grid directly.
+    """
+    entry = solutions_obj.get(tid)
+    if entry is None:
+        return []
+    if isinstance(entry, dict) and "test" in entry:
+        outs = entry["test"]
+    elif isinstance(entry, list):
+        outs = entry
+    elif isinstance(entry, dict) and "outputs" in entry:
+        outs = entry["outputs"]
+    else:
+        outs = []
+    resolved = []
+    for out in outs:
+        if isinstance(out, dict) and "output" in out:
+            resolved.append(np.array(out["output"], dtype=np.int32))
+        else:
+            resolved.append(np.array(out, dtype=np.int32))
+    return resolved
+
+
+# ===== v2.9.0: Policy Prior =====
+
+
+class PolicyPrior:
+    """Return an additive logit (prior) for an operator under context."""
+
+    def op_logit(self, op_name: str, ctx) -> float:
+        return 0.0
+
+
+class HeuristicPrior(PolicyPrior):
+    """
+    Heuristic prior using φ-family hints (scale, objectness, palette, alignment, geometry, pattern, topology, composition)
+    and simple grid checks (divisibility for tiling, symmetry flags if available).
+    """
+
+    def op_logit(self, op_name: str, ctx) -> float:
+        # ctx: dict with fields we pass from the beam: phi, grid, grid_shape, divs, sym, family
+        divs = ctx.get("divs", ())
+        family = ctx.get("family", None)
+
+        score = 0.0
+
+        if ("tile" in op_name or "phase_tile" in op_name) and divs:
+            score += 0.6
+
+        if family in ("alignment", "geometry") and (
+            "mirror" in op_name or "rot" in op_name
+        ):
+            score += 0.3
+
+        if family in ("objectness", "topology") and (
+            "keep_n_largest" in op_name
+            or "fill_holes" in op_name
+            or "remove_isolated" in op_name
+        ):
+            score += 0.25
+
+        if family == "palette" and any(word in op_name for word in ("palette_map", "recolor")):
+            score += 0.2
+        elif family != "palette" and "palette" in op_name:
+            score -= 0.15
+
+        return score
+
+
+_DEFAULT_POLICY_PRIOR = HeuristicPrior()
+
+
+def _op_fill_holes(grid: np.ndarray) -> np.ndarray:
+    """Fill interior holes of each color component independently."""
+    out = grid.copy()
+    for c in np.unique(grid):
+        if c == 0:
+            continue
+        mask = (grid == c).astype(np.uint8)
+        if not mask.any():
+            continue
+        holes = _flood_holes_mask(mask)
+        if holes.any():
+            out[holes] = c
+    return out
+
+
+def _op_keep_rings(grid: np.ndarray) -> np.ndarray:
+    """Keep only components (per color) that contain at least one hole; zero everything else."""
+    out = np.zeros_like(grid)
+    structure = np.ones((3, 3), dtype=int)
+    for c in np.unique(grid):
+        if c == 0:
+            continue
+        mask = (grid == c).astype(np.uint8)
+        if not mask.any():
+            continue
+        lbl, n = _cc_label(mask, structure=structure)
+        for k in range(1, n + 1):
+            comp = (lbl == k).astype(np.uint8)
+            holes = _flood_holes_mask(comp)
+            if holes.any():
+                out[comp == 1] = c
+    return out
+
+
+def _op_remove_isolated(grid: np.ndarray, min_size: int) -> np.ndarray:
+    """Remove color components smaller than min_size (per color), keep the rest."""
+    out = grid.copy()
+    structure = np.ones((3, 3), dtype=int)
+    for c in np.unique(grid):
+        if c == 0:
+            continue
+        mask = (grid == c).astype(np.uint8)
+        if not mask.any():
+            continue
+        lbl, n = _cc_label(mask, structure=structure)
+        for k in range(1, n + 1):
+            comp = lbl == k
+            if np.count_nonzero(comp) < int(min_size):
+                out[comp] = 0
+    return out
+
+
 def _op_keep_n_largest(grid, n):
     """keep_n_largest <n>
     Keep only the n largest connected components by size.
@@ -1224,6 +2295,9 @@ OP_NAMES_BASIC = [
     ("minority", 1, ["grid"]),
     ("threshold", 2, ["grid", "int"]),
     ("largest", 1, ["grid"]),
+    ("fill_holes", 1, ["grid"]),
+    ("keep_rings", 1, ["grid"]),
+    ("remove_isolated", 2, ["grid", "int"]),
     ("stack", 3, ["grid", "grid", "int"]),
     ("subtract", 2, ["grid", "grid"]),
 ]
@@ -1251,6 +2325,9 @@ OP_REGISTRY = {
     "minority": _op_minority,
     "threshold": _op_threshold,
     "largest": _op_largest,
+    "fill_holes": _op_fill_holes,
+    "keep_rings": _op_keep_rings,
+    "remove_isolated": _op_remove_isolated,
     "keep_n_largest": _op_keep_n_largest,
     "keep_size_range": _op_keep_size_range,
     "resize": _op_resize,
@@ -1273,7 +2350,7 @@ OP_ORDER_O2 = [
     # Core geometry next
     "rot90", "mirror", "transpose", "shift", "crop", "grow", "shrink",
     # Composition / structural
-    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "scale", "duplicate",
+    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "remove_isolated", "fill_holes", "keep_rings", "scale", "duplicate",
     # Color / palette last
     "mask", "replacecolor", "swapcolors", "invert", "fill", "outline", "threshold", "majority", "minority",
 ]
@@ -1285,7 +2362,7 @@ _OP_RANK = {name: i for i, name in enumerate(OP_ORDER_O2)}
 SHAPE_OPS = {
     "tile", "tile_masked", "phase_tile_row", "phase_tile_col", "phase_tile", "resize",
     "rot90", "mirror", "transpose", "shift", "crop", "grow", "shrink",
-    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "scale", "duplicate",
+    "stack", "add", "subtract", "largest", "keep_n_largest", "keep_size_range", "remove_isolated", "fill_holes", "keep_rings", "scale", "duplicate",
 }
 COLOR_OPS = {
     "mask", "replacecolor", "swapcolors", "invert", "fill", "outline", "threshold", "majority", "minority",
@@ -1333,6 +2410,71 @@ def program_to_str(prog: Program) -> str:
     for i, step in enumerate(prog.steps):
         lines.append(f"{i+1}. {step.op}{step.args}")
     return "\n".join(lines)
+
+
+def _format_step_token(step: Step) -> str:
+    op = step.op
+    if not step.args:
+        return op
+
+    def _fmt(arg):
+        if isinstance(arg, (list, tuple)):
+            return "(" + ",".join(_fmt(a) for a in arg) + ")"
+        if isinstance(arg, np.ndarray):
+            return f"array{tuple(arg.shape)}"
+        if hasattr(arg, "tolist") and not isinstance(arg, (str, bytes)):
+            try:
+                arr = np.asarray(arg)
+                return f"array{tuple(arr.shape)}"
+            except Exception:
+                pass
+        if isinstance(arg, (np.integer, int)):
+            return str(int(arg))
+        if isinstance(arg, (np.floating, float)):
+            return f"{float(arg):.3g}"
+        return str(arg)
+
+    args_str = ",".join(_fmt(a) for a in step.args)
+    return f"{op}({args_str})"
+
+
+_TILING_OPS = {"tile", "tile_masked", "phase_tile", "phase_tile_row", "phase_tile_col"}
+_ALIGNMENT_OPS = {"rot90", "mirror", "transpose"}
+_GEOMETRY_OPS = {"shift", "crop", "grow", "shrink", "duplicate", "stack"}
+_TOPOLOGY_OPS = {"largest", "keep_n_largest", "keep_size_range", "fill_holes", "keep_rings", "remove_isolated"}
+_PALETTE_KEYWORDS = ("palette", "recolor", "swap", "replacecolor", "invert", "majority", "minority")
+_COMPOSITION_OPS = {"stack", "add", "subtract"}
+_RESIZE_OPS = {"resize", "scale"}
+_MASK_KEYWORDS = ("mask", "outline", "threshold")
+
+
+def _op_family_name(op_name: str) -> str:
+    name = op_name or ""
+    lower = name.lower()
+    if lower in _TILING_OPS or "tile" in lower:
+        return "tiling"
+    if lower in _ALIGNMENT_OPS:
+        return "alignment"
+    if lower in _RESIZE_OPS:
+        return "resize"
+    if lower in _COMPOSITION_OPS:
+        return "composition"
+    if lower in _TOPOLOGY_OPS:
+        return "topology"
+    if any(key in lower for key in _PALETTE_KEYWORDS):
+        return "palette"
+    if lower in _GEOMETRY_OPS:
+        return "geometry"
+    if any(key in lower for key in _MASK_KEYWORDS):
+        return "mask"
+    return "other"
+
+
+def _op_family_tag(step: Step) -> str:
+    try:
+        return _op_family_name(step.op)
+    except Exception:
+        return "other"
 
 
 # ============================================================================
@@ -1515,10 +2657,11 @@ def compute_phi(features: Dict[str, Any]) -> np.ndarray:
 
 def phi_to_family(phi: np.ndarray) -> str:
     """Classify task family from φ."""
-    if phi is None or len(phi) != 8:
+    if phi is None or len(phi) < 8:
         return "unknown"
 
-    abs_phi = np.abs(phi)
+    core = np.array(phi[:8], dtype=np.float32)
+    abs_phi = np.abs(core)
     idx = np.argmax(abs_phi)
 
     families = [
@@ -1609,6 +2752,8 @@ def op_to_vector(op_name: str) -> np.ndarray:
         "minority": [0, 0, 1, 0, 0, 0, 0, 0],
         "threshold": [0, 0, 1, 0, 0, 0, 0, 0],
         "largest": [0, 1, 0, 0, 0, 1, 0, 0],
+        "fill_holes": [0, 0, 0, 0, 0, 1, 0, 0],
+        "keep_rings": [0, 1, 0, 0, 0, 1, 0, 0],
         "keep_n_largest": [0, 1, 0, 0, 0, 1, 0, 0],
         "keep_size_range": [0, 1, 0, 0, 0, 1, 0, 0],
         "resize": [1, 0, 0, 0, 0, 0, 0, 0],
@@ -1661,6 +2806,28 @@ class SearchSettings:
     log_every: int = 200
     seed: int = 1337
     _disable_rotation: bool = False
+    max_train_pairs_for_beam: int = 2
+    use_meta_controller: bool = False
+    always_two_attempts: bool = False  # wrapper now manages alternates; keep default conservative
+    test_palette_policy: str = "second_only_guarded"
+    allow_finishers_on_masked: bool = False
+    no_polish: bool = False
+    stop_if_diversity: float = 0.20
+    div_lambda: float = 0.20
+    iou_cap: float = 0.97
+    max_bounces: int = -1
+    _hfp_prevC: Optional[float] = None
+    _hfp_rho: Optional[float] = None
+    _hfp_rho_smoothed: Optional[float] = None
+    _hfp_ready: bool = False
+    _rho_samples: List[float] = field(default_factory=list)
+    _hfp_sustained: bool = False
+    _hfp_prev_increase: bool = False
+    # Octonion (palette8) difficulty prior — default ON (disable via CLI flag)
+    use_octo_prior: bool = True
+    octo_alpha: float = 0.25
+    octo_clip: float = 2.0
+    _octo_stats: Optional[_RunningStats] = None
 
 
 def compute_cost(
@@ -1721,6 +2888,12 @@ def compute_cost(
     c_oco = lam1 * t_prog + lam2 * t_slice
 
     total = c_match + c_len + c_oco - beta * acc
+
+    # shape-stage: tiny prior for topology selection ops (mirrors tile_masked prior)
+    if pred.shape == target_grid.shape and len(prog) > 0:
+        last = prog.steps[-1].op
+        if last in ("keep_rings", "fill_holes"):
+            total -= 0.01
 
     return float(total)
 
@@ -1934,6 +3107,10 @@ def _int_space_for(op_name, idx, ctx):
             for b in pals[i+1:]:
                 pairs.append((a, b))
         return pairs or [(1, 2), (2, 3), (3, 4)]
+    if op_name in ("fill_holes", "keep_rings"):
+        return [()]
+    if op_name == "remove_isolated":
+        return [(1,), (2,), (3,)]
     if op_name == "keep_n_largest":
         return [(1,), (2,), (3,)]
     if op_name == "keep_size_range":
@@ -1951,23 +3128,32 @@ def beam_search_one_pair(
     target_grid: np.ndarray,
     phi: np.ndarray,
     settings: SearchSettings,
-    logger: Optional[Any] = None
+    logger: Optional[Any] = None,
+    deadline: Optional[_Deadline] = None
 ) -> Optional[Program]:
     """
     OCO-guided beam search for a single train pair.
     
     Returns the best program found, or None if time/depth exceeded.
     """
-    start_time = time.time()
+    if deadline is None:
+        max_secs = getattr(settings, "max_seconds", 0.0)
+        if max_secs is None:
+            max_secs = 0.0
+        deadline = _Deadline(max_secs)
+    start_time = _now()
+    policy_prior = getattr(settings, "_policy_prior", _DEFAULT_POLICY_PRIOR) or _DEFAULT_POLICY_PRIOR
+    trace_buffer = getattr(settings, "_trace_buffer", None) if getattr(settings, "_trace_ops", False) else None
+    family_hint = phi_to_family(phi)
+    divs_hint = _divisible_shape(input_grid.shape, target_grid.shape)
 
     # Early-abort tracking (no-shape)
     no_shape_seen = True           # flip to False once any successor matches target shape
-    abort_after = settings.max_seconds / 3.0  # early-abort threshold
+    base_seconds = settings.max_seconds
 
     # Early-abort tracking (no-improvement)
-    last_improve_t = time.time()
+    last_improve_t = _now()
     best_cost_seen = 1e9
-    stall_window = settings.max_seconds / 3.0  # same scale as no-shape abort
 
     # Build context for op-specific argument generation
     ctx = build_synth_context(input_grid, target_grid)
@@ -1975,6 +3161,29 @@ def beam_search_one_pair(
     # === Meta-seed discovery ===
     meta = _quick_shape_candidates(input_grid, target_grid)
     seeds = [prog for (acc, prog) in meta]
+
+    # --- φ-aware topo gating for seeds / refiners ---
+    dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+    # v2.8.7: read topology from side-channel hint (works for 8-D φ)
+    topo_hint = getattr(settings, "_topo_hint", None)
+    if topo_hint and len(topo_hint) == 4:
+        dholes_g, dcomps_g, dholes_pc, dcomps_pc = map(float, topo_hint)
+
+    try:
+        if dholes_g > 0.0 or dholes_pc > 0.0:
+            seeds.insert(0, Program([Step("keep_rings", ())]))
+        if dholes_g < 0.0 or dholes_pc < 0.0:
+            seeds.append(Program([Step("fill_holes", ())]))
+    except Exception:
+        pass
+
+    # if shape is identical sizes and accuracy is high-ish, try denoising early
+    try:
+        if target_grid.size == input_grid.size:
+            seeds.append(Program([Step("remove_isolated", (1,))]))
+            seeds.append(Program([Step("remove_isolated", (2,))]))
+    except Exception:
+        pass
 
     # Early-latch: if any seed already strong, prefer it
     best_so_far, best_cost = None, 1e9
@@ -2049,18 +3258,40 @@ def beam_search_one_pair(
     while beam:
         iteration += 1
 
+        if iteration >= 2 and not getattr(settings, "_hfp_ready", False):
+            settings._hfp_ready = True
+
+        stall_window, abort_after = _adjust_abort_windows(settings, base_seconds, not no_shape_seen)
+        if deadline is not None:
+            time_left = max(0.0, deadline.time_left())
+            stall_window = min(stall_window, time_left)
+            abort_after = min(abort_after, time_left)
+        rho_raw = getattr(settings, "_hfp_rho", None)
+        rho_s = getattr(settings, "_hfp_rho_smoothed", None)
+        if rho_raw is not None:
+            rho_s = 0.5 * (rho_s if rho_s is not None else rho_raw) + 0.5 * rho_raw
+            setattr(settings, "_hfp_rho_smoothed", rho_s)
+        ready = bool(getattr(settings, "_hfp_ready", False))
+        sustained = bool(getattr(settings, "_hfp_sustained", False))
+        max_secs = getattr(settings, "max_seconds", base_seconds)
+        if sustained and max_secs:
+            stall_window = max(stall_window, max_secs * 0.80)
+            abort_after = max(abort_after, max_secs * 0.80)
+        elif ready and rho_s is not None and rho_s < 0.70 and max_secs and (_now() - start_time) > max_secs / 3.0:
+            stall_window = min(stall_window, max_secs * 0.20)
+            abort_after = min(abort_after, max_secs * 0.20)
+
         # Check timeout
-        if time.time() - start_time > settings.max_seconds:
+        if deadline is not None and deadline.expired():
+            setattr(settings, "_deadline_hit", True)
             if logger:
                 logger.log_iteration(iteration, len(beam), best_cost)
-            # Return best-so-far immediately on hard timeout
             if best_so_far is not None:
                 return best_so_far
-            # Fallback if nothing found
             return Program([Step("resize", (target_grid.shape[0], target_grid.shape[1]))])
 
         # No-improvement early-abort check
-        if time.time() - last_improve_t > stall_window:
+        if _now() - last_improve_t > stall_window:
             if logger:
                 print(f"[early-abort] No cost improvement for {stall_window:.1f}s, returning best")
             # Return best-so-far or resize fallback
@@ -2070,7 +3301,7 @@ def beam_search_one_pair(
             return Program([Step("resize", (target_grid.shape[0], target_grid.shape[1]))])
 
         # No-shape early-abort check: if ⅓ budget spent with no shape progress
-        if time.time() - start_time > abort_after and no_shape_seen:
+        if _now() - start_time > abort_after and no_shape_seen:
             if logger:
                 print(f"[early-abort] No shape match after {abort_after:.1f}s, returning fallback")
             # Return best-so-far or resize fallback
@@ -2085,7 +3316,7 @@ def beam_search_one_pair(
         # Track improvement for no-improvement abort
         if current.cost < best_cost_seen - 1e-6:
             best_cost_seen = current.cost
-            last_improve_t = time.time()
+            last_improve_t = _now()
 
         # Check if solved
         if current.cost < 0.01:
@@ -2112,6 +3343,57 @@ def beam_search_one_pair(
                 no_shape_seen = False
         except Exception:
             cur_state = input_grid
+
+        # --- v2.8.3 Topology-aware refiner: keep_rings post-alignment ---
+        dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+        # v2.8.7: read topology from side-channel hint (works for 8-D φ)
+        topo_hint = getattr(settings, "_topo_hint", None)
+        if topo_hint and len(topo_hint) == 4:
+            dholes_g, dcomps_g, dholes_pc, dcomps_pc = map(float, topo_hint)
+
+        acc_proxy = 0.0
+        try:
+            if cur_state.shape == target_grid.shape:
+                acc_proxy = float((cur_state == target_grid).mean())
+        except Exception:
+            acc_proxy = 0.0
+
+        if (
+            cur_state.shape == target_grid.shape
+            and (dholes_g > 0.0 or dholes_pc > 0.0)
+            and acc_proxy >= 0.55
+            and current.depth < 3
+        ):
+            try:
+                ring_prog = current.program.copy()
+                ring_prog.steps.append(Step("keep_rings", ()))
+                sig = ring_prog.to_tuple()
+                if sig not in visited:
+                    cost_ring = compute_cost(ring_prog, input_grid, target_grid, phi, settings)
+                    beam.append(Candidate(ring_prog, cost_ring, current.depth + 1))
+                    visited.add(sig)
+            except Exception:
+                pass
+        # --- end v2.8.3 insert ---
+
+        # --- v2.8.4 Topology-aware refiner: fill_holes post-alignment ---
+        if (
+            cur_state.shape == target_grid.shape
+            and (dholes_g < 0.0 or dholes_pc < 0.0)
+            and acc_proxy >= 0.55
+            and current.depth < 3
+        ):
+            try:
+                fill_prog = current.program.copy()
+                fill_prog.steps.append(Step("fill_holes", ()))
+                sig = fill_prog.to_tuple()
+                if sig not in visited:
+                    cost_fill = compute_cost(fill_prog, input_grid, target_grid, phi, settings)
+                    beam.append(Candidate(fill_prog, cost_fill, current.depth + 1))
+                    visited.add(sig)
+            except Exception:
+                pass
+        # --- end v2.8.4 insert ---
 
         # --- Conditional Smart Refiner (one extra post-shape step) ---
         try:
@@ -2178,28 +3460,53 @@ def beam_search_one_pair(
                 continue
             visited.add(prog_sig)
 
+            op_name = succ_prog.steps[-1].op if succ_prog.steps else ""
+
             # Compute cost
             cost = compute_cost(succ_prog, input_grid, target_grid, phi, settings)
 
             # Check successor output for tie-break, early exit, and shape tracking
+            pred = None
             try:
                 pred = interpret_program(succ_prog, input_grid)
-                
+
                 # Track shape match
                 if pred.shape == target_grid.shape:
                     no_shape_seen = False
-                
+
                 # Tiny tie-break for tile_masked when shape matches
                 if pred.shape == target_grid.shape:
                     last = succ_prog.steps[-1].op if succ_prog.steps else None
                     if last == "tile_masked":
                         cost -= 0.02
-                    
+
                     # Early exit if exact match
                     if np.array_equal(pred, target_grid):
                         return succ_prog
             except Exception:
                 pass
+
+            # Apply policy prior as an additive bonus in score space (subtract from cost)
+            try:
+                grid_shape = pred.shape if isinstance(pred, np.ndarray) else (None, None)
+                ctx_prior = {
+                    "phi": phi,
+                    "grid": pred,
+                    "grid_shape": grid_shape,
+                    "divs": divs_hint if divs_hint is not None else (),
+                    "family": family_hint,
+                }
+                prior_logit = policy_prior.op_logit(op_name, ctx_prior)
+                cost -= 0.05 * prior_logit
+            except Exception:
+                pass
+
+            if trace_buffer is not None and op_name:
+                try:
+                    delta_cost = float(cost - current.cost)
+                except Exception:
+                    delta_cost = float(cost)
+                trace_buffer.append((op_name, delta_cost))
 
             # Add to beam
             new_cand = Candidate(succ_prog, cost, current.depth + 1)
@@ -2304,6 +3611,88 @@ class ControllerState:
     mode: str = "observer"  # observer, navigator, explorer
     rotation_count: int = 0
     last_rotation_cost: float = 1e9
+
+
+# ============================================================================
+# ============ controller/meta.py (opt-in meta-controller) ============
+# ============================================================================
+
+
+class _UCB:
+    def __init__(self, n_arms: int):
+        self.n = [0] * n_arms
+        self.r = [0.0] * n_arms
+        self.t = 0
+
+    def select(self) -> int:
+        self.t += 1
+        for i, c in enumerate(self.n):
+            if c == 0:
+                return i
+        import math
+
+        avg = [self.r[i] / self.n[i] for i in range(len(self.n))]
+        bonus = [math.sqrt(2 * math.log(self.t) / self.n[i]) for i in range(len(self.n))]
+        ucb = [avg[i] + bonus[i] for i in range(len(self.n))]
+        return int(np.argmax(ucb))
+
+    def update(self, arm: int, reward: float):
+        self.n[arm] += 1
+        self.r[arm] += reward
+
+
+class MetaControllerUCB:
+    """
+    Per-φ-family UCB over a few fixed bundles (beam, λ1, λ2, K).
+    Reward is provided by caller (e.g., acc/sec).
+    """
+
+    def __init__(self):
+        # bundles are minimal & stable; adjust offline if needed
+        self.bundle_map = {
+            "scale": [
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+                {"beam_width": 96, "lambda1": 0.30, "lambda2": 0.20, "max_train_pairs_for_beam": 2},
+                {"beam_width": 128, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
+            ],
+            "objectness": [
+                {"beam_width": 48, "lambda1": 0.35, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
+            ],
+            "palette": [
+                {"beam_width": 64, "lambda1": 0.20, "lambda2": 0.15, "max_train_pairs_for_beam": 2},
+                {"beam_width": 96, "lambda1": 0.10, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
+            ],
+            "alignment": [
+                {"beam_width": 64, "lambda1": 0.25, "lambda2": 0.30, "max_train_pairs_for_beam": 1},
+                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 1},
+            ],
+            "geometry": [
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+            ],
+            "pattern": [
+                {"beam_width": 128, "lambda1": 0.25, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
+            ],
+            "default": [
+                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.20, "max_train_pairs_for_beam": 2},
+            ],
+        }
+        self.bandits = {}
+
+    def _bundles_for(self, fam: str):
+        return self.bundle_map.get(fam, self.bundle_map["default"])
+
+    def select(self, fam: str):
+        bundles = self._bundles_for(fam)
+        if fam not in self.bandits:
+            self.bandits[fam] = _UCB(len(bundles))
+        arm = self.bandits[fam].select()
+        return arm, bundles[arm]
+
+    def update(self, fam: str, arm: int, reward: float):
+        self.bandits[fam].update(arm, reward)
 
 
 def should_rotate(state: ControllerState, current_cost: float, settings: SearchSettings) -> bool:
@@ -2507,6 +3896,61 @@ class StepLogger:
 # ============ solver/task_solver.py ============
 # ============================================================================
 
+
+def _compute_train_px_err(best_program, train_pairs, phi, settings):
+    if best_program is None or not train_pairs:
+        return 1.0, 1.0, 0.0
+    errs = []
+    shape_hits = 0
+    for (xi, yi) in train_pairs:
+        try:
+            pred = interpret_program(best_program, xi)
+            if pred.shape == yi.shape:
+                shape_hits += 1
+                errs.append(float((pred != yi).mean()))
+            else:
+                errs.append(1.0)
+        except Exception:
+            errs.append(1.0)
+    mean_err = float(sum(errs) / len(errs)) if errs else 1.0
+    var_err = float(np.var(errs)) if errs else 1.0
+    shape_rate = float(shape_hits / max(1, len(train_pairs)))
+    return mean_err, var_err, shape_rate
+
+
+def _update_rho(settings, best_program, train_pairs, phi, palette_is_safe):
+    eps = 1e-3
+    mean_err, var_err, shape_rate = _compute_train_px_err(best_program, train_pairs, phi, settings)
+    t = max(eps, 1.0 - mean_err)
+    r = 1.0 / (1.0 + max(0.0, min(1.0, var_err)))
+    u_len = 1.0 / (1.0 + (len(best_program.steps) / 10.0)) if best_program else 0.5
+    try:
+        tens = compute_program_tension(best_program, phi) if best_program else 0.0
+        u_ten = 1.0 / (1.0 + tens / 10.0)
+    except Exception:
+        u_ten = 0.7
+    u = max(eps, 0.5 * u_len + 0.5 * u_ten)
+    p = max(eps, shape_rate)
+    a = 1.0 if palette_is_safe else 0.9
+    C = max(eps, p * t * r * u * a)
+    prevC = getattr(settings, "_hfp_prevC", None)
+    prev_inc = bool(getattr(settings, "_hfp_prev_increase", False))
+    increase = prevC is not None and C > float(prevC) + 1e-6
+    rho = (C / prevC) if (prevC is not None and prevC > 0) else 1.0
+    if increase and prev_inc:
+        setattr(settings, "_hfp_sustained", True)
+    else:
+        setattr(settings, "_hfp_sustained", False)
+    setattr(settings, "_hfp_prev_increase", bool(increase))
+    setattr(settings, "_hfp_prevC", float(C))
+    setattr(settings, "_hfp_rho", float(rho))
+    hist = list(getattr(settings, "_rho_samples", []))
+    hist.append(float(rho))
+    setattr(settings, "_rho_samples", hist)
+    if len(hist) >= 2:
+        setattr(settings, "_hfp_ready", True)
+    return rho
+
 def solve_task(
     task_id: str,
     task_json: Dict,
@@ -2526,20 +3970,57 @@ def solve_task(
     if logger:
         logger.log_task_start(task_id)
 
-    start_time = time.time()
+    max_secs = getattr(settings, "max_seconds", 3.0)
+    if max_secs is None:
+        max_secs = 0.0
+    deadline = _Deadline(max_secs)
+    t0 = _now()
+    hit_deadline = False
+    setattr(settings, "_deadline_hit", False)
 
     # Extract training pairs and test inputs
     train_pairs = trains_from_task(task_json)
     test_inputs = tests_from_task(task_json)
 
     if not train_pairs or not test_inputs:
+        elapsed = _now() - t0
         if logger:
-            logger.log_task_end(task_id, False, time.time() - start_time)
+            logger.log_task_end(task_id, False, elapsed)
         return [np.array([[0]]) for _ in test_inputs]
 
     # Compute task features and φ
     features = task_features(train_pairs)
     phi = compute_phi(features)
+    rho_samples = list(getattr(settings, "_rho_samples", []))
+
+    if getattr(settings, "_policy_prior", None) is None:
+        settings._policy_prior = _DEFAULT_POLICY_PRIOR
+
+    trace = getattr(settings, "_trace_ops", False)
+    settings._trace_buffer = []
+
+    # --- Topology hint (side-channel): averages over train pairs ---
+    dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
+    for xi, yi in train_pairs:
+        try:
+            xg = np.asarray(xi)
+            yg = np.asarray(yi)
+            dholes_g += _holes_count(yg) - _holes_count(xg)
+            dcomps_g += _component_count(yg) - _component_count(xg)
+            dholes_pc += _holes_count(yg)
+            dcomps_pc += _component_count(yg)
+        except Exception:
+            pass
+    n = float(max(1, len(train_pairs)))
+    settings._topo_hint = (dholes_g / n, dcomps_g / n, dholes_pc / n, dcomps_pc / n)
+
+    # Meta-controller (opt-in)
+    meta = None
+    if settings.use_meta_controller:
+        meta = getattr(solve_task, "_META", None)
+        if meta is None:
+            meta = MetaControllerUCB()
+            solve_task._META = meta
 
     # --- Consensus one-step sweep (fast path) ---
     cons_prog, cons_mean = _consensus_one_step_candidate(train_pairs)
@@ -2549,20 +4030,63 @@ def solve_task(
     best_avg_cost = 1e9
 
     controller = ControllerState(mode="observer")
+    selected_arm = None
+    selected_bundle = None
+    selected_fam = None
 
     # If consensus is strong, accept it and let finishers polish
     if cons_prog is not None and cons_mean >= 0.80:
         best_program = cons_prog
         best_avg_cost = 1.0 - cons_mean
     else:
-        # Standard beam search on each training pair
-        for pair_idx, (x, y) in enumerate(train_pairs):
+        # Standard beam search on a subset of training pairs when consensus is weak
+        K_eff = _maybe_escalate_K(cons_mean, rho_samples, settings, len(train_pairs))
+        pairs_for_beam = train_pairs[:max(1, K_eff)]
+        if logger:
+            print(
+                f"[beam] sampling {len(pairs_for_beam)}/{len(train_pairs)} pairs (consensus={cons_mean:.3f})"
+            )
+        selected_arm = None
+        selected_bundle = None
+        selected_fam = None
+        if meta is not None:
+            selected_fam = phi_to_family(phi)
+            selected_arm, selected_bundle = meta.select(selected_fam)
+            if logger:
+                print(f"[meta] family={selected_fam} arm={selected_arm} bundle={selected_bundle}")
+        for pair_idx, (x, y) in enumerate(pairs_for_beam):
+            if deadline.expired():
+                hit_deadline = True
+                setattr(settings, "_deadline_hit", True)
+                break
             # Apply controller mode bias
-            mode_settings = apply_mode_bias(settings, controller.mode)
+            if meta is not None and selected_bundle is not None:
+                mode_settings = replace(
+                    settings,
+                    beam_width=selected_bundle["beam_width"],
+                    lambda1=selected_bundle["lambda1"],
+                    lambda2=selected_bundle["lambda2"],
+                    max_train_pairs_for_beam=selected_bundle["max_train_pairs_for_beam"],
+                )
+            else:
+                mode_settings = apply_mode_bias(settings, controller.mode)
+
+            topo_hint = getattr(settings, "_topo_hint", None)
+            if topo_hint is not None:
+                setattr(mode_settings, "_topo_hint", topo_hint)
+            setattr(mode_settings, "_policy_prior", getattr(settings, "_policy_prior", _DEFAULT_POLICY_PRIOR))
+            setattr(mode_settings, "_trace_ops", getattr(settings, "_trace_ops", False))
+            if hasattr(settings, "_trace_buffer"):
+                setattr(mode_settings, "_trace_buffer", getattr(settings, "_trace_buffer"))
 
             # Search for program
-            prog = beam_search_one_pair(x, y, phi, mode_settings, logger)
+            prog = beam_search_one_pair(x, y, phi, mode_settings, logger, deadline=deadline)
 
+            if deadline.expired():
+                hit_deadline = True
+                setattr(settings, "_deadline_hit", True)
+                if prog is None:
+                    break
             if prog is None:
                 continue
 
@@ -2586,6 +4110,9 @@ def solve_task(
                 controller.rotation_count += 1
 
             controller.last_rotation_cost = avg_cost
+
+            if hit_deadline:
+                break
 
             # Early stop if perfect
             if best_avg_cost < 0.01:
@@ -2715,7 +4242,9 @@ def solve_task(
         learned_block_mask = None
 
     # Attach palette finisher - try appending palette remapping to improve accuracy
-    if best_program is not None:
+    if deadline.expired():
+        hit_deadline = True
+    if best_program is not None and not deadline.expired():
         mapping = _palette_map_from_train_pairs(train_pairs)
         if mapping:
             prog2 = Program([Step(s.op, s.args) for s in best_program.steps])
@@ -2725,6 +4254,44 @@ def solve_task(
             avg_p2 = np.mean([compute_cost(prog2, xi, yi, phi, settings) for (xi, yi) in train_pairs])
             if avg_p2 < avg_best:
                 best_program = prog2
+
+    # ===== v2.9.1: Late auto-refiners (looser gate, extra candidate) =====
+    if deadline.expired():
+        hit_deadline = True
+    if best_program is not None and not deadline.expired():
+        def _avg_train_cost_pixels(prog: Program) -> float:
+            errs = []
+            for xi, yi in train_pairs:
+                try:
+                    pred = interpret_program(prog, xi)
+                    tgt = np.asarray(yi)
+                    if pred.shape != tgt.shape:
+                        errs.append(1.0)
+                    else:
+                        errs.append(float((pred != tgt).mean()))
+                except Exception:
+                    errs.append(1.0)
+            return float(np.mean(errs)) if errs else 1.0
+
+        try:
+            base_cost_px = _avg_train_cost_pixels(best_program)
+            if base_cost_px <= 0.45:
+                candidates = []
+                base_steps = [Step(s.op, s.args) for s in best_program.steps]
+                prog_keep1 = Program(base_steps + [Step("keep_n_largest", (1,))])
+                prog_keep2 = Program(base_steps + [Step("keep_n_largest", (2,))])
+                prog_fill = Program(base_steps + [Step("fill_holes", tuple())])
+                candidates.append(("keep_n_largest(1)", prog_keep1, _avg_train_cost_pixels(prog_keep1)))
+                candidates.append(("keep_n_largest(2)", prog_keep2, _avg_train_cost_pixels(prog_keep2)))
+                candidates.append(("fill_holes", prog_fill, _avg_train_cost_pixels(prog_fill)))
+                _, best_prog2, best_cost_px = min(candidates, key=lambda t: t[2])
+                if best_cost_px + 1e-9 < base_cost_px:
+                    best_program = best_prog2
+                    best_avg_cost = np.mean(
+                        [compute_cost(best_program, xi, yi, phi, settings) for (xi, yi) in train_pairs]
+                    )
+        except Exception:
+            pass
 
     # Apply best program to test inputs
     # Learn palette map once from training pairs (used for TRAIN evaluation only)
@@ -2748,6 +4315,10 @@ def solve_task(
         # Palette is safe if it helps or maintains accuracy on all training pairs
         palette_is_safe = (safe_count == len(train_pairs))
     
+    _update_rho(settings, best_program, train_pairs, phi, palette_is_safe)
+    _smooth_rho(settings, getattr(settings, "_hfp_rho", None))
+    prog_tension = float(compute_program_tension(best_program, phi)) if best_program is not None else 0.0
+
     # Check if we should generate two attempts using truncated shape-base
     # Truncate program at last tile_masked to get pure shape transformation
     base_steps, ky, kx, m = _truncate_at_last_tile_masked(best_program)
@@ -2771,6 +4342,12 @@ def solve_task(
         prog2 = Program(alt_steps)
         
         for test_x in test_inputs:
+            if deadline.expired():
+                hit_deadline = True
+                setattr(settings, "_deadline_hit", True)
+                fallback = test_x.copy()
+                predictions.append({"attempt_1": fallback.tolist(), "attempt_2": fallback.tolist()})
+                continue
             # Attempt 1: Original mode (raw output)
             try:
                 pred1 = interpret_program(prog1, test_x)
@@ -2789,7 +4366,12 @@ def solve_task(
     # SINGLE-ATTEMPT MODE: Apply finishers on TEST
     else:
         for test_x in test_inputs:
-            if best_program is None:
+            expired_now = deadline.expired()
+            if expired_now:
+                hit_deadline = True
+                setattr(settings, "_deadline_hit", True)
+
+            if best_program is None or expired_now:
                 pred1 = test_x.copy()
             else:
                 try:
@@ -2797,31 +4379,181 @@ def solve_task(
                 except Exception:
                     pred1 = test_x.copy()
 
-            # Apply finishers to single-attempt predictions
-            # Block-mask finisher
-            if 'learned_block_mask' in locals() and learned_block_mask is not None:
-                ky, kx, M = learned_block_mask
-                div = _divisible_shape(test_x.shape, pred1.shape)
-                if div == (ky, kx):
-                    pred1 = _apply_block_mask(pred1, ky, kx, M)
+            if not expired_now:
+                if 'learned_block_mask' in locals() and learned_block_mask is not None:
+                    ky, kx, M = learned_block_mask
+                    div = _divisible_shape(test_x.shape, pred1.shape)
+                    if div == (ky, kx):
+                        pred1 = _apply_block_mask(pred1, ky, kx, M)
 
-            # Blockwise color projection finisher
-            if 'learned_blockwise_proj' in locals() and learned_blockwise_proj is not None:
-                ky, kx, D = learned_blockwise_proj
-                div = _divisible_shape(test_x.shape, pred1.shape)
-                if div == (ky, kx):
-                    pred1 = _apply_blockwise_projection(pred1, ky, kx, D)
+                if 'learned_blockwise_proj' in locals() and learned_blockwise_proj is not None:
+                    ky, kx, D = learned_blockwise_proj
+                    div = _divisible_shape(test_x.shape, pred1.shape)
+                    if div == (ky, kx):
+                        pred1 = _apply_blockwise_projection(pred1, ky, kx, D)
 
-            # Single-output mode
-            predictions.append(pred1)
+            pred_np = np.asarray(pred1)
+            ky_kx_meta = None
+            if "learned_block_mask" in locals() and learned_block_mask is not None:
+                ky_kx_meta = (learned_block_mask[0], learned_block_mask[1])
+            elif "learned_blockwise_proj" in locals() and learned_blockwise_proj is not None:
+                ky_kx_meta = (learned_blockwise_proj[0], learned_blockwise_proj[1])
+            meta = {
+                "bg": 0,
+                "prog_len": (len(best_program.steps) if best_program else 0),
+                "tension": prog_tension,
+                "align_dy_dx": align,
+                "block_mask": (learned_block_mask[2] if ("learned_block_mask" in locals() and learned_block_mask is not None) else None),
+                "block_proj": (lambda g, ky=learned_blockwise_proj[0], kx=learned_blockwise_proj[1], D=learned_blockwise_proj[2]: _apply_blockwise_projection(g, ky, kx, D)) if ("learned_blockwise_proj" in locals() and learned_blockwise_proj is not None and not expired_now) else None,
+                "palette_safe": bool(palette_is_safe),
+                "ky_kx": ky_kx_meta,
+            }
+            predictions.append({"grid": pred_np.tolist(), "meta": meta})
 
-    elapsed = time.time() - start_time
+    # v2.8.7: expose last program for replay/debugging
+    try:
+        globals()["last_best_program"] = best_program
+    except Exception:
+        pass
+
+    # v2.8.7: universal two-attempts for non-tiling programs
+    if (
+        settings.always_two_attempts
+        and predictions
+        and not (isinstance(predictions[0], dict) and ("attempt_1" in predictions[0] or "grid" in predictions[0]))
+    ):
+        enhanced = []
+        for grid in predictions:
+            if deadline.expired():
+                hit_deadline = True
+                setattr(settings, "_deadline_hit", True)
+                fallback = grid.tolist() if hasattr(grid, "tolist") else grid
+                enhanced.append({"attempt_1": fallback, "attempt_2": fallback})
+                continue
+            try:
+                g = np.asarray(grid)
+                alt_cands = [
+                    np.rot90(g, k=1),
+                    np.rot90(g, k=2),
+                    np.rot90(g, k=3),
+                    np.fliplr(g),
+                    np.flipud(g),
+                ]
+                attempt_2 = alt_cands[0]
+                enhanced.append(
+                    {
+                        "attempt_1": g.tolist(),
+                        "attempt_2": attempt_2.tolist(),
+                    }
+                )
+            except Exception:
+                fallback = grid.tolist() if hasattr(grid, "tolist") else grid
+                enhanced.append({"attempt_1": fallback, "attempt_2": fallback})
+        predictions = enhanced
+
+    elapsed = _now() - t0
     success = best_avg_cost < 0.01
+
+    if meta is not None and selected_arm is not None and selected_fam is not None:
+        try:
+            reward = max(0.0, 1.0 - float(best_avg_cost)) / (0.05 + elapsed)
+            meta.update(selected_fam, selected_arm, reward)
+        except Exception:
+            pass
+
+    if trace and logger:
+        print(f"[trace] collected {len(getattr(settings, '_trace_buffer', []))} op deltas")
+
+    hit_deadline = hit_deadline or getattr(settings, "_deadline_hit", False) or deadline.expired()
+    budget = float(getattr(settings, "max_seconds", 0.0) or 0.0)
+    ops_tokens: List[str] = []
+    ops_families: List[str] = []
+    if best_program is not None:
+        for step in best_program.steps:
+            ops_tokens.append(_format_step_token(step))
+            ops_families.append(_op_family_tag(step))
+    payload = {
+        "budget_sec": budget,
+        "elapsed_sec": float(elapsed),
+        "hit_deadline": bool(hit_deadline),
+        "ops_tokens": ops_tokens,
+        "ops_families": ops_families,
+        "program_len": int(len(ops_tokens)),
+    }
+    if logger and hasattr(logger, "log_kv"):
+        try:
+            logger.log_kv("budget_sec", budget)
+            logger.log_kv("elapsed_sec", float(elapsed))
+            logger.log_kv("hit_deadline", bool(hit_deadline))
+        except Exception:
+            pass
+    if isinstance(predictions, list):
+        for entry in predictions:
+            if isinstance(entry, dict):
+                _telemetry_note(entry, **payload)
+    elif isinstance(predictions, dict):
+        _telemetry_note(predictions, **payload)
 
     if logger:
         logger.log_task_end(task_id, success, elapsed)
 
     return predictions
+
+
+# v2.8.7: progressive beam schedules
+DEFAULT_SCHEDULES = [(24, 3), (48, 5), (64, 7), (96, 8)]
+
+
+def solve_task_with_schedule(
+    tid,
+    task_json,
+    settings,
+    logger=None,
+    schedules=None,
+):
+    """
+    Try a tiered (beam_width, max_depth) schedule and return the best predictions and schedule.
+    If settings._truths_provider is present (callable tid->list[np.ndarray]), use it to pick the best;
+    otherwise returns the first successful predictions.
+    """
+
+    schedules = schedules or DEFAULT_SCHEDULES
+    best_score, best_preds, best_cfg = -1.0, None, None
+    last_preds = None
+
+    truths = None
+    try:
+        provider = getattr(settings, "_truths_provider", None)
+        if callable(provider):
+            truths = provider(tid)
+    except Exception:
+        truths = None
+
+    for beam_width, max_depth in schedules:
+        sub = replace(settings, beam_width=beam_width, max_depth=max_depth)
+        # propagate auxiliary hooks if present
+        for attr in ("_truths_provider", "_policy_prior", "_trace_ops"):
+            if hasattr(settings, attr):
+                setattr(sub, attr, getattr(settings, attr))
+
+        preds = solve_task(tid, task_json, sub, logger=logger)
+        last_preds = preds
+        score = -1.0
+        if truths is not None and preds is not None and len(truths) == len(preds):
+            try:
+                score = float(
+                    np.mean([_pixel_acc(preds[i], truths[i]) for i in range(len(preds))])
+                )
+            except Exception:
+                score = -1.0
+
+        if best_preds is None or score > best_score:
+            best_score, best_preds, best_cfg = score, preds, (beam_width, max_depth)
+
+        if score == 1.0:
+            break
+
+    return (best_preds if best_preds is not None else last_preds), best_cfg
 
 
 # ============================================================================
@@ -2834,33 +4566,37 @@ def run_dir(
     max_tasks: Optional[int] = None,
     logger: Optional[StepLogger] = None
 ) -> Dict[str, List[Any]]:
-    """
-    Run solver on all tasks in a directory.
-    
-    Returns:
-        Dict mapping task_id -> list of predicted grids (or dicts if two_attempts mode)
-    """
-    results = {}
-
     tasks = list(load_tasks_from_dir(tasks_dir))
-
+    tasks_dict = dict(tasks)
+    panel_ids = list(tasks_dict.keys())
     if max_tasks:
-        tasks = tasks[:max_tasks]
-
-    for task_id, task_json in tasks:
-        preds = solve_task(task_id, task_json, settings, logger)
-
-        # Convert to list of lists for JSON serialization
-        # Handle both single-output and two-attempts formats
+        panel_ids = panel_ids[:max_tasks]
+        tasks_dict = {tid: tasks_dict[tid] for tid in panel_ids}
+    # _run_dir_staged expects loader to fetch tasks by id
+    def _local_loader(_):
+        return tasks_dict
+    prev_loader = globals().get("_load_test_challenges")
+    globals()["_load_test_challenges"] = _local_loader
+    try:
+        staged = _run_dir_staged(
+            tasks_dir,
+            seconds=getattr(settings, "max_seconds", None),
+            panel_ids=panel_ids,
+            logger=logger,
+            settings_proto=settings,
+        )
+    finally:
+        if prev_loader is not None:
+            globals()["_load_test_challenges"] = prev_loader
+        else:
+            globals().pop("_load_test_challenges", None)
+    results = {}
+    for tid, preds in staged.items():
         if preds and isinstance(preds[0], dict):
-            # Two-attempts mode: already in dict format
             preds_ll = preds
         else:
-            # Single-output mode: convert np.ndarray to list
-            preds_ll = [pred.tolist() if hasattr(pred, 'tolist') else pred for pred in preds]
-
-        results[task_id] = preds_ll
-
+            preds_ll = [pred.tolist() if hasattr(pred, "tolist") else pred for pred in preds]
+        results[tid] = preds_ll
     return results
 
 
@@ -3079,6 +4815,22 @@ Examples:
                        help="Program tension weight (default: 0.30)")
     parser.add_argument("--lambda2", type=float, default=0.20,
                        help="Slice tension weight (default: 0.20)")
+    parser.add_argument("--div_lambda", type=float, default=0.20,
+                        help="Diversity bonus weight for two-attempt selection (default: 0.20)")
+    parser.add_argument("--iou_cap", type=float, default=0.97,
+                        help="Maximum IoU allowed before alternates are rejected (default: 0.97)")
+    parser.add_argument("--max_bounces", type=int, default=-1,
+                        help="Hard cap on debate bounces (default: -1 for rho-driven)")
+    parser.add_argument("--no_octo_prior", action="store_true",
+                        help="Disable palette8 octonion distance–based time scaling (training stage).")
+    parser.add_argument("--octo_alpha", type=float, default=0.25,
+                        help="Z-score scaling strength for octo prior (mult = 1 + alpha * z).")
+    parser.add_argument("--octo_clip", type=float, default=2.0,
+                        help="Clamp |z| to this many std devs for octo prior.")
+    parser.add_argument("--no_polish", action="store_true",
+                        help="Skip polish stage (third stage) to save time.")
+    parser.add_argument("--stop_if_diversity", type=float, default=0.20,
+                        help="Early-exit after a stage if (1 - IoU(attempt1,attempt2)) exceeds threshold.")
     
     # Ablations
     parser.add_argument("--ablation", type=str, default=None,
@@ -3116,6 +4868,14 @@ Examples:
         print(f"  Two attempts mode: {args.attempt2_strategy}")
     if args.ablation:
         print(f"  Ablation: {args.ablation}")
+    print(
+        f"  Octo prior: {'ON' if not args.no_octo_prior else 'OFF'} "
+        f"(alpha={args.octo_alpha}, clip={args.octo_clip})"
+    )
+    print(
+        f"  Stage controls: no_polish={'ON' if args.no_polish else 'OFF'}, "
+        f"stop_if_diversity={args.stop_if_diversity:.2f}"
+    )
     print("=" * 80)
     
     # Build settings
@@ -3129,6 +4889,14 @@ Examples:
         public_mode=args.public_mode,
         log_every=args.log_every,
         seed=args.seed,
+        div_lambda=args.div_lambda,
+        iou_cap=args.iou_cap,
+        max_bounces=args.max_bounces,
+        use_octo_prior=(not args.no_octo_prior),
+        octo_alpha=args.octo_alpha,
+        octo_clip=args.octo_clip,
+        no_polish=args.no_polish,
+        stop_if_diversity=args.stop_if_diversity,
     )
     
     # Apply ablation if specified
@@ -3149,7 +4917,8 @@ Examples:
         predictions = _two_attempts_from_results(
             results,
             tasks_dir=resolved_tasks_dir,
-            strategy=args.attempt2_strategy
+            strategy=args.attempt2_strategy,
+            settings=settings,
         )
     else:
         predictions = results  # legacy single-output-per-test schema
