@@ -891,6 +891,296 @@ def _palette_map_if_pareto_safe(grid, train_pairs):
     except Exception:
         return grid, False
 
+def _surrogate_conf(pred, belief):
+    """Cheap [0,1] confidence surrogate from belief metadata."""
+    H, W = _grid_shape(pred)
+    if H * W == 0:
+        return 0.0
+    bg = belief.get("bg", 0) if belief else 0
+    occ = 0.0
+    if H > 0 and W > 0:
+        occ = sum(1 for i in range(H) for j in range(W) if pred[i][j] != bg) / (H * W)
+    prog_len = max(1, int(belief.get("prog_len", 10))) if belief else 1
+    prior_len = 1.0 / (1.0 + prog_len / 10.0)
+    tension = 1.0 - min(1.0, float(belief.get("tension", 0.5))) if belief else 0.5
+    varp = 1.0 - min(1.0, float(belief.get("train_cost_var", 0.5))) if belief else 0.5
+    pal = 1.0 if belief and belief.get("palette_safe", False) else 0.0
+    conf = 0.25 * occ + 0.20 * prior_len + 0.25 * tension + 0.20 * varp + 0.10 * pal
+    return max(0.0, min(1.0, conf))
+
+
+def _build_belief(meta, train_pairs=None, phi=None, palette_safe=None, learned_mask=None, learned_proj=None, align=None):
+    belief = {
+        "ky_kx": meta.get("ky_kx") if isinstance(meta, dict) else None,
+        "block_mask": learned_mask if learned_mask is not None else (meta.get("block_mask") if isinstance(meta, dict) else None),
+        "block_proj": learned_proj if learned_proj is not None else (meta.get("block_proj") if isinstance(meta, dict) else None),
+        "align_dy_dx": align if align is not None else (meta.get("align_dy_dx") if isinstance(meta, dict) else None),
+        "palette_safe": bool(palette_safe if palette_safe is not None else (meta.get("palette_safe", False) if isinstance(meta, dict) else False)),
+        "prog_len": meta.get("prog_len", 10) if isinstance(meta, dict) else 10,
+        "tension": meta.get("tension", 0.5) if isinstance(meta, dict) else 0.5,
+        "train_cost_var": meta.get("train_cost_var", 0.5) if isinstance(meta, dict) else 0.5,
+        "family": meta.get("family") if isinstance(meta, dict) else None,
+        "bg": meta.get("bg", 0) if isinstance(meta, dict) else 0,
+    }
+    return belief
+
+
+def _alternates_from_belief(att1, test_x, belief, train_pairs):
+    alts = []
+    dy, dx = (0, 0)
+    if belief.get("align_dy_dx") and len(belief["align_dy_dx"]) == 2:
+        dy, dx = belief["align_dy_dx"]
+    alts.append({"tag": "align_shift", "grid": _shift_grid(att1, dy, dx, fill=belief.get("bg", 0))})
+
+    block_mask = belief.get("block_mask")
+    if block_mask is not None and _grid_shape(block_mask) == _grid_shape(att1):
+        H, W = _grid_shape(att1)
+        bg = belief.get("bg", 0)
+        masked = [[att1[i][j] if block_mask[i][j] else bg for j in range(W)] for i in range(H)]
+        alts.append({"tag": "block_mask", "grid": masked})
+
+    block_proj = belief.get("block_proj")
+    if block_proj is not None and callable(block_proj):
+        try:
+            alts.append({"tag": "block_proj", "grid": block_proj(att1)})
+        except Exception:
+            pass
+
+    alts.append({"tag": "rot180", "grid": _rot180(att1)})
+    alts.append({"tag": "mirror", "grid": _mirror_lr(att1)})
+    alts.append({"tag": "keep_n_largest(1)", "grid": _largest_component_only(att1, bg=belief.get("bg", 0))})
+
+    for alt in alts:
+        alt["conf"] = _surrogate_conf(alt["grid"], belief)
+    return alts
+
+
+def _select_best_pair(att1, candidates, belief, lambda_div=0.20, iou_cap=0.97):
+    confA = _surrogate_conf(att1, belief)
+    best_choice = None
+    best_grid = None
+    best_score = -1e9
+    for alt in candidates:
+        grid = alt.get("grid")
+        if grid is None:
+            continue
+        iou = _pixel_iou(att1, grid)
+        if iou >= iou_cap:
+            continue
+        confB = alt.get("conf", _surrogate_conf(grid, belief))
+        score = confA + confB + lambda_div * (1.0 - iou)
+        if score > best_score:
+            best_score = score
+            best_grid = grid
+            best_choice = {"tag": alt.get("tag", "?"), "iou": iou, "conf1": confA, "conf2": confB}
+    if best_grid is None:
+        if candidates:
+            fallback = min(candidates, key=lambda c: _pixel_iou(att1, c.get("grid")))
+            best_grid = fallback.get("grid", att1)
+            best_choice = {"tag": fallback.get("tag", "fallback"), "iou": _pixel_iou(att1, best_grid), "conf1": confA, "conf2": _surrogate_conf(best_grid, belief)}
+        else:
+            best_grid = att1
+            best_choice = {"tag": "self", "iou": 1.0, "conf1": confA, "conf2": confA}
+    return att1, best_grid, best_choice
+
+
+def _smooth_rho(settings, rho_raw):
+    if rho_raw is None:
+        return getattr(settings, "_hfp_rho_smoothed", None)
+    prev = getattr(settings, "_hfp_rho_smoothed", None)
+    smoothed = 0.5 * (prev if prev is not None else rho_raw) + 0.5 * rho_raw
+    setattr(settings, "_hfp_rho_smoothed", smoothed)
+    return smoothed
+
+
+def _rho_band(rho):
+    if rho is None:
+        return "<0.70"
+    if rho < 0.70:
+        return "<0.70"
+    if rho < 0.95:
+        return "0.70–0.95"
+    return "≥0.95"
+
+
+def _cheap_revision(grid, belief, which="align_or_block"):
+    if which == "align_or_block":
+        align = belief.get("align_dy_dx") if belief else None
+        if isinstance(align, (tuple, list)) and len(align) == 2:
+            dy, dx = align
+            return _shift_grid(grid, dy, dx, fill=belief.get("bg", 0) if belief else 0)
+        bm = belief.get("block_mask") if belief else None
+        if bm is not None and _grid_shape(bm) == _grid_shape(grid):
+            H, W = _grid_shape(grid)
+            bg = belief.get("bg", 0) if belief else 0
+            return [[grid[i][j] if bm[i][j] else bg for j in range(W)] for i in range(H)]
+    return _mirror_lr(grid)
+
+
+def _bounded_debate(att1, att2, test_x, belief, rho_s, max_bounces):
+    bounces = 0
+    if rho_s is None or rho_s < 0.70:
+        return att1, att2, bounces
+    cap = 1 if rho_s < 0.95 else 2
+    if isinstance(max_bounces, int) and max_bounces >= 0:
+        cap = min(cap, max_bounces)
+    confA = _surrogate_conf(att1, belief)
+    confB = _surrogate_conf(att2, belief)
+    if confB <= confA + 0.03:
+        return att1, att2, bounces
+    A1 = _cheap_revision(att1, belief, "align_or_block")
+    bounces += 1
+    if bounces >= cap:
+        return A1, att2, bounces
+    confA1 = _surrogate_conf(A1, belief)
+    if confA1 > confB + 0.03:
+        B1 = _cheap_revision(att2, belief, "align_or_block")
+        bounces += 1
+        return A1, B1, bounces
+    return A1, att2, bounces
+
+
+def _apply_test_palette_policy_pair(att1, att2, train_pairs, test_x, settings):
+    policy = getattr(settings, "test_palette_policy", "second_only_guarded") if settings else "second_only_guarded"
+    if policy in (None, "none"):
+        return att1, att2, "no_palette"
+    if policy == "both":
+        policy = "second_only_guarded"
+    mapped, ok = _palette_map_if_pareto_safe(att2, train_pairs)
+    if policy == "second_only":
+        return att1, (mapped if ok else att2), "second_only" if ok else "second_only(noop)"
+    if policy == "second_only_guarded":
+        return att1, (mapped if ok else att2), "second_only_guarded" if ok else "guard_blocked"
+    return att1, att2, "unknown_policy"
+
+
+def _telemetry_note(meta_or_res, **kw):
+    try:
+        if isinstance(meta_or_res, dict):
+            meta_or_res.setdefault("_telemetry", {}).update({k: v for k, v in kw.items() if v is not None})
+    except Exception:
+        pass
+
+
+def _is_masked_tiling(meta):
+    if isinstance(meta, dict):
+        if meta.get("path_tag") == "masked_tiling":
+            return True
+        if meta.get("tile_masked"):
+            return True
+        if meta.get("ky_kx") and meta.get("block_mask") is not None and meta.get("no_finishers", True):
+            return True
+    return False
+
+
+def _masked_tiling_alternate(att1, meta):
+    H, W = _grid_shape(att1)
+    if H * W == 0:
+        return att1
+    bm = meta.get("block_mask") if isinstance(meta, dict) else None
+    if bm is not None and _grid_shape(bm) == (H, W):
+        return [[att1[i][j] if not bm[i][j] else 0 for j in range(W)] for i in range(H)]
+    return [[0 if att1[i][j] != 0 else 1 for j in range(W)] for i in range(H)]
+
+
+def _structure_ok(a, b, train_pairs=None):
+    if _grid_shape(a) != _grid_shape(b):
+        return False
+    Ha, Wa = _grid_shape(a)
+    if Ha * Wa == 0:
+        return True
+    def _checksum(g):
+        H, W = _grid_shape(g)
+        return sum((i + 1) * (j + 1) * g[i][j] for i in range(H) for j in range(W))
+    return _checksum(a) == _checksum(b)
+
+
+def _palette_map_if_pareto_safe(grid, train_pairs):
+    try:
+        mapping = _palette_map_from_train_pairs(train_pairs or [])
+        if not mapping:
+            return grid, False
+        if not _palette_map_is_unanimous(train_pairs or [], mapping):
+            return grid, False
+        candidate = _apply_palette_map_ll(grid, mapping)
+        if not _structure_ok(grid, candidate, train_pairs):
+            return grid, False
+        return candidate, True
+    except Exception:
+        return grid, False
+
+
+def _adjust_abort_windows(settings, seconds, have_shape_match):
+    stall = seconds / 3.0
+    abort_after = seconds / 3.0
+    rho_s = getattr(settings, "_hfp_rho_smoothed", None)
+    ready = bool(getattr(settings, "_hfp_ready", False))
+    if rho_s is not None and rho_s >= 0.95:
+        stall = max(stall, 0.80 * seconds)
+        abort_after = max(abort_after, 0.80 * seconds)
+    if ready and rho_s is not None and rho_s < 0.70:
+        stall = min(stall, 0.20 * seconds)
+        abort_after = min(abort_after, 0.20 * seconds)
+    return stall, abort_after
+
+
+def _median2(values):
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return float(values[-1])
+    return float(_stats.median(values[-2:]))
+
+
+def _maybe_escalate_K(cons_mean, rho_samples, settings, n_train_pairs):
+    K = getattr(settings, "max_train_pairs_for_beam", 2)
+    cons_mean = cons_mean or 0.0
+    rho_med = _median2(rho_samples)
+    if cons_mean >= 0.70 or rho_med >= 0.90:
+        K = max(3, K)
+    return min(n_train_pairs, K)
+
+
+def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settings_proto=None):
+    stages = [(24, 3, 4.0), (96, 7, 45.0), (128, 8, 120.0)]
+    if seconds is not None:
+        stages = [(24, 3, 4.0), (96, 7, float(seconds))] if seconds >= 10.0 else [(96, 7, float(seconds))]
+    loader = globals().get("_load_test_challenges") or globals().get("load_tasks")
+    if loader is None:
+        raise RuntimeError("task loader not found")
+    challenges = loader(tasks_dir)
+    tids = list(panel_ids) if panel_ids else list(challenges.keys())
+    outputs = {}
+
+    def _score(preds):
+        if not preds:
+            return (0, 0.0)
+        if isinstance(preds[0], dict) and "attempt_1" in preds[0]:
+            ious = [_pixel_iou(d["attempt_1"], d["attempt_2"]) for d in preds]
+            div = 1.0 - float(sum(ious) / len(ious))
+            return (2, div)
+        return (1, 0.0)
+
+    for tid in tids:
+        task_json = challenges[tid]
+        best, best_tag = None, (0, 0.0)
+        for beam, depth, secs in stages:
+            proto = settings_proto or SearchSettings()
+            stage_settings = replace(proto, beam_width=beam, max_depth=depth, max_seconds=secs, use_meta_controller=True)
+            start = time.time()
+            res = solve_task(tid, task_json, stage_settings, logger=logger)
+            elapsed = time.time() - start
+            try:
+                _telemetry_note(res if isinstance(res, dict) else {}, stage_time=elapsed, stage=(beam, depth, secs))
+            except Exception:
+                pass
+            sc = _score(res)
+            if best is None or sc > best_tag:
+                best, best_tag = res, sc
+                outputs[tid] = best
+            if best_tag[0] == 2 and best_tag[1] >= 0.03:
+                break
+    return outputs
 
 # === Octonion palette8 encoding & running stats ===============================
 
