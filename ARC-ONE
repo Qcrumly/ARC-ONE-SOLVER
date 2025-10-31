@@ -2749,6 +2749,36 @@ PALETTE_OPS = {
     "majority",
     "minority",
 }
+# --- Guard: define underscore op-family sets if not yet defined (import-order safe) ---
+try:
+    _TOPOLOGY_OPS
+except NameError:
+    _TOPOLOGY_OPS = {
+        "largest", "keep_n_largest", "keep_size_range",
+        "fill_holes", "keep_rings", "remove_isolated", "mask",
+        "center_largest", "fill"
+    }
+try:
+    _ALIGNMENT_OPS
+except NameError:
+    _ALIGNMENT_OPS = {
+        "shift", "flipud", "fliplr",
+        "rot90", "rot180", "rot270", "transpose", "align"
+    }
+try:
+    _TILING_OPS
+except NameError:
+    _TILING_OPS = {"tile", "tile_masked", "phase_tile", "phase_tile_row", "phase_tile_col"}
+try:
+    _RESIZE_OPS
+except NameError:
+    _RESIZE_OPS = {"resize", "scale"}
+try:
+    _PALETTE_OPS
+except NameError:
+    _PALETTE_OPS = {"replacecolor", "swapcolors", "invert", "recolor", "palette_map"}
+# --- end guard ---
+
 TOPOLOGY_OPS = set(_TOPOLOGY_OPS)
 ALIGNMENT_OPS = set(_ALIGNMENT_OPS)
 EXPANSION_OPS = set(_TILING_OPS) | set(_RESIZE_OPS)
