@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.17"
+__version__ = "v2.9.18"
 
 last_best_program = None
 
@@ -2986,6 +2986,89 @@ def _gof_wrap_tile_masked_identity(op_obj):
     return op_obj
 
 
+# Utility: coerce a “single int” argument in many forms into a plain int
+def _gof_coerce_single_int_arg(x):
+    try:
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, int):
+            return int(x)
+        np_integer = getattr(np, "integer", ()) if hasattr(np, "integer") else ()
+        if np_integer and isinstance(x, np_integer):  # type: ignore[arg-type]
+            return int(x)
+        if isinstance(x, (tuple, list)) and len(x) == 1:
+            return _gof_coerce_single_int_arg(x[0])
+        if isinstance(x, str):
+            filtered = "".join(ch for ch in x if ch.isdigit() or ch == "-")
+            if filtered and filtered not in {"-", "--"}:
+                return int(filtered)
+    except Exception:
+        pass
+    return x
+
+
+# Generic single-int sanitizer for ops like remove_isolated, keep_n_largest, etc.
+def _gof_wrap_single_int_arg(op_obj):
+    if hasattr(op_obj, "apply"):
+        original_apply = op_obj.apply
+
+        def _apply(program, *args, **kwargs):
+            if len(args) == 1:
+                coerced = _gof_coerce_single_int_arg(args[0])
+                args = (coerced,)
+            return original_apply(program, *args, **kwargs)
+
+        op_obj.apply = _apply
+        return op_obj
+
+    if callable(op_obj):
+        original_call = op_obj
+
+        def _call(*args, **kwargs):
+            if len(args) == 1:
+                coerced = _gof_coerce_single_int_arg(args[0])
+                args = (coerced,)
+            return original_call(*args, **kwargs)
+
+        return _call
+
+    return op_obj
+
+
+# Depth-0 identity ban for phase-tile family: phase_tile, phase_tile_row, phase_tile_col
+def _gof_wrap_phase_tile_identity(op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = None
+            for x in a:
+                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
+                    prog = x
+                    break
+            d = 0 if prog is None else _gof_prog_depth(prog)
+            if d < K_NO_SIZEOPS_AT_START:
+                ints = _gof_collect_ints(*a)
+                if len(ints) >= 2:
+                    if len(ints) >= 3:
+                        ky, kx = ints[-3], ints[-2]
+                    else:
+                        ky, kx = ints[-2], ints[-1]
+                    try:
+                        if int(ky) == 1 and int(kx) == 1:
+                            return None
+                    except Exception:
+                        pass
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
 # Optional: args_enum shields so bad candidates are never proposed
 def _gof_shield_resize_args_enum(op_obj):
     if not hasattr(op_obj, "args_enum"):
@@ -3044,32 +3127,6 @@ def _gof_shield_resize_args_enum(op_obj):
     return op_obj
 
 
-# New: sanitize single-int args (e.g., 'remove_isolated((1))' → 1)
-def _gof_wrap_single_int_arg(op_obj):
-    if not hasattr(op_obj, "apply"):
-        return op_obj
-
-    original_apply = op_obj.apply
-
-    def _apply(program, *args, **kwargs):
-        new_args = args
-        if len(args) == 1:
-            a0 = args[0]
-            try:
-                if isinstance(a0, (list, tuple)) and len(a0) == 1:
-                    new_args = (int(a0[0]),)
-                elif isinstance(a0, str):
-                    filtered = "".join(ch for ch in a0 if ch.isdigit() or ch == "-")
-                    if filtered:
-                        new_args = (int(filtered),)
-            except Exception:
-                pass
-        return original_apply(program, *new_args, **kwargs)
-
-    op_obj.apply = _apply
-    return op_obj
-
-
 # Patch the current OP_REGISTRY once
 try:
     _REG = OP_REGISTRY
@@ -3086,7 +3143,9 @@ try:
             _REG[_k] = _gof_wrap_tile_identity(_op)
         elif _nm == "tile_masked":
             _REG[_k] = _gof_wrap_tile_masked_identity(_op)
-        elif _nm in ("remove_isolated", "keep_n_largest"):
+        elif _nm in ("phase_tile", "phase_tile_row", "phase_tile_col"):
+            _REG[_k] = _gof_wrap_phase_tile_identity(_op)
+        elif _nm in ("remove_isolated", "keep_n_largest", "largest"):
             _REG[_k] = _gof_wrap_single_int_arg(_op)
 except Exception:
     pass

@@ -1,3 +1,8 @@
+## v2.9.18 — 2025-11-01
+- **Depth-0 identity ban extended to phase-tiles:** `phase_tile`, `phase_tile_row`, and `phase_tile_col` with `(1,1,*)` are blocked as opening moves, matching the existing `tile`/`tile_masked` policy.
+- **Robust single-int sanitizer:** callable and method operators normalize forms like `remove_isolated((1))` or `'1'` to plain `1` so object tools stay reachable.
+- Keeps prior guards: no size-ops at depth 0; directional resize/scale in early steps; strengthened object-first prior.
+
 ## v2.9.17 — 2025-11-01
 - **Depth-0 masked identity ban:** `tile_masked(1,1,0)` blocked at step 0, same as `tile(1,1)`.
 - **Robust int-arg parsing:** normalize single-int ops like `remove_isolated((1))` → `1` so object tools stay available.
