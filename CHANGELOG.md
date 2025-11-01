@@ -1,3 +1,8 @@
+## v2.9.20 — 2025-11-01
+- **Shift de-dupe:** block any immediate `shift(...)` following another `shift(...)` to prevent shift→shift openers.
+- **Sanitized arguments & tokens:** normalize single-int arguments (e.g., `'1'`, `((1))`) across object ops and clean `ops_tokens` rendering so telemetry logs stay readable.
+- Keeps prior depth-0 identity and directional guards for resize/scale/tile families.
+
 ## v2.9.18 — 2025-11-01
 - **Depth-0 identity ban extended to phase-tiles:** `phase_tile`, `phase_tile_row`, and `phase_tile_col` with `(1,1,*)` are blocked as opening moves, matching the existing `tile`/`tile_masked` policy.
 - **Robust single-int sanitizer:** callable and method operators normalize forms like `remove_isolated((1))` or `'1'` to plain `1` so object tools stay reachable.

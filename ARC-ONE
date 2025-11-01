@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.18"
+__version__ = "v2.9.20"
 
 last_best_program = None
 
@@ -1077,14 +1077,14 @@ def _ops_tokens_from_program(prog):
         for m in ("as_tokens", "to_tokens"):
             if hasattr(prog, m):
                 toks = getattr(prog, m)() or []
-                return [str(t) for t in toks]
+                return [_gof_sanitize_token(str(t)) for t in toks]
         steps = getattr(prog, "steps", None)
         if steps:
             toks = []
             for s in steps:
                 op = getattr(s, "op", s)
                 args = getattr(s, "args", [])
-                toks.append(f"{op}({','.join(map(str, args))})")
+                toks.append(_gof_sanitize_token(f"{op}({','.join(map(str, args))})"))
             return toks
     except Exception:
         pass
@@ -2754,6 +2754,23 @@ def _gof_collect_ints(*values):
     return ints
 
 
+def _gof_sanitize_token(tok: str) -> str:
+    """Normalize token strings so integer arguments appear without extra wrappers."""
+    try:
+        name, rest = tok.split("(", 1)
+        rest = rest.rstrip(")")
+        if not rest:
+            return tok
+        parts = [p.strip() for p in rest.split(",")]
+        cleaned: List[str] = []
+        for part in parts:
+            digits = "".join(ch for ch in part if (ch.isdigit() or ch == "-"))
+            cleaned.append(digits if digits else part)
+        return f"{name}(" + ",".join(cleaned) + ")"
+    except Exception:
+        return tok
+
+
 def _gof_shape_of(g):
     try:
         import numpy as _np
@@ -2843,8 +2860,7 @@ def _gof_wrap_resize(op_obj):
                         pass
                 # If shrinking is needed, do not allow area-increasing resize; if growing is needed, forbid shrinking
                 try:
-                    # Heuristic: last two positional args are (h, w)
-                    nums = _gof_collect_ints(*a[-2:])
+                    nums = _gof_collect_ints(*a)
                     if len(nums) >= 2:
                         h, w = nums[-2], nums[-1]
                         cur = (
@@ -2945,7 +2961,7 @@ def _gof_wrap_tile_identity(op_obj):
                     break
             d = 0 if prog is None else _gof_prog_depth(prog)
             if d < K_NO_SIZEOPS_AT_START:
-                nums = _gof_collect_ints(*a[-2:])
+                nums = _gof_collect_ints(*a)
                 if len(nums) >= 2 and nums[-2] == 1 and nums[-1] == 1:
                     return None
             return f(*a, **k)
@@ -2971,7 +2987,7 @@ def _gof_wrap_tile_masked_identity(op_obj):
                     break
             d = 0 if prog is None else _gof_prog_depth(prog)
             if d < K_NO_SIZEOPS_AT_START:
-                nums = _gof_collect_ints(*a[-3:])
+                nums = _gof_collect_ints(*a)
                 if len(nums) >= 3 and nums[-3] == 1 and nums[-2] == 1:
                     return None
             return f(*a, **k)
@@ -3069,6 +3085,33 @@ def _gof_wrap_phase_tile_identity(op_obj):
     return op_obj
 
 
+# Strong shift de-dupe: block shift immediately following another shift.
+def _gof_wrap_shift_guard(op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = None
+            for x in a:
+                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
+                    prog = x
+                    break
+            if prog is not None:
+                steps = getattr(prog, "steps", None)
+                if steps:
+                    prev = getattr(steps[-1], "op", None)
+                    if isinstance(prev, str) and prev.lower() == "shift":
+                        return None
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
 # Optional: args_enum shields so bad candidates are never proposed
 def _gof_shield_resize_args_enum(op_obj):
     if not hasattr(op_obj, "args_enum"):
@@ -3147,6 +3190,8 @@ try:
             _REG[_k] = _gof_wrap_phase_tile_identity(_op)
         elif _nm in ("remove_isolated", "keep_n_largest", "largest"):
             _REG[_k] = _gof_wrap_single_int_arg(_op)
+        elif _nm == "shift":
+            _REG[_k] = _gof_wrap_shift_guard(_op)
 except Exception:
     pass
 
