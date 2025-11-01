@@ -1,8 +1,9 @@
-## v2.9.12-b — 2025-10-31
+## v2.9.12 — 2025-10-31
 - **Identity policy (shape-aware):** Keep neutral ops blocked until shapes match and depth > 0, treating resize/scale/tile(1,1) as
   no-ops when they preserve area.
-- **Scale-rails enforcement:** Apply directional scale gating after successor generation, allowing shrink actions when shrink is
-  required and forbidding only the wrong direction; expose the gated operator shortlist.
+- **Scale-rails enforcement:** Apply directional scale gating after successor generation and wrap
+  `resize`/`scale` so early steps refuse the wrong direction while still allowing the needed
+  shrink/grow actions; expose the gated operator shortlist.
 - **Telemetry:** Added `rail_depth` and `rail_allowed` breadcrumbs alongside the scale sign and identity policy markers.
 
 ## v2.9.11 — 2025-10-31

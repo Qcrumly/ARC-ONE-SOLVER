@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.9.12-b — Identity rails directional pass
+# Version: v2.9.12 — Directional scale guards
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.12-b"
+__version__ = "v2.9.12"
 
 last_best_program = None
 
@@ -1065,6 +1065,117 @@ def compute_rho(pred, truth, t_prog=None):
         except Exception:
             pass
     return acc
+
+
+# === Directional scale guards (operator-level, early steps only) ============
+# Enforce direction for resize/scale during first K steps, inferred from shapes.
+K_SCALE_DIR = 3  # guard for depth < 3
+
+
+def _prog_depth(p):
+    try:
+        return len(p.steps)
+    except Exception:
+        return getattr(p, "_rails_steps", 0)
+
+
+def _shape_of(grid_like):
+    # numpy array or list-of-lists
+    try:
+        import numpy as _np
+
+        if hasattr(grid_like, "shape") and len(grid_like.shape) >= 2:
+            return (int(grid_like.shape[-2]), int(grid_like.shape[-1]))
+    except Exception:
+        pass
+    if isinstance(grid_like, list) and grid_like and isinstance(grid_like[0], list):
+        return (len(grid_like), len(grid_like[0]))
+    return None
+
+
+def _infer_scale_need_from_prog(p):
+    """Return s in {-1.0, 0.0, +1.0}: compress, neutral, expand."""
+    # Try program context first
+    ctx = getattr(p, "ctx", None)
+    in_shape = out_shape = None
+    if isinstance(ctx, dict):
+        in_shape = ctx.get("in_shape") or _shape_of(ctx.get("input") or ctx.get("input_grid"))
+        out_shape = ctx.get("out_shape") or _shape_of(ctx.get("target") or ctx.get("target_grid"))
+    # Fall back to common attrs
+    in_shape = in_shape or _shape_of(getattr(p, "input_grid", None)) or _shape_of(getattr(p, "state0", None))
+    out_shape = out_shape or _shape_of(getattr(p, "target", None)) or _shape_of(getattr(p, "goal", None))
+    if not (in_shape and out_shape):
+        return 0.0
+    ia = int(in_shape[0]) * int(in_shape[1])
+    oa = int(out_shape[0]) * int(out_shape[1])
+    if oa < 0.9 * ia:  # need to shrink
+        return -1.0
+    if oa > 1.1 * ia:  # need to grow
+        return +1.0
+    return 0.0
+
+
+def _wrap_resize_directional(op_obj):
+    if not hasattr(op_obj, "apply"):
+        return op_obj
+    old_apply = op_obj.apply
+
+    def new_apply(program, *args, **kw):
+        d = _prog_depth(program)
+        if d < K_SCALE_DIR:
+            s = getattr(program, "_rails_s", None)
+            if s is None:
+                s = _infer_scale_need_from_prog(program)
+                try:
+                    setattr(program, "_rails_s", s)
+                except Exception:
+                    pass
+            try:
+                h, w = int(args[0]), int(args[1])
+            except Exception:
+                return old_apply(program, *args, **kw)
+            cur = getattr(program, "state", None) or getattr(program, "grid", None)
+            cur_shape = _shape_of(cur) or _shape_of(getattr(program, "input_grid", None))
+            if cur_shape:
+                cur_area = cur_shape[0] * cur_shape[1]
+                new_area = h * w
+                if s <= -1.0 and new_area >= cur_area:
+                    return None
+                if s >= +1.0 and new_area <= cur_area:
+                    return None
+        return old_apply(program, *args, **kw)
+
+    op_obj.apply = new_apply
+    return op_obj
+
+
+def _wrap_scale_directional(op_obj):
+    if not hasattr(op_obj, "apply"):
+        return op_obj
+    old_apply = op_obj.apply
+
+    def new_apply(program, *args, **kw):
+        d = _prog_depth(program)
+        if d < K_SCALE_DIR:
+            s = getattr(program, "_rails_s", None)
+            if s is None:
+                s = _infer_scale_need_from_prog(program)
+                try:
+                    setattr(program, "_rails_s", s)
+                except Exception:
+                    pass
+            try:
+                factor = float(args[0])
+            except Exception:
+                return old_apply(program, *args, **kw)
+            if s <= -1.0 and factor >= 1.0:
+                return None
+            if s >= +1.0 and factor <= 1.0:
+                return None
+        return old_apply(program, *args, **kw)
+
+    op_obj.apply = new_apply
+    return op_obj
 
 
 # === Telemetry helpers (always available) ===================================
@@ -2705,6 +2816,19 @@ OP_REGISTRY = {
     "phase_tile_row": _op_phase_tile_row,
     "phase_tile_col": _op_phase_tile_col,
 }
+
+
+try:
+    _OPR = OP_REGISTRY
+    for k in list(_OPR.keys()):
+        op = _OPR[k]
+        name = str(getattr(op, "name", k)).lower()
+        if name == "resize":
+            _OPR[k] = _wrap_resize_directional(op)
+        elif name == "scale":
+            _OPR[k] = _wrap_scale_directional(op)
+except Exception:
+    pass
 
 
 # ============================================================================
