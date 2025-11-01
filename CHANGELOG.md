@@ -1,3 +1,8 @@
+## v2.9.14 — 2025-11-01
+- **Operator-level early-step direction guards**: `resize/scale` refuse the wrong direction for the first K steps, inferred from input→target area (shrink when target is smaller; grow when target is larger). Stops early wrong-way expansions on compression tasks.
+- **Identity policy at step 0**: block `tile(1,1)`, `scale(1)`, and `resize(H,W==current)` as the **first** step unless the task is truly identity. Avoids no-op starts that stall progress.
+- Telemetry note: `early_dir_guard_steps=K` recorded once at import.
+
 ## v2.9.13 — 2025-11-01
 - **Operator-level directional guards** (early steps): `resize/scale` now refuse the wrong direction for the first K steps, inferred from input→target area (shrink when target is smaller; grow when target is larger). Prevents early wrong-way expansions on compression tasks.
 - **Identity ejection (runtime)**: `tile(1,1)`, `scale(1)`, and `resize(H,W==current)` rejected in policy overlays unless the task is truly identity; avoids no-op starts that stall progress.

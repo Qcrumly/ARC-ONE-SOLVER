@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.9.13 — Directional scale guards
+# Version: v2.9.14 — Directional guards + identity gate
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.13"
+__version__ = "v2.9.14"
 
 last_best_program = None
 
@@ -1065,117 +1065,6 @@ def compute_rho(pred, truth, t_prog=None):
         except Exception:
             pass
     return acc
-
-
-# === Directional scale guards (operator-level, early steps only) ============
-# Enforce direction for resize/scale during first K steps, inferred from shapes.
-K_SCALE_DIR = 3  # guard for depth < 3
-
-
-def _prog_depth(p):
-    try:
-        return len(p.steps)
-    except Exception:
-        return getattr(p, "_rails_steps", 0)
-
-
-def _shape_of(grid_like):
-    # numpy array or list-of-lists
-    try:
-        import numpy as _np
-
-        if hasattr(grid_like, "shape") and len(grid_like.shape) >= 2:
-            return (int(grid_like.shape[-2]), int(grid_like.shape[-1]))
-    except Exception:
-        pass
-    if isinstance(grid_like, list) and grid_like and isinstance(grid_like[0], list):
-        return (len(grid_like), len(grid_like[0]))
-    return None
-
-
-def _infer_scale_need_from_prog(p):
-    """Return s in {-1.0, 0.0, +1.0}: compress, neutral, expand."""
-    # Try program context first
-    ctx = getattr(p, "ctx", None)
-    in_shape = out_shape = None
-    if isinstance(ctx, dict):
-        in_shape = ctx.get("in_shape") or _shape_of(ctx.get("input") or ctx.get("input_grid"))
-        out_shape = ctx.get("out_shape") or _shape_of(ctx.get("target") or ctx.get("target_grid"))
-    # Fall back to common attrs
-    in_shape = in_shape or _shape_of(getattr(p, "input_grid", None)) or _shape_of(getattr(p, "state0", None))
-    out_shape = out_shape or _shape_of(getattr(p, "target", None)) or _shape_of(getattr(p, "goal", None))
-    if not (in_shape and out_shape):
-        return 0.0
-    ia = int(in_shape[0]) * int(in_shape[1])
-    oa = int(out_shape[0]) * int(out_shape[1])
-    if oa < 0.9 * ia:  # need to shrink
-        return -1.0
-    if oa > 1.1 * ia:  # need to grow
-        return +1.0
-    return 0.0
-
-
-def _wrap_resize_directional(op_obj):
-    if not hasattr(op_obj, "apply"):
-        return op_obj
-    old_apply = op_obj.apply
-
-    def new_apply(program, *args, **kw):
-        d = _prog_depth(program)
-        if d < K_SCALE_DIR:
-            s = getattr(program, "_rails_s", None)
-            if s is None:
-                s = _infer_scale_need_from_prog(program)
-                try:
-                    setattr(program, "_rails_s", s)
-                except Exception:
-                    pass
-            try:
-                h, w = int(args[0]), int(args[1])
-            except Exception:
-                return old_apply(program, *args, **kw)
-            cur = getattr(program, "state", None) or getattr(program, "grid", None)
-            cur_shape = _shape_of(cur) or _shape_of(getattr(program, "input_grid", None))
-            if cur_shape:
-                cur_area = cur_shape[0] * cur_shape[1]
-                new_area = h * w
-                if s <= -1.0 and new_area >= cur_area:
-                    return None
-                if s >= +1.0 and new_area <= cur_area:
-                    return None
-        return old_apply(program, *args, **kw)
-
-    op_obj.apply = new_apply
-    return op_obj
-
-
-def _wrap_scale_directional(op_obj):
-    if not hasattr(op_obj, "apply"):
-        return op_obj
-    old_apply = op_obj.apply
-
-    def new_apply(program, *args, **kw):
-        d = _prog_depth(program)
-        if d < K_SCALE_DIR:
-            s = getattr(program, "_rails_s", None)
-            if s is None:
-                s = _infer_scale_need_from_prog(program)
-                try:
-                    setattr(program, "_rails_s", s)
-                except Exception:
-                    pass
-            try:
-                factor = float(args[0])
-            except Exception:
-                return old_apply(program, *args, **kw)
-            if s <= -1.0 and factor >= 1.0:
-                return None
-            if s >= +1.0 and factor <= 1.0:
-                return None
-        return old_apply(program, *args, **kw)
-
-    op_obj.apply = new_apply
-    return op_obj
 
 
 # === Telemetry helpers (always available) ===================================
@@ -2818,17 +2707,182 @@ OP_REGISTRY = {
 }
 
 
+# === GOF-9000: Early-step Directional Guards + Identity Policy ===============
+# Purpose: stop wrong-way resize/scale in the first few steps, and block noop
+# starts unless the task is truly identity. Works regardless of successor API.
+
+# How many earliest steps to police (conservative)
+K_DIR = 3
+
+
+def _gof_shape_of(g):
+    try:
+        import numpy as _np
+
+        if hasattr(g, "shape") and len(g.shape) >= 2:
+            return (int(g.shape[-2]), int(g.shape[-1]))
+    except Exception:
+        pass
+    if isinstance(g, list) and g and isinstance(g[0], list):
+        return (len(g), len(g[0]))
+    return None
+
+
+def _gof_prog_depth(p):
+    try:
+        return len(p.steps)
+    except Exception:
+        return int(getattr(p, "_rails_steps", 0))
+
+
+def _gof_infer_scale_need_from_prog(p):
+    """Return s in {-1.0, 0.0, +1.0}: compress, neutral, expand."""
+    inp = (_gof_shape_of(getattr(p, "input_grid", None))
+           or _gof_shape_of(getattr(p, "state0", None))
+           or _gof_shape_of(getattr(p, "state", None)))
+    tgt = (_gof_shape_of(getattr(p, "target", None))
+           or _gof_shape_of(getattr(p, "goal", None)))
+    if not (inp and tgt):
+        return 0.0
+    ia, ta = int(inp[0]) * int(inp[1]), int(tgt[0]) * int(tgt[1])
+    if ta < 0.9 * ia:
+        return -1.0  # need shrink
+    if ta > 1.1 * ia:
+        return +1.0  # need expand
+    return 0.0
+
+
+def _gof_is_identity(op_name, args, program):
+    # tile(1,1), scale(1), resize to same size
+    try:
+        if op_name == "tile" and len(args) >= 2:
+            return int(args[0]) == 1 and int(args[1]) == 1
+        if op_name == "scale" and len(args) >= 1:
+            return float(args[0]) == 1.0
+        if op_name == "resize" and len(args) >= 2:
+            h, w = int(args[0]), int(args[1])
+            cur = (_gof_shape_of(getattr(program, "state", None))
+                   or _gof_shape_of(getattr(program, "grid", None))
+                   or _gof_shape_of(getattr(program, "input_grid", None)))
+            return bool(cur) and (tuple(cur) == (h, w))
+    except Exception:
+        pass
+    return False
+
+
+def _gof_wrap_resize(op_obj):
+    if not hasattr(op_obj, "apply"):
+        return op_obj
+    _old = op_obj.apply
+
+    def _apply(program, *args, **kw):
+        # Identity ejection at depth 0 (or when shapes differ)
+        d = _gof_prog_depth(program)
+        if _gof_is_identity("resize", args, program) and d == 0:
+            return None
+        # Directional guard in first K steps
+        if d < K_DIR:
+            s = getattr(program, "_rails_s", None)
+            if s is None:
+                s = _gof_infer_scale_need_from_prog(program)
+                try:
+                    setattr(program, "_rails_s", s)
+                except Exception:
+                    pass
+            try:
+                h, w = int(args[0]), int(args[1])
+                cur = (_gof_shape_of(getattr(program, "state", None))
+                       or _gof_shape_of(getattr(program, "grid", None))
+                       or _gof_shape_of(getattr(program, "input_grid", None)))
+                if cur:
+                    curA, newA = int(cur[0]) * int(cur[1]), h * w
+                    if s <= -1.0 and newA >= curA:  # must shrink
+                        return None
+                    if s >= +1.0 and newA <= curA:  # must grow
+                        return None
+            except Exception:
+                pass
+        return _old(program, *args, **kw)
+
+    op_obj.apply = _apply
+    return op_obj
+
+
+def _gof_wrap_scale(op_obj):
+    if not hasattr(op_obj, "apply"):
+        return op_obj
+    _old = op_obj.apply
+
+    def _apply(program, *args, **kw):
+        # Identity ejection at depth 0 (or when shapes differ)
+        d = _gof_prog_depth(program)
+        try:
+            if d == 0 and len(args) >= 1 and float(args[0]) == 1.0:
+                return None
+        except Exception:
+            pass
+        # Directional guard in first K steps
+        if d < K_DIR:
+            s = getattr(program, "_rails_s", None)
+            if s is None:
+                s = _gof_infer_scale_need_from_prog(program)
+                try:
+                    setattr(program, "_rails_s", s)
+                except Exception:
+                    pass
+            try:
+                factor = float(args[0])
+                if s <= -1.0 and factor >= 1.0:  # must shrink
+                    return None
+                if s >= +1.0 and factor <= 1.0:  # must grow
+                    return None
+            except Exception:
+                pass
+        return _old(program, *args, **kw)
+
+    op_obj.apply = _apply
+    return op_obj
+
+
+def _gof_wrap_tile_identity(op_obj):
+    if not hasattr(op_obj, "apply"):
+        return op_obj
+    _old = op_obj.apply
+
+    def _apply(program, *args, **kw):
+        # Block tile(1,1) as a start; permit later only if truly neutral
+        d = _gof_prog_depth(program)
+        try:
+            if d == 0 and len(args) >= 2 and int(args[0]) == 1 and int(args[1]) == 1:
+                return None
+        except Exception:
+            pass
+        return _old(program, *args, **kw)
+
+    op_obj.apply = _apply
+    return op_obj
+
+
+# Patch the current OP_REGISTRY once
 try:
-    _OPR = OP_REGISTRY
-    for k in list(_OPR.keys()):
-        op = _OPR[k]
-        name = str(getattr(op, "name", k)).lower()
-        if name == "resize":
-            _OPR[k] = _wrap_resize_directional(op)
-        elif name == "scale":
-            _OPR[k] = _wrap_scale_directional(op)
+    _REG = OP_REGISTRY
+    for _k in list(getattr(_REG, "keys", lambda: [])()):
+        _op = _REG[_k]
+        _nm = (getattr(_op, "name", _k)).lower()
+        if _nm == "resize":
+            _REG[_k] = _gof_wrap_resize(_op)
+        elif _nm == "scale":
+            _REG[_k] = _gof_wrap_scale(_op)
+        elif _nm == "tile":
+            _REG[_k] = _gof_wrap_tile_identity(_op)
 except Exception:
     pass
+
+try:
+    _telemetry_note(globals(), early_dir_guard_steps=K_DIR)
+except Exception:
+    pass
+# === end GOF-9000 directional/identity guards ===============================
 
 
 # ============================================================================
