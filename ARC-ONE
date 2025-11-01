@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.9.14 — Directional guards + identity gate
+# Version: v2.9.15 — No-guess resize/scale shields
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.14"
+__version__ = "v2.9.15"
 
 last_best_program = None
 
@@ -2737,11 +2737,19 @@ def _gof_prog_depth(p):
 
 def _gof_infer_scale_need_from_prog(p):
     """Return s in {-1.0, 0.0, +1.0}: compress, neutral, expand."""
-    inp = (_gof_shape_of(getattr(p, "input_grid", None))
-           or _gof_shape_of(getattr(p, "state0", None))
-           or _gof_shape_of(getattr(p, "state", None)))
-    tgt = (_gof_shape_of(getattr(p, "target", None))
-           or _gof_shape_of(getattr(p, "goal", None)))
+    # Try program.ctx first if present (search layer usually sets these)
+    ctx = getattr(p, "ctx", None)
+    inp = None
+    tgt = None
+    if isinstance(ctx, dict):
+        inp = ctx.get("in_shape") or _gof_shape_of(ctx.get("input") or ctx.get("input_grid"))
+        tgt = ctx.get("out_shape") or _gof_shape_of(ctx.get("target") or ctx.get("target_grid"))
+    # Fall back to common attributes
+    inp = inp or (_gof_shape_of(getattr(p, "input_grid", None))
+                  or _gof_shape_of(getattr(p, "state0", None))
+                  or _gof_shape_of(getattr(p, "state", None)))
+    tgt = tgt or (_gof_shape_of(getattr(p, "target", None))
+                  or _gof_shape_of(getattr(p, "goal", None)))
     if not (inp and tgt):
         return 0.0
     ia, ta = int(inp[0]) * int(inp[1]), int(tgt[0]) * int(tgt[1])
@@ -2789,6 +2797,9 @@ def _gof_wrap_resize(op_obj):
                     setattr(program, "_rails_s", s)
                 except Exception:
                     pass
+            # If we can't determine direction at step 0, don't guess: forbid resize as first move
+            if d == 0 and s == 0.0:
+                return None
             try:
                 h, w = int(args[0]), int(args[1])
                 cur = (_gof_shape_of(getattr(program, "state", None))
@@ -2830,6 +2841,8 @@ def _gof_wrap_scale(op_obj):
                     setattr(program, "_rails_s", s)
                 except Exception:
                     pass
+            if d == 0 and s == 0.0:
+                return None  # don't guess expansion/shrink at step 0
             try:
                 factor = float(args[0])
                 if s <= -1.0 and factor >= 1.0:  # must shrink
@@ -2863,6 +2876,60 @@ def _gof_wrap_tile_identity(op_obj):
     return op_obj
 
 
+# Optional: args_enum shields so bad candidates are never proposed
+def _shield_resize_args_enum(op_obj):
+    if not hasattr(op_obj, "args_enum"):
+        return op_obj
+    old = op_obj.args_enum
+
+    def new_enum(*aa, **kk):
+        # Try to pull ctx/program if provided by the framework
+        ctx = None
+        prog = None
+        for x in aa:
+            if isinstance(x, dict):
+                ctx = x
+            else:
+                prog = x if getattr(x, "__class__", None) else prog
+        s = 0.0
+        if prog is not None:
+            s = getattr(prog, "_rails_s", None)
+            if s is None:
+                s = _gof_infer_scale_need_from_prog(prog)
+                try:
+                    setattr(prog, "_rails_s", s)
+                except Exception:
+                    pass
+        elif isinstance(ctx, dict) and ("in_shape" in ctx and "out_shape" in ctx):
+            ia = int(ctx["in_shape"][0]) * int(ctx["in_shape"][1])
+            oa = int(ctx["out_shape"][0]) * int(ctx["out_shape"][1])
+            s = -1.0 if oa < 0.9 * ia else (+1.0 if oa > 1.1 * ia else 0.0)
+        # If we can't tell direction yet, forbid resize at step 0 by returning nothing
+        for args in old(*aa, **kk):
+            try:
+                h, w = int(args[0]), int(args[1])
+            except Exception:
+                continue
+            # No direction known: let non-zero-depth cases through; step-0 will be blocked by apply()
+            if s == 0.0:
+                yield args
+                continue
+            # Direction known: keep only area-consistent candidates
+            # (Shrinking: new area < current; Growing: new area > current.
+            # We can't see current here reliably, so approximate by comparing to out_shape if present.)
+            if isinstance(ctx, dict) and "out_shape" in ctx:
+                oa = int(ctx["out_shape"][0]) * int(ctx["out_shape"][1])
+                na = h * w
+                if s <= -1.0 and na >= oa:  # shrinking needed → prefer <= target area
+                    continue
+                if s >= +1.0 and na <= oa:  # growing needed → prefer >= target area
+                    continue
+            yield args
+
+    op_obj.args_enum = new_enum
+    return op_obj
+
+
 # Patch the current OP_REGISTRY once
 try:
     _REG = OP_REGISTRY
@@ -2870,7 +2937,9 @@ try:
         _op = _REG[_k]
         _nm = (getattr(_op, "name", _k)).lower()
         if _nm == "resize":
-            _REG[_k] = _gof_wrap_resize(_op)
+            _op = _gof_wrap_resize(_op)
+            _op = _shield_resize_args_enum(_op)
+            _REG[_k] = _op
         elif _nm == "scale":
             _REG[_k] = _gof_wrap_scale(_op)
         elif _nm == "tile":

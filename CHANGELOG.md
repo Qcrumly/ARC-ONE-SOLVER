@@ -1,3 +1,8 @@
+## v2.9.15 — 2025-11-01
+- **No-guess rule at step 0:** when direction cannot be inferred, `resize/scale` are forbidden as the first move. Prevents harmful blind opens on hard evals.
+- **Better direction inference:** guards now read `program.ctx['in_shape'/'out_shape']` when available; falls back to common attributes.
+- **Enumerator shields:** when available, `resize.args_enum(...)` is filtered to prefer candidates consistent with the required direction (and avoid obvious mismatches).
+
 ## v2.9.14 — 2025-11-01
 - **Operator-level early-step direction guards**: `resize/scale` refuse the wrong direction for the first K steps, inferred from input→target area (shrink when target is smaller; grow when target is larger). Stops early wrong-way expansions on compression tasks.
 - **Identity policy at step 0**: block `tile(1,1)`, `scale(1)`, and `resize(H,W==current)` as the **first** step unless the task is truly identity. Avoids no-op starts that stall progress.
