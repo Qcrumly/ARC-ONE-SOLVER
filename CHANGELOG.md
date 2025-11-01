@@ -1,3 +1,9 @@
+## v2.9.17 — 2025-11-01
+- **Depth-0 masked identity ban:** `tile_masked(1,1,0)` blocked at step 0, same as `tile(1,1)`.
+- **Robust int-arg parsing:** normalize single-int ops like `remove_isolated((1))` → `1` so object tools stay available.
+- **Object-first opening bias:** at depth 0, when |φ[obj]| > 0.30, up-rank `keep_n_largest`/`remove_isolated` (+0.80) and `fill_holes`/`keep_rings`/`largest` (+0.60).
+- Keeps previous guards: no size-ops at depth 0; directional checks for resize/scale in early steps.
+
 ## v2.9.16 — 2025-11-01
 - **Hard block `resize`/`scale`/`tile` at depth 0.** Enforces structure-first openings across all code paths.
 - **Wrap function-style ops too.** Registry wrappers now handle both `.apply` methods and bare callables, so step-0 bans and directional checks always apply.

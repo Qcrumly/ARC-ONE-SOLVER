@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.9.15 — No-guess resize/scale shields
+# Version: v2.9.17 — Masked identity ban + object-first open
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.16"
+__version__ = "v2.9.17"
 
 last_best_program = None
 
@@ -2208,9 +2208,11 @@ class HeuristicPrior(PolicyPrior):
 
         # --- GOF-9000: object-centric soft preference ---
         phi = None
+        depth = 0
         try:
-            if "ctx" in locals() and isinstance(ctx, dict):
+            if isinstance(ctx, dict):
                 phi = ctx.get("phi")
+                depth = int(ctx.get("depth", 0) or 0)
         except Exception:
             phi = None
 
@@ -2222,12 +2224,17 @@ class HeuristicPrior(PolicyPrior):
                 obj_mag = 0.0
         else:
             try:
-                if "ctx" in locals() and isinstance(ctx, dict) and ctx.get("has_shape_match"):
+                if isinstance(ctx, dict) and ctx.get("has_shape_match"):
                     obj_mag = max(obj_mag, 0.35)
             except Exception:
                 pass
 
-        if obj_mag > 0.30:
+        if depth == 0 and obj_mag > 0.30:
+            if op_name in ("keep_n_largest", "remove_isolated"):
+                score += 0.80
+            elif op_name in ("fill_holes", "keep_rings", "largest", "center_largest"):
+                score += 0.60
+        elif obj_mag > 0.30:
             if op_name in ("keep_n_largest", "remove_isolated"):
                 score += 0.35
             elif op_name in ("fill_holes", "keep_rings", "largest", "center_largest"):
@@ -2718,6 +2725,35 @@ K_DIR = 3
 K_NO_SIZEOPS_AT_START = 1
 
 
+def _gof_collect_ints(*values):
+    """Collect ints from nested args, tolerating numpy scalars and digit strings."""
+    ints: List[int] = []
+    stack = list(values)
+    np_integer = getattr(np, "integer", ()) if hasattr(np, "integer") else ()
+    while stack:
+        item = stack.pop()
+        if isinstance(item, bool):  # avoid treating booleans as ints
+            continue
+        if isinstance(item, int):
+            ints.append(int(item))
+            continue
+        if np_integer and isinstance(item, np_integer):  # type: ignore[arg-type]
+            ints.append(int(item))
+            continue
+        if isinstance(item, (list, tuple)):
+            stack.extend(item)
+            continue
+        if isinstance(item, str):
+            filtered = "".join(ch for ch in item if ch.isdigit() or ch == "-")
+            if filtered:
+                try:
+                    ints.append(int(filtered))
+                except Exception:
+                    pass
+    ints.reverse()
+    return ints
+
+
 def _gof_shape_of(g):
     try:
         import numpy as _np
@@ -2808,12 +2844,7 @@ def _gof_wrap_resize(op_obj):
                 # If shrinking is needed, do not allow area-increasing resize; if growing is needed, forbid shrinking
                 try:
                     # Heuristic: last two positional args are (h, w)
-                    nums = []
-                    for arg in a:
-                        try:
-                            nums.append(int(arg))
-                        except Exception:
-                            continue
+                    nums = _gof_collect_ints(*a[-2:])
                     if len(nums) >= 2:
                         h, w = nums[-2], nums[-1]
                         cur = (
@@ -2871,11 +2902,19 @@ def _gof_wrap_scale(op_obj):
                 try:
                     factor = None
                     for arg in reversed(a):
-                        try:
+                        if isinstance(arg, bool):
+                            continue
+                        if isinstance(arg, (int, float)):
                             factor = float(arg)
                             break
-                        except Exception:
-                            continue
+                        if hasattr(np, "floating") and isinstance(arg, np.floating):  # type: ignore[arg-type]
+                            factor = float(arg)
+                            break
+                        if isinstance(arg, str):
+                            filtered = "".join(ch for ch in arg if ch.isdigit() or ch == "." or ch == "-")
+                            if filtered:
+                                factor = float(filtered)
+                                break
                     if factor is None:
                         return f(*a, **k)
                     if s <= -1.0 and factor >= 1.0:
@@ -2905,18 +2944,36 @@ def _gof_wrap_tile_identity(op_obj):
                     prog = x
                     break
             d = 0 if prog is None else _gof_prog_depth(prog)
-            try:
-                if d < K_NO_SIZEOPS_AT_START:
-                    nums = []
-                    for arg in a:
-                        try:
-                            nums.append(int(arg))
-                        except Exception:
-                            continue
-                    if len(nums) >= 2 and nums[-2] == 1 and nums[-1] == 1:
-                        return None
-            except Exception:
-                pass
+            if d < K_NO_SIZEOPS_AT_START:
+                nums = _gof_collect_ints(*a[-2:])
+                if len(nums) >= 2 and nums[-2] == 1 and nums[-1] == 1:
+                    return None
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+# New: also block masked-identity at depth 0: tile_masked(1,1,*)
+def _gof_wrap_tile_masked_identity(op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = None
+            for x in a:
+                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
+                    prog = x
+                    break
+            d = 0 if prog is None else _gof_prog_depth(prog)
+            if d < K_NO_SIZEOPS_AT_START:
+                nums = _gof_collect_ints(*a[-3:])
+                if len(nums) >= 3 and nums[-3] == 1 and nums[-2] == 1:
+                    return None
             return f(*a, **k)
 
         return _wrapped
@@ -2987,6 +3044,32 @@ def _gof_shield_resize_args_enum(op_obj):
     return op_obj
 
 
+# New: sanitize single-int args (e.g., 'remove_isolated((1))' → 1)
+def _gof_wrap_single_int_arg(op_obj):
+    if not hasattr(op_obj, "apply"):
+        return op_obj
+
+    original_apply = op_obj.apply
+
+    def _apply(program, *args, **kwargs):
+        new_args = args
+        if len(args) == 1:
+            a0 = args[0]
+            try:
+                if isinstance(a0, (list, tuple)) and len(a0) == 1:
+                    new_args = (int(a0[0]),)
+                elif isinstance(a0, str):
+                    filtered = "".join(ch for ch in a0 if ch.isdigit() or ch == "-")
+                    if filtered:
+                        new_args = (int(filtered),)
+            except Exception:
+                pass
+        return original_apply(program, *new_args, **kwargs)
+
+    op_obj.apply = _apply
+    return op_obj
+
+
 # Patch the current OP_REGISTRY once
 try:
     _REG = OP_REGISTRY
@@ -3001,6 +3084,10 @@ try:
             _REG[_k] = _gof_wrap_scale(_op)
         elif _nm == "tile":
             _REG[_k] = _gof_wrap_tile_identity(_op)
+        elif _nm == "tile_masked":
+            _REG[_k] = _gof_wrap_tile_masked_identity(_op)
+        elif _nm in ("remove_isolated", "keep_n_largest"):
+            _REG[_k] = _gof_wrap_single_int_arg(_op)
 except Exception:
     pass
 
