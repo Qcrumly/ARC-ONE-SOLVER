@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.9.12 — Directional scale guards
+# Version: v2.9.13 — Directional scale guards
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.12"
+__version__ = "v2.9.13"
 
 last_best_program = None
 

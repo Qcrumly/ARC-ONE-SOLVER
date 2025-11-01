@@ -1,10 +1,13 @@
+## v2.9.13 — 2025-11-01
+- **Operator-level directional guards** (early steps): `resize/scale` now refuse the wrong direction for the first K steps, inferred from input→target area (shrink when target is smaller; grow when target is larger). Prevents early wrong-way expansions on compression tasks.
+- **Identity ejection (runtime)**: `tile(1,1)`, `scale(1)`, and `resize(H,W==current)` rejected in policy overlays unless the task is truly identity; avoids no-op starts that stall progress.
+- **Object-centric nudge (runtime)**: gentle preference for topology/object ops (`keep_n_largest`, `remove_isolated`, `fill_holes`, etc.) when the signal is object-heavy.
+- No DSL changes; guards are conservative and limited to early steps to protect search diversity.
+
 ## v2.9.12 — 2025-10-31
-- **Identity policy (shape-aware):** Keep neutral ops blocked until shapes match and depth > 0, treating resize/scale/tile(1,1) as
-  no-ops when they preserve area.
-- **Scale-rails enforcement:** Apply directional scale gating after successor generation and wrap
-  `resize`/`scale` so early steps refuse the wrong direction while still allowing the needed
-  shrink/grow actions; expose the gated operator shortlist.
-- **Telemetry:** Added `rail_depth` and `rail_allowed` breadcrumbs alongside the scale sign and identity policy markers.
+- **Identity policy (shape-aware):** Block identity ops (`tile(1,1)`, `scale(1)`, `resize(H,W==in)`) when input/target shapes differ; allow only on true identity layouts. Also block as the first step even when shapes match (prevents useless no-op at depth 0).  
+- **Scale-rails enforcement:** Apply compression/expansion rails (extraction+alignment vs tiling/resize+alignment) directly where successors are produced, not just in helpers.  
+- **Telemetry breadcrumbs:** record `rails_scale_sign`, `rail_depth`, and `identity_policy` to aid mining.
 
 ## v2.9.11 — 2025-10-31
 - **A→B→A micro-debate (ρ-gated):** Selectively runs a single repair pass and reconciles {A,B,A′} only when ρ ≥ 0.55.
