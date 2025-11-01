@@ -1,3 +1,9 @@
+## v2.9.16 — 2025-11-01
+- **Hard block `resize`/`scale`/`tile` at depth 0.** Enforces structure-first openings across all code paths.
+- **Wrap function-style ops too.** Registry wrappers now handle both `.apply` methods and bare callables, so step-0 bans and directional checks always apply.
+- **Early gating hardened.** `resize`/`scale`/`tile` are removed from the allowed set when `depth < 1`, preventing bad candidates from being proposed.
+- Directional guards for size changes are still active from depth ≥ 1 (block expanding when shrink is needed, and vice-versa).
+
 ## v2.9.15 — 2025-11-01
 - **No-guess rule at step 0:** when direction cannot be inferred, `resize/scale` are forbidden as the first move. Prevents harmful blind opens on hard evals.
 - **Better direction inference:** guards now read `program.ctx['in_shape'/'out_shape']` when available; falls back to common attributes.
