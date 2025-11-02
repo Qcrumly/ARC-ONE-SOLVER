@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.21"
+__version__ = "v2.9.22"
 
 last_best_program = None
 
@@ -3085,7 +3085,7 @@ def _gof_wrap_phase_tile_identity(op_obj):
     return op_obj
 
 
-# Strong shift de-dupe: block shift immediately following another shift.
+# Strong shift de-dupe (universal): refuse a second shift during the first two steps.
 def _gof_wrap_shift_guard(op_obj):
     def _wrap_apply(f):
         def _wrapped(*a, **k):
@@ -3099,13 +3099,12 @@ def _gof_wrap_shift_guard(op_obj):
                     depth = len(getattr(prog, "steps", []) or [])
                 except Exception:
                     depth = int(getattr(prog, "_rails_steps", 0))
-                prev_op = None
-                steps = getattr(prog, "steps", None)
-                if steps:
-                    prev_op = getattr(steps[-1], "op", None)
-                if not prev_op:
-                    prev_op = getattr(prog, "_gof_last_op", None)
-                if isinstance(prev_op, str) and prev_op.lower() == "shift" and depth < 2:
+                seen_raw = getattr(prog, "_gof_shift_count", 0)
+                try:
+                    seen = int(seen_raw)
+                except Exception:
+                    seen = 0
+                if depth < 2 and seen >= 1:
                     return None
             return f(*a, **k)
 
@@ -3133,6 +3132,28 @@ def _gof_wrap_mark_last(op_name, op_obj):
             if prog is not None:
                 try:
                     setattr(prog, "_gof_last_op", str(op_name).lower())
+                except Exception:
+                    pass
+                try:
+                    op_lower = str(op_name).lower()
+                    if op_lower == "shift":
+                        current = getattr(prog, "_gof_shift_count", 0)
+                        if isinstance(current, bool):
+                            current = 0
+                        try:
+                            current_int = int(current)
+                        except Exception:
+                            current_int = 0
+                        setattr(prog, "_gof_shift_count", current_int + 1)
+                    else:
+                        current = getattr(prog, "_gof_shift_count", 0)
+                        if isinstance(current, bool):
+                            current = 0
+                        try:
+                            current_int = int(current)
+                        except Exception:
+                            current_int = 0
+                        setattr(prog, "_gof_shift_count", current_int)
                 except Exception:
                     pass
             return result

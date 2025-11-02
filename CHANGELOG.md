@@ -1,3 +1,7 @@
+## v2.9.22 — 2025-11-01
+- **Shift de-dupe (final):** universal early counter blocks any second `shift(...)` when `depth < 2`, covering method and callable wrappers while retaining the `_gof_last_op` stamp.
+- Probe targets now expected 0/0/0 for depth-0 size/identity bans, shift→shift openers, and argument sanitization edge cases.
+
 ## v2.9.21 — 2025-11-01
 - **Universal last-op marker:** every operator stamps `_gof_last_op` after a successful apply so policy overlays can reliably inspect the previous move.
 - **Shift de-dupe (hardened):** within the first two steps, `shift` refuses to execute if the immediately prior op was also a `shift`, consulting both the structural history and `_gof_last_op`.
