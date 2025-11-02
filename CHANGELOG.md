@@ -1,3 +1,8 @@
+## v2.9.25 — 2025-11-01
+- **Early shift de-dupe (engine-proof):** rejecting a second early `shift(...)` now returns the unchanged program (instead of `None`), preventing downstream engines from recording a phantom step.
+- **Alias-safe attach:** guards continue to apply to any registry entry whose name includes "shift," so synonyms still obey the guardrails while tokens render as `shift(...)`.
+- Probe target: depth-0 size/identity = 0; shift→shift start = 0; argument sanitization issues = 0.
+
 ## v2.9.24 — 2025-11-01
 - **Early shift de-dupe (alias-safe):** guards now attach to any operator whose name contains "shift" (e.g., `shift_xy`), blocking second shifts within the first two steps at both proposal and apply time.
 - **Depth-0 shift identity:** treat `shift(0,0)` as an identity move and refuse it as the opening action.

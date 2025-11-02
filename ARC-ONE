@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.24"
+__version__ = "v2.9.25"
 
 last_best_program = None
 
@@ -3124,14 +3124,14 @@ def _gof_wrap_shift_apply(op_obj):
             if prog is not None:
                 depth = _gof_depth_of(prog)
                 if depth < 2 and _gof_prev_op_lower(prog) == "shift":
-                    return None
+                    return prog
                 if depth == 0:
                     ints = _gof_collect_ints(*a)
                     if len(ints) >= 2:
                         try:
                             dy, dx = int(ints[-2]), int(ints[-1])
                             if dy == 0 and dx == 0:
-                                return None
+                                return prog
                         except Exception:
                             pass
             return f(*a, **k)
