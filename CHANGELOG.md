@@ -1,3 +1,12 @@
+## v2.9.34 — 2025-11-02
+- **HFP × GOF integration**: Hidden-Factor health (ρ) now modulates GOF “consciousness” to balance exploration vs. caution.
+  - Boost `C_gof` by +50% when healthy (ρ ≥ 0.80), suppress by −50% when degraded (ρ < 0.55).
+  - **Anti-friction break**: piecewise R(ρ) trigger (>|ln ρ|/ρ| scaled) halts futile loops once R > 5.0.
+  - **ρ-driven faces**: Observer/Navigator/Explorer transitions consider ρ trend and modulated `C_gof`, damped by sustained-improvement checks.
+  - **Health-gated successors**: under low ρ, only robust object/align ops survive; gating relaxes as health recovers while keeping core openers.
+  - **Unified telemetry**: `_telemetry.hfp_gof = {rho, rho_sm, R, health, C_gof_base, C_gof, face}` plus CLI toggles (`--no_hfp`, thresholds, debug flag).
+  - Works alongside the GOF-9000 SelfMonitor (pressure, diversity, duplicate pruning) and respects CLI overrides.
+
 ## v2.9.32 — 2025-11-02
 - **GOF-9000 SelfMonitor:** tracks operator-class pressure, prunes duplicate program signatures with an LRU, and injects a single underused-class successor when collapse is detected. Telemetry exposes `op_counts`, `pressure`, `face`, and recent events.
 - **CLI/Settings:** new knobs `--no_monitor`, `--monitor_pressure_thresh`, `--monitor_plateau_N`, `--monitor_visited_cap`, `--no_monitor_inject_underused`, `--no_monitor_drop_dupe_sigs` (also surfaced on `SearchSettings`).
