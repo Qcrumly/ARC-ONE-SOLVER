@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.9.34 — HFP×GOF integration
+# Version: v2.10.0 — Memory v0.1 (motifs + priors + layout) + HFP×GOF integration
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
