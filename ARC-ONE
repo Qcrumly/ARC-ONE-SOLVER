@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.10.0 — Memory v0.1 (motifs + priors + layout) + HFP×GOF integration
+# Version: v2.10.1 — Memory v1.0 (motifs + priors + layout) + Diversity Guard + HFP×GOF
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.10.0"  # Memory v0.1 (motifs + priors + layout)
+__version__ = "v2.10.1"  # Memory v1.0 + Diversity Guard (A/B) + soft priors
 
 last_best_program = None
 
@@ -98,20 +98,10 @@ try:  # Prefer real numpy but fall back to the shim if unavailable
 except ModuleNotFoundError:  # pragma: no cover - aligns with optional numpy install
     _np = np  # type: ignore
 
-try:
-    from arc_memory import load_memory, fingerprint_layout, select_motifs_for_task, parse_op_tokens
+try:  # Memory helpers are optional
+    import arc_memory as MEM
 except Exception:  # pragma: no cover - memory module optional
-    def load_memory(*a, **k):
-        return {}
-
-    def fingerprint_layout(*a, **k):
-        return {}
-
-    def select_motifs_for_task(*a, **k):
-        return []
-
-    def parse_op_tokens(*a, **k):
-        return []
+    MEM = None
 
 
 def _set_determinism(seed=0):
@@ -631,6 +621,115 @@ def _enforce_diversity(att1, att2):
     if _mmr_dissim(ops1, ops2, g1, g2) < DIVERSITY_MIN and isinstance(att2, dict):
         att2.setdefault("_telemetry", {})["diversity_nudge"] = True
     return att2
+
+
+def _detect_strategy_family(ops_tokens: List[str]) -> str:
+    head = " ".join([str(op).lower() for op in (ops_tokens or [])[:2]])
+    if not head:
+        return "unknown"
+    if any(key in head for key in ("mirror", "rot", "flip", "align", "center")):
+        return "align_first"
+    if any(key in head for key in ("keep_n_largest", "largest", "remove_isolated", "keep_size")):
+        return "object_first"
+    if any(key in head for key in ("recolor", "replacecolor", "palette", "map")):
+        return "color_first"
+    if any(key in head for key in ("tile", "phase_tile")):
+        return "tiling_first"
+    return "unknown"
+
+
+def _candidate_family_from_tag(tag: str) -> str:
+    tag_l = (tag or "").lower()
+    if any(key in tag_l for key in ("mirror", "rot", "align", "shift")):
+        return "align_first"
+    if any(key in tag_l for key in ("keep", "largest", "remove", "mask")):
+        return "object_first"
+    if any(key in tag_l for key in ("color", "palette")):
+        return "color_first"
+    if any(key in tag_l for key in ("tile", "phase")):
+        return "tiling_first"
+    return "unknown"
+
+
+def _build_family_alternates(base_grid, belief, family: str) -> List[Dict[str, Any]]:
+    import numpy as _np
+
+    alts: List[Dict[str, Any]] = []
+    try:
+        base_np = _np.asarray(base_grid)
+    except Exception:
+        return alts
+    if base_np.ndim != 2:
+        return alts
+
+    def _push(tag: str, grid_like):
+        if grid_like is None:
+            return
+        grid_arr = _np.asarray(grid_like)
+        if grid_arr.shape != base_np.shape:
+            return
+        alts.append({"tag": tag, "grid": grid_arr})
+
+    if family == "align_first":
+        try:
+            _push("keep_n_largest(1)", _op_keep_n_largest(base_np, 1))
+        except Exception:
+            pass
+    elif family == "object_first":
+        try:
+            _push("mirror_guard", _mirror_lr(base_np))
+        except Exception:
+            pass
+    elif family == "tiling_first":
+        try:
+            _push("rot90_guard", _np.rot90(base_np, 1))
+        except Exception:
+            pass
+    elif family == "color_first":
+        try:
+            _push("keep1_guard", _op_keep_n_largest(base_np, 1))
+        except Exception:
+            pass
+
+    refined: List[Dict[str, Any]] = []
+    for alt in alts:
+        try:
+            grid_val = alt["grid"]
+            conf = _surrogate_conf(grid_val, belief)
+            refined.append({"tag": alt["tag"], "grid": grid_val, "conf": conf})
+        except Exception:
+            continue
+    return refined
+
+
+def _apply_diversity_guard_candidates(base_grid, candidates, belief, settings, ops_tokens):
+    if not getattr(settings, "diversity_guard", True):
+        return candidates, "unknown"
+    family = _detect_strategy_family(ops_tokens)
+    if family == "unknown":
+        return candidates, family
+
+    filtered = [c for c in (candidates or []) if _candidate_family_from_tag(str(c.get("tag", ""))) != family]
+    if not filtered:
+        filtered = list(candidates or [])
+
+    extras = _build_family_alternates(base_grid, belief, family)
+    if getattr(settings, "diversity_b_force_first", False) and family == "align_first":
+        extras = _build_family_alternates(base_grid, belief, "align_first") + extras
+
+    merged = extras + filtered
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for cand in merged:
+        grid_val = cand.get("grid")
+        if grid_val is None:
+            continue
+        key = (cand.get("tag"), _pixel_iou(base_grid, grid_val))
+        if key in seen:
+            continue
+        deduped.append(cand)
+        seen.add(key)
+    return deduped if deduped else filtered, family
 
 
 def _pixel_iou_ll(a, b):
@@ -1728,7 +1827,10 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     except Exception:
                         pass
                 candidates.extend(_alternates_from_belief(base, test_in, belief, pairs))
+                ops_tokens = (meta_dict.get("_telemetry", {}) or {}).get("ops_tokens", [])
+                candidates, family_tag = _apply_diversity_guard_candidates(base, candidates, belief, settings, ops_tokens)
                 lambda_div = getattr(settings, "div_lambda", 0.20) if settings else 0.20
+                lambda_div *= float(getattr(settings, "attemptB_beam_scale", 1.0) if settings else 1.0)
                 iou_cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
                 att1_sel, att2_sel, choice = _select_best_pair(base, candidates, belief, lambda_div=lambda_div, iou_cap=iou_cap)
                 base = att1_sel
@@ -1736,6 +1838,9 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                 rho_raw = getattr(settings, "_hfp_rho", None) if settings else None
                 rho_sm = _smooth_rho(settings, rho_raw) if settings else rho_raw
                 max_b = getattr(settings, "max_bounces", -1) if settings else -1
+                if max_b and max_b > 0 and settings is not None:
+                    scale = float(getattr(settings, "attemptB_time_scale", 1.0))
+                    max_b = max(1, int(round(max_b * max(scale, 0.1))))
                 att1_deb, att2_deb, bounces = _bounded_debate(base, att2, test_in, belief, rho_sm, max_b)
                 base = att1_deb
                 att2 = att2_deb
@@ -1748,6 +1853,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     "bounces": bounces,
                     "rho_band": _rho_band(rho_sm),
                     "attempt_policy": policy_tag,
+                    "diversity_family": family_tag,
                 }
 
                 bg_val = belief.get("bg", 0)
@@ -3884,13 +3990,41 @@ def _apply_op_priors_soft(priors: Dict[str, float], alpha: float = 1.0) -> None:
         pass
 
 
+_TOKEN_PARSE_RE = re.compile(r"^\s*([a-zA-Z_]\w*)\s*\((.*)\)\s*$")
+
+
 def _program_from_ops_tokens(tokens: List[str]) -> Program:
     """Parse a list of op tokens into a Program. Safe fallback returns empty program."""
-    try:
-        steps = parse_op_tokens(tokens)
-        return Program(list(steps))
-    except Exception:
-        return Program([])
+    if MEM is not None and hasattr(MEM, "parse_op_tokens"):
+        try:
+            steps = MEM.parse_op_tokens(tokens)
+            return Program(list(steps))
+        except Exception:
+            pass
+
+    steps: List[Step] = []
+    for tok in tokens or []:
+        tok = str(tok).strip()
+        match = _TOKEN_PARSE_RE.match(tok)
+        if not match:
+            if "(" not in tok:
+                steps.append(Step(tok, ()))
+            continue
+        name, arg_str = match.group(1), match.group(2)
+        parts = [p.strip() for p in arg_str.split(",") if p.strip()]
+        args: List[Any] = []
+        for part in parts:
+            try:
+                args.append(int(part))
+                continue
+            except Exception:
+                pass
+            if part.lower() in ("true", "false"):
+                args.append(part.lower() == "true")
+            else:
+                args.append(part)
+        steps.append(Step(name, tuple(args)))
+    return Program(steps)
 
 
 def _format_step_token(step: Step) -> str:
@@ -4442,13 +4576,17 @@ class _InternalSearchSettings:
     monitor_visited_cap: int = 50000
     monitor_inject_underused: bool = True
     monitor_drop_dupe_sigs: bool = True
-    # === Memory v0.1 ===
+    # === Memory v1.0 ===
     use_memory: bool = True                 # master switch
     memory_use_motifs: bool = True          # seed short programs
     memory_use_priors: bool = True          # bias op policy
-    memory_dir: str | None = None           # default from env ARC_MEMORY_DIR or ./memory_bank
-    memory_max_seeded: int = 3              # 0..3 recommended
-    memory_prior_alpha: float = 1.0         # strength for priors nudges
+    memory_dir: Optional[str] = None        # default from env ARC_MEMORY_DIR or ./memory_bank
+    priors_alpha: float = 1.0               # strength for priors nudges
+    motif_topk: int = 1                     # max motifs to seed
+    diversity_guard: bool = True            # A/B diversity guard
+    diversity_b_force_first: bool = False   # force different first op for B when align-first
+    attemptB_beam_scale: float = 1.0        # heuristic scaling for diversity alt
+    attemptB_time_scale: float = 1.0        # heuristic scaling for debate/time
     hfp_enable: bool = True
     hfp_alpha: float = 0.50
     hfp_rho_hi: float = 0.80
@@ -5854,57 +5992,59 @@ def _solve_task_internal(
     phi = compute_phi(features)
     rho_samples = list(getattr(settings, "_rho_samples", []))
 
-    # === Memory v0.1 hooks ==================================================
-    memo = {}
+    # === Memory v1.0 hooks ==================================================
+    memo: Dict[str, Any] = {}
     layout_fp: Dict[str, Any] = {}
     seeded_programs: List[Program] = []
-    family = None
+    memory_family = None
     priors_applied = False
+    phi_family = None
     try:
-        family = phi_to_family(phi)
+        phi_family = phi_to_family(phi)
     except Exception:
-        family = None
-    try:
-        if getattr(settings, "use_memory", True):
-            memo = load_memory(settings)
-            try:
-                layout_source = task_json.get("train", [{}])[0]
-                layout_grid = layout_source.get("output") or layout_source.get("input")
-                layout_fp = fingerprint_layout(layout_grid) if layout_grid is not None else {}
-            except Exception:
-                layout_fp = {}
-            if family and isinstance(layout_fp, dict):
-                layout_fp.setdefault("family", family)
-            if getattr(settings, "memory_use_priors", True) and memo:
-                priors = memo.get("priors", {}) or {}
-                fam_key = family or layout_fp.get("family") or "default"
-                fam_priors = priors.get("phi_to_ops", {}).get(fam_key, {}) if isinstance(priors, dict) else {}
-                if not fam_priors:
-                    fam_priors = priors.get("ops_global", {}) if isinstance(priors, dict) else {}
-                if fam_priors:
-                    _apply_op_priors_soft(fam_priors, alpha=float(getattr(settings, "memory_prior_alpha", 1.0) or 0.0))
-                    priors_applied = True
-            if getattr(settings, "memory_use_motifs", True) and memo:
-                motifs = select_motifs_for_task(
-                    memo,
-                    layout_fp,
-                    max_k=int(getattr(settings, "memory_max_seeded", 0) or 0),
+        phi_family = None
+    if getattr(settings, "use_memory", True) and MEM is not None:
+        try:
+            memory_dir = getattr(settings, "memory_dir", None) or os.environ.get("ARC_MEMORY_DIR", "./memory_bank")
+            memo = MEM.load_all(memory_dir)
+            layout_fp = MEM.fingerprint_layout(task_json)
+            memory_family = MEM.detect_family(layout_fp)
+            if memory_family is None:
+                memory_family = phi_family or layout_fp.get("family_hint")
+            if getattr(settings, "memory_use_priors", True):
+                priors_map = memo.get("priors", {})
+                priors = MEM.op_prior_for_task(
+                    memory_family or (phi_family or "default"),
+                    priors_map,
+                    alpha=float(getattr(settings, "priors_alpha", 1.0)),
                 )
-                if motifs:
-                    for toks in motifs:
-                        prog = _program_from_ops_tokens(toks)
-                        if prog is not None and prog.steps:
-                            seeded_programs.append(prog)
-    except Exception:
+                if priors:
+                    _apply_op_priors_soft(priors, alpha=float(getattr(settings, "priors_alpha", 1.0)))
+                    priors_applied = True
+            if getattr(settings, "memory_use_motifs", True):
+                motif_topk = int(max(0, getattr(settings, "motif_topk", 0) or 0))
+                motif_tokens = MEM.choose_motifs(layout_fp, memo.get("motifs", {}), topk=motif_topk)
+                for toks in motif_tokens:
+                    prog = _program_from_ops_tokens(toks)
+                    if prog is not None and prog.steps:
+                        seeded_programs.append(prog)
+        except Exception as mem_exc:
+            print(f"[MEMORY] disabled ({mem_exc})")
+            memo = {}
+            seeded_programs = []
+            memory_family = None
+    else:
         memo = {}
         seeded_programs = []
+        memory_family = phi_family
 
     if not priors_applied:
         globals().pop("_OP_NAMES_BIASED", None)
 
     setattr(settings, "_memory_seeded_programs", seeded_programs)
     setattr(settings, "_memory_layout_fp", layout_fp)
-    setattr(settings, "_memory_family", family)
+    setattr(settings, "_memory_family", memory_family)
+    setattr(settings, "_phi_family", memory_family or phi_family)
     setattr(settings, "_memory_priors_applied", priors_applied)
 
     if getattr(settings, "_policy_prior", None) is None:
@@ -6504,7 +6644,7 @@ def _solve_task_internal(
         payload["memory_seeded"] = memory_seed_info
         payload["memory_family"] = getattr(settings, "_memory_family", None)
     if getattr(settings, "_memory_priors_applied", False):
-        payload["memory_prior_alpha"] = float(getattr(settings, "memory_prior_alpha", 0.0) or 0.0)
+        payload["memory_priors_alpha"] = float(getattr(settings, "priors_alpha", 0.0) or 0.0)
         payload.setdefault("memory_family", getattr(settings, "_memory_family", None))
     if logger and hasattr(logger, "log_kv"):
         try:
@@ -6929,8 +7069,10 @@ Examples:
     parser.add_argument("--no_monitor_drop_dupe_sigs", action="store_true",
                         help="Do not prune duplicate program signatures during search.")
 
-    # Memory v0.1
-    parser.add_argument("--no_use_memory", action="store_true",
+    # Memory v1.0
+    parser.add_argument("--use_memory", dest="use_memory", action="store_true",
+        help="Enable memory (motifs + priors).")
+    parser.add_argument("--no_use_memory", dest="use_memory", action="store_false",
         help="Disable memory (motifs + priors).")
     parser.add_argument("--no_memory_motifs", action="store_true",
         help="Disable motif seeding.")
@@ -6938,10 +7080,27 @@ Examples:
         help="Disable priors bias.")
     parser.add_argument("--memory_dir", type=str, default=None,
         help="Path to memory_bank directory (default: $ARC_MEMORY_DIR or ./memory_bank).")
-    parser.add_argument("--memory_max_seeded", type=int, default=3,
-        help="Max motif seeds to inject (default 3).")
-    parser.add_argument("--memory_prior_alpha", type=float, default=1.0,
+    parser.add_argument("--motif_topk", type=int, default=None,
+        help="Max motif seeds to inject (default 1).")
+    parser.add_argument("--priors_alpha", type=float, default=None,
         help="Strength of priors logit bump (default 1.0).")
+    # Legacy aliases (kept for backwards compatibility; hidden in help)
+    parser.add_argument("--memory_max_seeded", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--memory_prior_alpha", type=float, default=None, help=argparse.SUPPRESS)
+    parser.set_defaults(use_memory=True)
+
+    # Diversity guard toggles for Attempt B
+    parser.add_argument("--diversity_guard", dest="diversity_guard", action="store_true",
+        help="Enable Attempt-B diversity guard (default ON).")
+    parser.add_argument("--no_diversity_guard", dest="diversity_guard", action="store_false",
+        help="Disable Attempt-B diversity guard.")
+    parser.add_argument("--diversity_b_force_first", action="store_true", default=False,
+        help="Force Attempt-B to start with a different opener when Attempt-A was align-first.")
+    parser.add_argument("--attemptB_beam_scale", type=float, default=1.0,
+        help="Heuristic diversity scaling factor for Attempt-B candidate selection (default 1.0).")
+    parser.add_argument("--attemptB_time_scale", type=float, default=1.0,
+        help="Heuristic schedule scaling for Attempt-B debate/time (default 1.0).")
+    parser.set_defaults(diversity_guard=True)
 
     # HFP × GOF integration
     parser.add_argument("--no_hfp", action="store_true",
@@ -6983,6 +7142,23 @@ Examples:
     if not _NUMPY_AVAILABLE:
         print(f"ERROR: {_NUMPY_IMPORT_ERROR}", file=sys.stderr)
         sys.exit(1)
+
+    # Derived configuration knobs (memory/diversity)
+    motif_topk = args.motif_topk
+    if motif_topk is None and args.memory_max_seeded is not None:
+        motif_topk = args.memory_max_seeded
+    if motif_topk is None:
+        motif_topk = 1
+    priors_alpha = args.priors_alpha
+    if priors_alpha is None and args.memory_prior_alpha is not None:
+        priors_alpha = args.memory_prior_alpha
+    if priors_alpha is None:
+        priors_alpha = 1.0
+    memory_dir_effective = args.memory_dir or os.environ.get("ARC_MEMORY_DIR", "./memory_bank")
+    use_memory_flag = bool(args.use_memory)
+    memory_motifs_flag = not args.no_memory_motifs
+    memory_priors_flag = not args.no_memory_priors
+    diversity_guard_flag = bool(args.diversity_guard)
 
     # Banner
     print("=" * 80)
@@ -7026,12 +7202,16 @@ Examples:
         f"R_break>{args.hfp_break_R:.2f}, gate_by_health={'ON' if not args.no_hfp_gate_by_health else 'OFF'}"
     )
     print(
-        f"  Memory: use={not args.no_use_memory}, motifs={not args.no_memory_motifs}, "
-        f"priors={not args.no_memory_priors}, dir={args.memory_dir or os.environ.get('ARC_MEMORY_DIR','./memory_bank')}, "
-        f"seeded<= {args.memory_max_seeded}, alpha={args.memory_prior_alpha:.2f}"
+        f"  Memory: use={use_memory_flag}, motifs={memory_motifs_flag}, priors={memory_priors_flag}, "
+        f"dir={memory_dir_effective}, motif_topk={motif_topk}, alpha={priors_alpha:.2f}"
+    )
+    print(
+        f"  Diversity guard: {'ON' if diversity_guard_flag else 'OFF'}, "
+        f"force_first={args.diversity_b_force_first}, "
+        f"attemptB_beam_scale={args.attemptB_beam_scale:.2f}, attemptB_time_scale={args.attemptB_time_scale:.2f}"
     )
     print("=" * 80)
-    
+
     # Build settings
     settings = _InternalSearchSettings(
         beam_width=args.beam,
@@ -7066,12 +7246,16 @@ Examples:
         monitor_visited_cap=args.monitor_visited_cap,
         monitor_inject_underused=(not args.no_monitor_inject_underused),
         monitor_drop_dupe_sigs=(not args.no_monitor_drop_dupe_sigs),
-        use_memory=(not args.no_use_memory),
-        memory_use_motifs=(not args.no_memory_motifs),
-        memory_use_priors=(not args.no_memory_priors),
+        use_memory=use_memory_flag,
+        memory_use_motifs=memory_motifs_flag,
+        memory_use_priors=memory_priors_flag,
         memory_dir=args.memory_dir,
-        memory_max_seeded=args.memory_max_seeded,
-        memory_prior_alpha=args.memory_prior_alpha,
+        priors_alpha=priors_alpha,
+        motif_topk=int(max(0, motif_topk)),
+        diversity_guard=diversity_guard_flag,
+        diversity_b_force_first=args.diversity_b_force_first,
+        attemptB_beam_scale=args.attemptB_beam_scale,
+        attemptB_time_scale=args.attemptB_time_scale,
         hfp_enable=(not args.no_hfp),
         hfp_alpha=args.hfp_alpha,
         hfp_rho_hi=args.hfp_rho_hi,
@@ -7169,6 +7353,17 @@ class SearchSettings:
     hfp_gate_by_health: bool = True
     hfp_gate_keep: bool = True
     hfp_debug_telemetry: bool = True
+    # --- Memory & Diversity (v2.10.x) ----------------------------------------
+    use_memory: bool = True
+    memory_use_motifs: bool = True
+    memory_use_priors: bool = True
+    memory_dir: Optional[str] = None
+    priors_alpha: float = 1.0
+    motif_topk: int = 1
+    diversity_guard: bool = True
+    diversity_b_force_first: bool = False
+    attemptB_beam_scale: float = 1.0
+    attemptB_time_scale: float = 1.0
 
 _INTERNAL_SETTINGS_CLS = globals().get("_InternalSearchSettings")
 _SETTINGS_SYNC_ATTRS = (
@@ -7191,8 +7386,12 @@ _SETTINGS_SYNC_ATTRS = (
     "memory_use_motifs",
     "memory_use_priors",
     "memory_dir",
-    "memory_max_seeded",
-    "memory_prior_alpha",
+    "priors_alpha",
+    "motif_topk",
+    "diversity_guard",
+    "diversity_b_force_first",
+    "attemptB_beam_scale",
+    "attemptB_time_scale",
     "hfp_enable",
     "hfp_alpha",
     "hfp_rho_hi",
@@ -7336,8 +7535,15 @@ except NameError:
             f"use={_default_settings.use_memory} | "
             f"motifs={_default_settings.memory_use_motifs} | "
             f"priors={_default_settings.memory_use_priors} | "
-            f"seeded<= {_default_settings.memory_max_seeded} | "
-            f"alpha={_default_settings.memory_prior_alpha:.2f}"
+            f"motif_topk={_default_settings.motif_topk} | "
+            f"alpha={_default_settings.priors_alpha:.2f}"
+        )
+        print(
+            "[ARC-ONE] Diversity guard: "
+            f"{'ON' if _default_settings.diversity_guard else 'OFF'} | "
+            f"force_first={_default_settings.diversity_b_force_first} | "
+            f"attemptB_beam_scale={_default_settings.attemptB_beam_scale:.2f} | "
+            f"attemptB_time_scale={_default_settings.attemptB_time_scale:.2f}"
         )
 # === end API shim ============================================================
 

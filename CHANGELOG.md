@@ -1,3 +1,11 @@
+## v2.10.1 — Memory v1.0 + Diversity Guard (2025-11-02)
+- **Memory v1.0 (read-only):** Loads `memory_bank/{priors,motifs,layouts,shapes}.json` once, fingerprints task layouts, and caches the detected family on the settings object.
+- **Soft priors:** Applies bounded logit boosts to successor ordering using `--priors_alpha` per φ-family; safely no-ops when files are absent.
+- **Motif seeding:** Injects up to `--motif_topk` short programs at beam start when layout matches; telemetry records `memory_seeded` and `memory_family`.
+- **Diversity Guard (Attempt B):** Detects Attempt-A's strategy family, suppresses its operators, boosts alternates, and optionally forces a different first move. Budget knobs: `--attemptB_beam_scale`, `--attemptB_time_scale`.
+- **Flags:** `--use_memory/--no_use_memory`, `--memory_dir`, `--priors_alpha`, `--motif_topk`, `--diversity_guard`, `--diversity_b_force_first`.
+- **Diagnostics:** Telemetry now exposes `memory_priors_alpha`, `diversity_family`, and the GOF-9000/HFP monitor still reports health metrics.
+
 ## v2.10.0 — Memory v0.1 (motifs + priors + layout)
 - Added read-only Long-Term Memory Bank integration:
   - Motif seeding: inject up to N short, proven sub-programs at search start.
