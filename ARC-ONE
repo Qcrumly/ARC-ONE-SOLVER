@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.20"
+__version__ = "v2.9.21"
 
 last_best_program = None
 
@@ -3095,11 +3095,18 @@ def _gof_wrap_shift_guard(op_obj):
                     prog = x
                     break
             if prog is not None:
+                try:
+                    depth = len(getattr(prog, "steps", []) or [])
+                except Exception:
+                    depth = int(getattr(prog, "_rails_steps", 0))
+                prev_op = None
                 steps = getattr(prog, "steps", None)
                 if steps:
-                    prev = getattr(steps[-1], "op", None)
-                    if isinstance(prev, str) and prev.lower() == "shift":
-                        return None
+                    prev_op = getattr(steps[-1], "op", None)
+                if not prev_op:
+                    prev_op = getattr(prog, "_gof_last_op", None)
+                if isinstance(prev_op, str) and prev_op.lower() == "shift" and depth < 2:
+                    return None
             return f(*a, **k)
 
         return _wrapped
@@ -3109,6 +3116,44 @@ def _gof_wrap_shift_guard(op_obj):
         return op_obj
     if callable(op_obj):
         return _wrap_apply(op_obj)
+    return op_obj
+
+
+def _gof_wrap_mark_last(op_name, op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            result = f(*a, **k)
+            if result is None:
+                return result
+            prog = None
+            for x in a:
+                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
+                    prog = x
+                    break
+            if prog is not None:
+                try:
+                    setattr(prog, "_gof_last_op", str(op_name).lower())
+                except Exception:
+                    pass
+            return result
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        wrapped = _wrap_apply(op_obj)
+        try:
+            setattr(wrapped, "__name__", getattr(op_obj, "__name__", wrapped.__name__))
+        except Exception:
+            pass
+        if hasattr(op_obj, "name"):
+            try:
+                setattr(wrapped, "name", getattr(op_obj, "name"))
+            except Exception:
+                pass
+        return wrapped
     return op_obj
 
 
@@ -3179,19 +3224,21 @@ try:
         if _nm == "resize":
             _op = _gof_wrap_resize(_op)
             _op = _gof_shield_resize_args_enum(_op)
-            _REG[_k] = _op
+            _REG[_k] = _gof_wrap_mark_last("resize", _op)
         elif _nm == "scale":
-            _REG[_k] = _gof_wrap_scale(_op)
+            _REG[_k] = _gof_wrap_mark_last("scale", _gof_wrap_scale(_op))
         elif _nm == "tile":
-            _REG[_k] = _gof_wrap_tile_identity(_op)
+            _REG[_k] = _gof_wrap_mark_last("tile", _gof_wrap_tile_identity(_op))
         elif _nm == "tile_masked":
-            _REG[_k] = _gof_wrap_tile_masked_identity(_op)
+            _REG[_k] = _gof_wrap_mark_last("tile_masked", _gof_wrap_tile_masked_identity(_op))
         elif _nm in ("phase_tile", "phase_tile_row", "phase_tile_col"):
-            _REG[_k] = _gof_wrap_phase_tile_identity(_op)
+            _REG[_k] = _gof_wrap_mark_last(_nm, _gof_wrap_phase_tile_identity(_op))
         elif _nm in ("remove_isolated", "keep_n_largest", "largest"):
-            _REG[_k] = _gof_wrap_single_int_arg(_op)
+            _REG[_k] = _gof_wrap_mark_last(_nm, _gof_wrap_single_int_arg(_op))
         elif _nm == "shift":
-            _REG[_k] = _gof_wrap_shift_guard(_op)
+            _REG[_k] = _gof_wrap_mark_last("shift", _gof_wrap_shift_guard(_op))
+        else:
+            _REG[_k] = _gof_wrap_mark_last(_nm, _op)
 except Exception:
     pass
 
@@ -6319,22 +6366,34 @@ def _wrap_to_list(result: Any) -> List[Dict[str, Any]]:
     if isinstance(result, list) and result:
         first = result[0]
         if isinstance(first, dict):
-            td = first.setdefault("_telemetry", {})
-            if "ops_tokens" not in td:
-                prog = first.get("program", None)
-                if prog is not None:
-                    td["ops_tokens"] = _ops_tokens_from_program(prog)
-            td.setdefault("ops_tokens", td.get("ops_tokens", []))
+            for entry in result:
+                if not isinstance(entry, dict):
+                    continue
+                td = entry.setdefault("_telemetry", {})
+                if "ops_tokens" not in td:
+                    prog = entry.get("program", None)
+                    if prog is not None:
+                        td["ops_tokens"] = _ops_tokens_from_program(prog)
+                tokens = td.get("ops_tokens", [])
+                if tokens is None:
+                    tokens = []
+                elif isinstance(tokens, (list, tuple)):
+                    tokens = list(tokens)
+                else:
+                    tokens = [tokens]
+                td["ops_tokens"] = [_gof_sanitize_token(str(t)) for t in tokens]
             return result
         first_norm = {"grid": _grid_from(first), "_telemetry": {}}
-        first_norm["_telemetry"]["ops_tokens"] = _ops_tokens_from_program(getattr(first, "program", None))
+        toks = _ops_tokens_from_program(getattr(first, "program", None))
+        first_norm["_telemetry"]["ops_tokens"] = [_gof_sanitize_token(str(t)) for t in toks]
         return [first_norm]
 
     if isinstance(result, list):
         return []
 
     first_norm = {"grid": _grid_from(result), "_telemetry": {}}
-    first_norm["_telemetry"]["ops_tokens"] = _ops_tokens_from_program(getattr(result, "program", None))
+    toks = _ops_tokens_from_program(getattr(result, "program", None))
+    first_norm["_telemetry"]["ops_tokens"] = [_gof_sanitize_token(str(t)) for t in toks]
     return [first_norm]
 
 

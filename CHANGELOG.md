@@ -1,3 +1,8 @@
+## v2.9.21 — 2025-11-01
+- **Universal last-op marker:** every operator stamps `_gof_last_op` after a successful apply so policy overlays can reliably inspect the previous move.
+- **Shift de-dupe (hardened):** within the first two steps, `shift` refuses to execute if the immediately prior op was also a `shift`, consulting both the structural history and `_gof_last_op`.
+- **API token sanitization:** the public shim now normalizes `ops_tokens`, turning strings like `remove_isolated((1))` into `remove_isolated(1)` regardless of their internal origin.
+
 ## v2.9.20 — 2025-11-01
 - **Shift de-dupe:** block any immediate `shift(...)` following another `shift(...)` to prevent shift→shift openers.
 - **Sanitized arguments & tokens:** normalize single-int arguments (e.g., `'1'`, `((1))`) across object ops and clean `ops_tokens` rendering so telemetry logs stay readable.
