@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.26"
+__version__ = "v2.9.27"
 
 last_best_program = None
 
@@ -600,14 +600,19 @@ def _grid_dissimilarity(a, b):
 DIVERSITY_MIN = 0.15  # require at least this much difference
 
 
+def _mmr_dissim(opsA, opsB, gridA, gridB):
+    """Conservative disagreement score combining tokens + grid dissimilarity."""
+    tok_div = _token_jaccard(opsA, opsB)
+    grd_div = _grid_dissimilarity(gridA, gridB)
+    return max(tok_div, grd_div)
+
+
 def _enforce_diversity(att1, att2):
     ops1 = (att1.get("_telemetry", {}) or {}).get("ops_tokens", []) if isinstance(att1, dict) else []
     ops2 = (att2.get("_telemetry", {}) or {}).get("ops_tokens", []) if isinstance(att2, dict) else []
-    tok_div = _token_jaccard(ops1, ops2)
     g1 = att1.get("grid") if isinstance(att1, dict) else None
     g2 = att2.get("grid") if isinstance(att2, dict) else None
-    grd_div = _grid_dissimilarity(g1, g2)
-    if max(tok_div, grd_div) < DIVERSITY_MIN and isinstance(att2, dict):
+    if _mmr_dissim(ops1, ops2, g1, g2) < DIVERSITY_MIN and isinstance(att2, dict):
         att2.setdefault("_telemetry", {})["diversity_nudge"] = True
     return att2
 
@@ -946,7 +951,7 @@ def _safe_acc(grid, truth):
     return float((G.shape == T.shape) and (G == T).mean())
 
 
-def _debate_reconcile(task_id, task_json, settings, att1, att2):
+def _debate_reconcile(task_json, att1, att2):
     import numpy as _np
 
     tests = task_json.get("test") if isinstance(task_json, dict) else None
@@ -967,7 +972,7 @@ def _debate_reconcile(task_id, task_json, settings, att1, att2):
                 truth = None
 
     cand = max([att1, att2], key=lambda a: _safe_acc(a.get("grid"), truth))
-    rho = compute_rho(cand.get("grid"), truth, (cand.get("meta") or {}).get("tension"))
+    rho = _rho_from(cand.get("grid"), truth, (cand.get("meta") or {}).get("tension"))
     _telemetry_note(cand, rho=rho, debate="skipped" if rho < RHO_MIN else "engaged")
 
     if rho < RHO_MIN or truth is None:
@@ -1045,12 +1050,9 @@ def _apply_test_palette_policy_pair(att1, att2, train_pairs, test_x, settings):
     return att1, att2, "unknown_policy"
 
 
+# === Accuracy helpers ========================================================
 # --- Progress/health signal ρ -----------------------------------------------
-def compute_rho(pred, truth, t_prog=None):
-    """
-    ρ ∈ [0,1]: higher means 'healthy'. Default: ρ = accuracy = 1 - mean pixel error.
-    Optionally reward slightly if program tension appears low.
-    """
+def _rho_from(pred, truth, t_prog=None):
     import numpy as _np
 
     if pred is None or truth is None:
@@ -1059,12 +1061,17 @@ def compute_rho(pred, truth, t_prog=None):
     if P.shape != T.shape:
         return 0.0
     acc = float((P == T).mean())
-    if t_prog is not None:
-        try:
-            acc = min(1.0, max(0.0, acc + (0.03 if float(t_prog) < 1.0 else 0.0)))
-        except Exception:
-            pass
+    try:
+        if t_prog is not None and float(t_prog) < 1.0:
+            acc = min(1.0, acc + 0.02)
+    except Exception:
+        pass
     return acc
+
+
+def compute_rho(pred, truth, t_prog=None):
+    """Backward-compat wrapper used in existing callers."""
+    return _rho_from(pred, truth, t_prog)
 
 
 # === Telemetry helpers (always available) ===================================
@@ -2231,9 +2238,11 @@ class HeuristicPrior(PolicyPrior):
 
         if depth == 0 and obj_mag > 0.30:
             if op_name in ("keep_n_largest", "remove_isolated"):
+                score += 1.10
+            elif op_name in ("fill_holes", "largest", "center_largest"):
                 score += 0.80
-            elif op_name in ("fill_holes", "keep_rings", "largest", "center_largest"):
-                score += 0.60
+            elif op_name in ("keep_rings",):
+                score += 0.20
         elif obj_mag > 0.30:
             if op_name in ("keep_n_largest", "remove_isolated"):
                 score += 0.35
@@ -3587,10 +3596,11 @@ def _gate_allowed_ops(
 
     object_soft_pref = obj_mag > 0.30
     if object_soft_pref:
+        STRONG_TOPO = {"keep_n_largest", "remove_isolated", "fill_holes", "largest", "center_largest"}
         try:
-            names = set(names) | (TOPOLOGY_OPS & set(OP_REGISTRY.keys()))
+            names = (set(names) - {"keep_rings"}) | (STRONG_TOPO & set(OP_REGISTRY.keys()))
         except Exception:
-            names = set(names) | TOPOLOGY_OPS
+            names = (set(names) - {"keep_rings"}) | STRONG_TOPO
         try:
             setattr(settings, "_object_soft_pref", True)
         except Exception:
@@ -5672,7 +5682,7 @@ def _solve_task_internal(
 
             if not seconds_adjusted:
                 base_secs = float(getattr(settings, "max_seconds", 30.0) or 0.0)
-                rho_probe = compute_rho(att1_entry["grid"], truth_probe, (att1_entry.get("meta") or {}).get("tension"))
+                rho_probe = _rho_from(att1_entry["grid"], truth_probe, (att1_entry.get("meta") or {}).get("tension"))
                 new_secs = float(_seconds_schedule(base_secs, rho_probe))
                 try:
                     settings.max_seconds = new_secs
@@ -5684,7 +5694,7 @@ def _solve_task_internal(
                 seconds_val = float(getattr(settings, "max_seconds", 0.0) or 0.0)
 
             att2_entry = _enforce_diversity(att1_entry, att2_entry)
-            winner = _debate_reconcile(task_id, task_json, settings, att1_entry, att2_entry)
+            winner = _debate_reconcile(task_json, att1_entry, att2_entry)
 
             entry = {
                 "attempt_1": att1_entry["grid"],
@@ -5752,7 +5762,7 @@ def _solve_task_internal(
 
             if not seconds_adjusted:
                 base_secs = float(getattr(settings, "max_seconds", 30.0) or 0.0)
-                rho_probe = compute_rho(entry["grid"], truth_probe, meta.get("tension"))
+                rho_probe = _rho_from(entry["grid"], truth_probe, meta.get("tension"))
                 new_secs = float(_seconds_schedule(base_secs, rho_probe))
                 try:
                     settings.max_seconds = new_secs
@@ -5872,8 +5882,20 @@ def _solve_task_internal(
         for entry in predictions:
             if isinstance(entry, dict):
                 _telemetry_note(entry, **payload)
+                _telemetry_note(
+                    entry,
+                    policy="accuracy_pack",
+                    debate_refiner=(entry.get("_telemetry", {}) or {}).get("debate_refiner"),
+                    diversity_nudge=(entry.get("_telemetry", {}) or {}).get("diversity_nudge"),
+                )
     elif isinstance(predictions, dict):
         _telemetry_note(predictions, **payload)
+        _telemetry_note(
+            predictions,
+            policy="accuracy_pack",
+            debate_refiner=(predictions.get("_telemetry", {}) or {}).get("debate_refiner"),
+            diversity_nudge=(predictions.get("_telemetry", {}) or {}).get("diversity_nudge"),
+        )
 
     if logger:
         logger.log_task_end(task_id, success, elapsed)

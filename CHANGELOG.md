@@ -1,3 +1,10 @@
+## v2.9.27 — 2025-11-01
+- **Object-first opening (strong):** depth-0 boost for `keep_n_largest/remove_isolated` (+1.10) and `fill_holes/largest/center_largest` (+0.80) when |φ[obj]| > 0.30; trims `keep_rings` influence.
+- **Diversity guard:** MMR-style dissimilarity nudges attempt_2 when it mirrors attempt_1.
+- **ρ-gated A→B→A:** opportunistic repair (prefers `fill_holes`) only when ρ ≥ 0.55, returning the best of {A,B,A′}.
+- **Seconds-aware scheduling:** extra time is granted only when predictions are healthy; diagnostics cap at ≈2× base budget.
+- **Telemetry grains:** records debate and diversity hints under the `policy="accuracy_pack"` banner.
+
 ## v2.9.26 — 2025-11-01
 - **No-consecutive-shift (beam):** right after successor generation, drop any candidate whose new last op is a shift when the parent just shifted and `depth < 2`, closing the final early-step leak regardless of wrapper timing or aliases.
 - Guardrails now cover depth-0 size/identity bans, phase-tile identities, directional size guards, object-first opening, sanitized args/tokens, and shift de-dupe at both operator and beam layers.
