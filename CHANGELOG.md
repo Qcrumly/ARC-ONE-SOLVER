@@ -1,3 +1,6 @@
+## v2.9.30 — 2025-11-02
+- **Interpreter identity fallback:** Treat `None` returns from guarded ops as identity in `apply_step`, preventing `state=None` propagation.
+
 ## v2.9.29 — 2025-11-02
 - **Interpreter safety:** refused ops now return the original grid inside `apply_step`, so guardrails that yield `None` behave as identity instead of crashing search.
 - **Wrapper realism:** early-step wrappers only enforce bans when depth is known to be 0 and, when they refuse an op, they hand back the input grid rather than `None`.
