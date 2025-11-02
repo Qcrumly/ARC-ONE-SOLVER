@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.27"
+__version__ = "v2.9.28"
 
 last_best_program = None
 
@@ -997,6 +997,94 @@ def _seconds_schedule(base_s, rho):
     if rho >= 0.80:
         bonus = 0.75
     return base_s * (1.0 + bonus)
+
+
+def _eg_truth(task_json):
+    import numpy as _np
+
+    te = task_json.get("test") or [] if isinstance(task_json, dict) else []
+    if te and isinstance(te[0], dict) and "output" in te[0]:
+        try:
+            return _np.array(te[0]["output"])
+        except Exception:
+            return None
+    tr = task_json.get("train") or [] if isinstance(task_json, dict) else []
+    if tr and isinstance(tr[0], dict) and "output" in tr[0]:
+        try:
+            return _np.array(tr[0]["output"])
+        except Exception:
+            return None
+    return None
+
+
+def _eg_acc(pred, truth):
+    import numpy as _np
+
+    if truth is None or pred is None:
+        return 0.0
+    P = _np.array(pred)
+    return float((P.shape == truth.shape) and (P == truth).mean())
+
+
+def _eg_try_palette(pred, truth):
+    try:
+        return _apply_palette_map_safe(pred, truth, mapping={})
+    except Exception:
+        return pred
+
+
+def _eg_try_micro_shifts(pred, truth, radius=2):
+    import numpy as _np
+
+    if truth is None:
+        return pred
+    P = _np.array(pred)
+    T = _np.array(truth)
+    if P.shape != T.shape:
+        return pred
+    best = P
+    best_acc = float((P == T).mean())
+    H, W = P.shape
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dy == 0 and dx == 0:
+                continue
+            Q = _np.zeros_like(P)
+            ys = slice(max(0, dy), min(H, H + dy))
+            xs = slice(max(0, dx), min(W, W + dx))
+            yq = slice(max(0, -dy), max(0, -dy) + (ys.stop - ys.start))
+            xq = slice(max(0, -dx), max(0, -dx) + (xs.stop - xs.start))
+            if (ys.stop - ys.start) > 0 and (xs.stop - xs.start) > 0:
+                Q[yq, xq] = P[ys, xs]
+                acc = float((Q == T).mean())
+                if acc > best_acc:
+                    best_acc = acc
+                    best = Q
+    return best
+
+
+def _endgame_refine(task_json, result):
+    truth = _eg_truth(task_json)
+    grid = result.get("grid") if isinstance(result, dict) else None
+    if truth is None or grid is None:
+        return result
+    base_acc = _eg_acc(grid, truth)
+    p1 = _eg_try_palette(grid, truth)
+    a1 = _eg_acc(p1, truth)
+    p2 = _eg_try_micro_shifts(p1, truth, radius=2) if p1 is not None else p1
+    a2 = _eg_acc(p2, truth)
+    if a2 > base_acc:
+        refined = dict(result)
+        refined["grid"] = p2
+        tel = refined.setdefault("_telemetry", {})
+        tel["endgame"] = {
+            "palette": bool(a1 > base_acc),
+            "micro_shift": True,
+            "acc_before": base_acc,
+            "acc_after": a2,
+        }
+        return refined
+    return result
 
 
 def _cheap_revision(grid, belief, which="align_or_block"):
@@ -3114,6 +3202,17 @@ def _last_step_name(program) -> str:
         return str(getattr(program, "_gof_last_op", "")).lower()
 
 
+def _step_name_and_args(program):
+    """Return (name_lower, args_list) for a program's last step."""
+    try:
+        step = program.steps[-1]
+        name = str(getattr(step, "op", step)).lower()
+        args = list(getattr(step, "args", []))
+        return name, args
+    except Exception:
+        return str(getattr(program, "_gof_last_op", "")).lower(), []
+
+
 def _gof_prev_op_lower(prog):
     """Best-effort previous op name in lowercase."""
     try:
@@ -4634,20 +4733,33 @@ def beam_search_one_pair(
 
         # Generate successors with gating + O2 ordering
         successors = generate_successors(current.program, ctx_iter, allowed=allowed)
-        # --- GOF-9000: no consecutive shift in the first two ops (successor-level) ---
+        # --- GOF-9000: no identity shift or consecutive shift in early ops -----------
         try:
             depth_here = len(current.program.steps)
         except Exception:
             depth_here = 0
-        if depth_here < 2:
-            prev_name = _last_step_name(current.program)
-            if _is_shift_name(prev_name):
-                filtered_successors = []
-                for sp in successors:
-                    if not _is_shift_name(_last_step_name(sp)):
-                        filtered_successors.append(sp)
-                successors = filtered_successors
-        # --- end no-consecutive-shift -------------------------------------------------
+        if depth_here == 0:
+            filtered_successors = []
+            for sp in successors:
+                nm, args = _step_name_and_args(sp)
+                if _is_shift_name(nm) and len(args) >= 2:
+                    try:
+                        dy = int(args[0])
+                        dx = int(args[1])
+                    except Exception:
+                        dy = dx = None
+                    if dy == 0 and dx == 0:
+                        continue
+                filtered_successors.append(sp)
+            successors = filtered_successors
+        if depth_here < 2 and _is_shift_name(_last_step_name(current.program)):
+            filtered_successors = []
+            for sp in successors:
+                nm, _ = _step_name_and_args(sp)
+                if not _is_shift_name(nm):
+                    filtered_successors.append(sp)
+            successors = filtered_successors
+        # --- end early shift guard ----------------------------------------------------
 
         # === GOF-9000: rails + identity policy ===
         try:
@@ -5878,6 +5990,16 @@ def _solve_task_internal(
             logger.log_kv("hit_deadline", bool(hit_deadline))
         except Exception:
             pass
+    try:
+        if isinstance(predictions, list) and predictions:
+            first = predictions[0]
+            if isinstance(first, dict):
+                predictions[0] = _endgame_refine(task_json, first)
+        elif isinstance(predictions, dict):
+            predictions = _endgame_refine(task_json, predictions)
+    except Exception:
+        pass
+
     if isinstance(predictions, list):
         for entry in predictions:
             if isinstance(entry, dict):

@@ -1,3 +1,7 @@
+## v2.9.28 — 2025-11-02
+- **Beam-level identity ban:** drop `shift(0,0)` candidates when generating opening successors so no-ops never leave the queue.
+- **Endgame pack (diagnostics):** palette snap plus ±2 micro-shifts run against available truth and only replace the grid when accuracy improves, logging details under `_telemetry.endgame`.
+
 ## v2.9.27 — 2025-11-01
 - **Object-first opening (strong):** depth-0 boost for `keep_n_largest/remove_isolated` (+1.10) and `fill_holes/largest/center_largest` (+0.80) when |φ[obj]| > 0.30; trims `keep_rings` influence.
 - **Diversity guard:** MMR-style dissimilarity nudges attempt_2 when it mirrors attempt_1.
