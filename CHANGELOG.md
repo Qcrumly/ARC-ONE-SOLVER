@@ -1,3 +1,8 @@
+## v2.9.32 — 2025-11-02
+- **GOF-9000 SelfMonitor:** tracks operator-class pressure, prunes duplicate program signatures with an LRU, and injects a single underused-class successor when collapse is detected. Telemetry exposes `op_counts`, `pressure`, `face`, and recent events.
+- **CLI/Settings:** new knobs `--no_monitor`, `--monitor_pressure_thresh`, `--monitor_plateau_N`, `--monitor_visited_cap`, `--no_monitor_inject_underused`, `--no_monitor_drop_dupe_sigs` (also surfaced on `SearchSettings`).
+- **Beam integration:** successor generation prunes duplicates and adds underused-class openers when pressure is high; accepted programs update monitor stats and results carry `_telemetry.gof9k_monitor` snapshots.
+
 ## v2.9.31 — 2025-11-02
 - **Opening quality:** prune `keep_rings` as a depth-0 move and auto-inject robust object openers (`keep_n_largest(1)`, `remove_isolated(1)`, `fill_holes`, `largest`) when absent.
 - **Endgame finisher:** palette snap plus ±2 micro-shifts run against available truth and only replace the grid when accuracy improves, logging `_telemetry.endgame` breadcrumbs.

@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.31"
+__version__ = "v2.9.32"
 
 last_best_program = None
 
@@ -3235,6 +3235,130 @@ def _append_step_clone(program, StepCls, ProgramCls, op_name, args):
         return None
 
 
+def _prog_signature(program) -> str:
+    """Compact signature of a Program's steps, to drop duplicates early."""
+    try:
+        items = []
+        for s in getattr(program, "steps", []):
+            name = str(getattr(s, "op", s))
+            args = tuple(getattr(s, "args", ()))
+            items.append((name, args))
+        raw = repr(items).encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _op_class(name: str):
+    """Rough class bucketing using known registries."""
+    n = (name or "").lower()
+    try:
+        if n in (PALETTE_OPS if 'PALETTE_OPS' in globals() else set()):
+            return "palette"
+        if n in (TOPOLOGY_OPS if 'TOPOLOGY_OPS' in globals() else set()):
+            return "topology"
+        if n in (ALIGNMENT_OPS if 'ALIGNMENT_OPS' in globals() else set()):
+            return "align"
+        if n in (EXPANSION_OPS if 'EXPANSION_OPS' in globals() else set()):
+            return "expand"
+        if "color" in n or "swap" in n or "palette" in n:
+            return "palette"
+        if "tile" in n or "resize" in n or "scale" in n:
+            return "expand"
+        if "shift" in n or "center" in n or "align" in n:
+            return "align"
+        return "topology"
+    except Exception:
+        return "other"
+
+
+class SelfMonitor:
+    """Tracks operator pressure, novelty, and duplicate programs."""
+
+    def __init__(self, settings):
+        self.on = bool(getattr(settings, "monitor_enable", True))
+        self.pressure_thresh = float(getattr(settings, "monitor_pressure_thresh", 0.70))
+        self.inject_underused = bool(getattr(settings, "monitor_inject_underused", True))
+        self.drop_dupes = bool(getattr(settings, "monitor_drop_dupe_sigs", True))
+        self.visited_cap = int(getattr(settings, "monitor_visited_cap", 50000))
+        self.sig_set = set()
+        self.sig_q = deque()
+        self.op_counts = {"palette": 0, "topology": 0, "align": 0, "expand": 0, "other": 0}
+        self.face = "Explorer"
+        self.events: List[Any] = []
+
+    def record_accept(self, program):
+        if not self.on or program is None:
+            return
+        name = _last_step_name(program)
+        cls = _op_class(name)
+        self.op_counts[cls] = self.op_counts.get(cls, 0) + 1
+        self.events.append(("accept", name, cls))
+
+    def _pressure(self):
+        total = sum(self.op_counts.values()) or 1
+        top = max(self.op_counts.values()) if total > 0 else 0
+        return top / total
+
+    def prune_dupes(self, successors):
+        if not (self.on and self.drop_dupes):
+            return successors
+        uniq = []
+        for sp in successors:
+            sig = _prog_signature(sp)
+            if sig and sig in self.sig_set:
+                continue
+            uniq.append(sp)
+            if sig:
+                self.sig_set.add(sig)
+                self.sig_q.append(sig)
+                if len(self.sig_q) > self.visited_cap:
+                    old = self.sig_q.popleft()
+                    if old in self.sig_set:
+                        self.sig_set.remove(old)
+        return uniq
+
+    def inject_underused_dimension(self, current, successors):
+        if not (self.on and self.inject_underused):
+            return successors
+        if self._pressure() < self.pressure_thresh:
+            return successors
+        want = min(self.op_counts, key=lambda k: self.op_counts[k])
+        candidates = {
+            "topology": [("keep_n_largest", (1,)), ("remove_isolated", (1,)), ("fill_holes", ())],
+            "align": [("center_largest", ()), ("shift", (1, 0))],
+            "palette": [("fill", (1,)), ("swapcolors", (1, 2))],
+            "expand": [("resize", (3, 3)), ("tile", (2, 2))],
+        }
+        reps = [c for c in candidates.get(want, []) if c[0] in OP_REGISTRY]
+        if not reps:
+            return successors
+        try:
+            StepCls = Step
+            ProgramCls = Program
+        except Exception:
+            return successors
+        have = {_last_step_name(sp) for sp in successors}
+        for oname, oargs in reps:
+            if oname in have:
+                continue
+            sp = _append_step_clone(current.program, StepCls, ProgramCls, oname, oargs)
+            if sp is not None:
+                successors.append(sp)
+                self.events.append(("inject", want, oname))
+                break
+        return successors
+
+    def as_dict(self):
+        data = {
+            "op_counts": dict(self.op_counts),
+            "pressure": self._pressure(),
+            "face": self.face,
+            "events": self.events[:16],
+            "visited": len(self.sig_set),
+        }
+        return data
+
 def _gof_prev_op_lower(prog):
     """Best-effort previous op name in lowercase."""
     try:
@@ -4127,6 +4251,13 @@ class _InternalSearchSettings:
     scale_hard_thresh: float = 1.0
     scale_hard_steps: int = 3
     early_palette_block_steps: int = 3
+    # GOF-9000 SelfMonitor defaults
+    monitor_enable: bool = True
+    monitor_pressure_thresh: float = 0.70
+    monitor_plateau_N: int = 3
+    monitor_visited_cap: int = 50000
+    monitor_inject_underused: bool = True
+    monitor_drop_dupe_sigs: bool = True
 
 
 def compute_cost(
@@ -4445,6 +4576,7 @@ def beam_search_one_pair(
     trace_buffer = getattr(settings, "_trace_buffer", None) if getattr(settings, "_trace_ops", False) else None
     family_hint = phi_to_family(phi)
     divs_hint = _divisible_shape(input_grid.shape, target_grid.shape)
+    monitor = getattr(settings, "_monitor", None)
 
     # Early-abort tracking (no-shape)
     no_shape_seen = True           # flip to False once any successor matches target shape
@@ -4456,6 +4588,11 @@ def beam_search_one_pair(
 
     # Build context for op-specific argument generation
     ctx = build_synth_context(input_grid, target_grid)
+    if monitor is not None:
+        try:
+            ctx["monitor"] = monitor
+        except Exception:
+            pass
 
     # === Meta-seed discovery ===
     meta = _quick_shape_candidates(input_grid, target_grid)
@@ -4611,6 +4748,11 @@ def beam_search_one_pair(
 
         # Get candidate with lowest cost
         current = beam.pop(0)
+        if monitor is not None:
+            try:
+                monitor.record_accept(current.program)
+            except Exception:
+                pass
 
         # Track improvement for no-improvement abort
         if current.cost < best_cost_seen - 1e-6:
@@ -4761,6 +4903,9 @@ def beam_search_one_pair(
 
         # Generate successors with gating + O2 ordering
         successors = generate_successors(current.program, ctx_iter, allowed=allowed)
+        if monitor is not None and monitor.on:
+            successors = monitor.prune_dupes(successors)
+            successors = monitor.inject_underused_dimension(current, successors)
         # --- GOF-9000: early opener hygiene -----------------------------------------
         try:
             depth_here = len(current.program.steps)
@@ -5461,6 +5606,9 @@ def _solve_task_internal(
     trace = getattr(settings, "_trace_ops", False)
     settings._trace_buffer = []
 
+    monitor = SelfMonitor(settings)
+    setattr(settings, "_monitor", monitor)
+
     # --- Topology hint (side-channel): averages over train pairs ---
     dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
     for xi, yi in train_pairs:
@@ -6064,6 +6212,11 @@ def _solve_task_internal(
                     debate_refiner=(entry.get("_telemetry", {}) or {}).get("debate_refiner"),
                     diversity_nudge=(entry.get("_telemetry", {}) or {}).get("diversity_nudge"),
                 )
+        try:
+            if predictions and isinstance(predictions[0], dict):
+                predictions[0].setdefault("_telemetry", {})["gof9k_monitor"] = monitor.as_dict()
+        except Exception:
+            pass
     elif isinstance(predictions, dict):
         _telemetry_note(predictions, **payload)
         _telemetry_note(
@@ -6072,6 +6225,10 @@ def _solve_task_internal(
             debate_refiner=(predictions.get("_telemetry", {}) or {}).get("debate_refiner"),
             diversity_nudge=(predictions.get("_telemetry", {}) or {}).get("diversity_nudge"),
         )
+        try:
+            predictions.setdefault("_telemetry", {})["gof9k_monitor"] = monitor.as_dict()
+        except Exception:
+            pass
 
     if logger:
         logger.log_task_end(task_id, success, elapsed)
@@ -6431,6 +6588,19 @@ Examples:
                         help="Early steps to enforce hard scale rails (default 3).")
     parser.add_argument("--early_palette_block_steps", type=int, default=3,
                         help="Block palette ops for the first N steps (default 3).")
+    # GOF-9000 SelfMonitor options
+    parser.add_argument("--no_monitor", action="store_true",
+                        help="Disable GOF-9000 self-monitor (pressure/novelty guard).")
+    parser.add_argument("--monitor_pressure_thresh", type=float, default=0.70,
+                        help="Pressure threshold (fraction of ops in one class) before injecting diversity.")
+    parser.add_argument("--monitor_plateau_N", type=int, default=3,
+                        help="Reserved plateau detector window (default 3).")
+    parser.add_argument("--monitor_visited_cap", type=int, default=50000,
+                        help="LRU cap for duplicate-program signatures (default 50k).")
+    parser.add_argument("--no_monitor_inject_underused", action="store_true",
+                        help="Do not inject underused-class successors when pressure detected.")
+    parser.add_argument("--no_monitor_drop_dupe_sigs", action="store_true",
+                        help="Do not prune duplicate program signatures during search.")
     
     # Ablations
     parser.add_argument("--ablation", type=str, default=None,
@@ -6521,6 +6691,12 @@ Examples:
         scale_hard_thresh=args.scale_hard_thresh,
         scale_hard_steps=args.scale_hard_steps,
         early_palette_block_steps=args.early_palette_block_steps,
+        monitor_enable=(not args.no_monitor),
+        monitor_pressure_thresh=args.monitor_pressure_thresh,
+        monitor_plateau_N=args.monitor_plateau_N,
+        monitor_visited_cap=args.monitor_visited_cap,
+        monitor_inject_underused=(not args.no_monitor_inject_underused),
+        monitor_drop_dupe_sigs=(not args.no_monitor_drop_dupe_sigs),
     )
     
     # Apply ablation if specified
@@ -6594,6 +6770,13 @@ class SearchSettings:
     early_palette_block_steps: int = 3
     # Palette test policy (optional)
     test_palette_policy: str = "second_only_guarded"
+    # --- GOF-9000 SelfMonitor -----------------------------------------------
+    monitor_enable: bool = True
+    monitor_pressure_thresh: float = 0.70
+    monitor_plateau_N: int = 3
+    monitor_visited_cap: int = 50000
+    monitor_inject_underused: bool = True
+    monitor_drop_dupe_sigs: bool = True
 
 _INTERNAL_SETTINGS_CLS = globals().get("_InternalSearchSettings")
 _SETTINGS_SYNC_ATTRS = (
@@ -6606,6 +6789,12 @@ _SETTINGS_SYNC_ATTRS = (
     "scale_hard_steps",
     "early_palette_block_steps",
     "test_palette_policy",
+    "monitor_enable",
+    "monitor_pressure_thresh",
+    "monitor_plateau_N",
+    "monitor_visited_cap",
+    "monitor_inject_underused",
+    "monitor_drop_dupe_sigs",
 )
 
 def _coerce_settings(settings_obj: Optional[Any]) -> Any:
@@ -6717,6 +6906,18 @@ except NameError:
     _printed_banner = True
     ver = globals().get("__version__", "(unknown)")
     print(f"[ARC-ONE] API shim active — version {ver} | solve_task + SearchSettings normalized.")
+    try:
+        _default_settings = SearchSettings()
+    except Exception:
+        _default_settings = None
+    if _default_settings is not None:
+        print(
+            "[ARC-ONE] GOF-9000 monitor: "
+            f"{'ON' if _default_settings.monitor_enable else 'OFF'} | "
+            f"pressure≥{_default_settings.monitor_pressure_thresh:.2f} | "
+            f"inject_underused={_default_settings.monitor_inject_underused} | "
+            f"drop_dupes={_default_settings.monitor_drop_dupe_sigs}"
+        )
 # === end API shim ============================================================
 
 
