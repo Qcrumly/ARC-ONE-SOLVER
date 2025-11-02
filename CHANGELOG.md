@@ -1,3 +1,7 @@
+## v2.9.23 — 2025-11-01
+- **Early shift de-dupe (final):** block a second `shift(...)` within the first two steps via both `args_enum` (proposal) and `apply` (execution), using `steps` and `_gof_last_op` as the sources of truth.
+- Completes the early-step guardrail suite: depth-0 size/identity bans, zero shift→shift openers, and fully sanitized arguments/tokens.
+
 ## v2.9.22 — 2025-11-01
 - **Shift de-dupe (final):** universal early counter blocks any second `shift(...)` when `depth < 2`, covering method and callable wrappers while retaining the `_gof_last_op` stamp.
 - Probe targets now expected 0/0/0 for depth-0 size/identity bans, shift→shift openers, and argument sanitization edge cases.

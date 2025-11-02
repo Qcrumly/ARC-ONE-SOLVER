@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.22"
+__version__ = "v2.9.23"
 
 last_best_program = None
 
@@ -3085,37 +3085,77 @@ def _gof_wrap_phase_tile_identity(op_obj):
     return op_obj
 
 
-# Strong shift de-dupe (universal): refuse a second shift during the first two steps.
-def _gof_wrap_shift_guard(op_obj):
-    def _wrap_apply(f):
-        def _wrapped(*a, **k):
+# === GOF-9000: Final early shift de-dupe (apply + args_enum) ================
+# Refuse a second `shift(...)` in the first two steps (depth < 2), across
+# method-style and callable ops, and prevent the candidate from being proposed.
+
+def _gof_prev_op_lower(prog):
+    """Best-effort previous op name in lowercase."""
+    try:
+        if hasattr(prog, "steps") and prog.steps:
+            op = getattr(prog.steps[-1], "op", None)
+            if isinstance(op, str):
+                return op.lower()
+    except Exception:
+        pass
+    try:
+        return str(getattr(prog, "_gof_last_op", "")).lower()
+    except Exception:
+        return ""
+
+
+def _gof_depth_of(prog):
+    try:
+        return len(prog.steps)
+    except Exception:
+        return int(getattr(prog, "_rails_steps", 0))
+
+
+def _gof_wrap_shift_apply(op_obj):
+    # Works for method-style and callable ops
+    def _wrap(f):
+        def _call(*a, **k):
             prog = None
             for x in a:
                 if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
                     prog = x
                     break
             if prog is not None:
-                try:
-                    depth = len(getattr(prog, "steps", []) or [])
-                except Exception:
-                    depth = int(getattr(prog, "_rails_steps", 0))
-                seen_raw = getattr(prog, "_gof_shift_count", 0)
-                try:
-                    seen = int(seen_raw)
-                except Exception:
-                    seen = 0
-                if depth < 2 and seen >= 1:
+                depth = _gof_depth_of(prog)
+                if depth < 2 and _gof_prev_op_lower(prog) == "shift":
                     return None
             return f(*a, **k)
 
-        return _wrapped
+        return _call
 
     if hasattr(op_obj, "apply"):
-        op_obj.apply = _wrap_apply(op_obj.apply)
+        op_obj.apply = _wrap(op_obj.apply)
         return op_obj
     if callable(op_obj):
-        return _wrap_apply(op_obj)
+        return _wrap(op_obj)
     return op_obj
+
+
+def _gof_wrap_shift_args_enum(op_obj):
+    # Remove shift candidates entirely if previous op was shift and depth < 2
+    if not hasattr(op_obj, "args_enum"):
+        return op_obj
+
+    original_enum = op_obj.args_enum
+
+    def _enum(*aa, **kk):
+        prog = None
+        for item in aa:
+            if hasattr(item, "steps") or hasattr(item, "ctx") or hasattr(item, "input_grid"):
+                prog = item
+                break
+        if prog is not None and _gof_depth_of(prog) < 2 and _gof_prev_op_lower(prog) == "shift":
+            return iter(())
+        return original_enum(*aa, **kk)
+
+    op_obj.args_enum = _enum
+    return op_obj
+# === end shift de-dupe =======================================================
 
 
 def _gof_wrap_mark_last(op_name, op_obj):
@@ -3257,7 +3297,9 @@ try:
         elif _nm in ("remove_isolated", "keep_n_largest", "largest"):
             _REG[_k] = _gof_wrap_mark_last(_nm, _gof_wrap_single_int_arg(_op))
         elif _nm == "shift":
-            _REG[_k] = _gof_wrap_mark_last("shift", _gof_wrap_shift_guard(_op))
+            _op = _gof_wrap_shift_args_enum(_op)
+            _op = _gof_wrap_shift_apply(_op)
+            _REG[_k] = _gof_wrap_mark_last("shift", _op)
         else:
             _REG[_k] = _gof_wrap_mark_last(_nm, _op)
 except Exception:
