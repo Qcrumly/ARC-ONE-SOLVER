@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.30"
+__version__ = "v2.9.31"
 
 last_best_program = None
 
@@ -3199,6 +3199,18 @@ def _gof_wrap_phase_tile_identity(op_obj):
 # `shift(0,0)` as an identity opener. Works for method-style/callable ops and
 # removes bad candidates from args_enum.
 
+# === Name/args helpers for successor gating ==================================
+def _step_name_and_args(program):
+    """Return (name_lower, args_list) for the program's last step, best-effort."""
+    try:
+        step = program.steps[-1]
+        name = str(getattr(step, "op", step)).lower()
+        args = list(getattr(step, "args", []))
+        return name, args
+    except Exception:
+        return str(getattr(program, "_gof_last_op", "")).lower(), []
+
+
 def _is_shift_name(name: str) -> bool:
     try:
         return "shift" in str(name).lower()
@@ -3214,15 +3226,13 @@ def _last_step_name(program) -> str:
         return str(getattr(program, "_gof_last_op", "")).lower()
 
 
-def _step_name_and_args(program):
-    """Return (name_lower, args_list) for a program's last step."""
+def _append_step_clone(program, StepCls, ProgramCls, op_name, args):
+    """Clone program and append Step(op_name, args); return None on failure."""
     try:
-        step = program.steps[-1]
-        name = str(getattr(step, "op", step)).lower()
-        args = list(getattr(step, "args", []))
-        return name, args
+        new_steps = list(getattr(program, "steps", [])) + [StepCls(op=op_name, args=tuple(args or ()))]
+        return ProgramCls(steps=new_steps)
     except Exception:
-        return str(getattr(program, "_gof_last_op", "")).lower(), []
+        return None
 
 
 def _gof_prev_op_lower(prog):
@@ -4751,15 +4761,19 @@ def beam_search_one_pair(
 
         # Generate successors with gating + O2 ordering
         successors = generate_successors(current.program, ctx_iter, allowed=allowed)
-        # --- GOF-9000: no identity shift or consecutive shift in early ops -----------
+        # --- GOF-9000: early opener hygiene -----------------------------------------
         try:
             depth_here = len(current.program.steps)
         except Exception:
             depth_here = 0
+
         if depth_here == 0:
+            # --- GOF-9000: ban weak opener keep_rings at depth-0 ---------------------
             filtered_successors = []
             for sp in successors:
                 nm, args = _step_name_and_args(sp)
+                if nm == "keep_rings":
+                    continue  # too weak as an opener
                 if _is_shift_name(nm) and len(args) >= 2:
                     try:
                         dy = int(args[0])
@@ -4767,9 +4781,31 @@ def beam_search_one_pair(
                     except Exception:
                         dy = dx = None
                     if dy == 0 and dx == 0:
-                        continue
+                        continue  # drop shift(0,0) openers
                 filtered_successors.append(sp)
             successors = filtered_successors
+
+            # Inject robust object-centric openers at depth-0 if missing
+            try:
+                StepCls = Step
+                ProgramCls = Program
+            except Exception:
+                StepCls = ProgramCls = None
+            if StepCls and ProgramCls:
+                have = {_last_step_name(sp) for sp in successors}
+                candidates = [
+                    ("keep_n_largest", (1,)),
+                    ("remove_isolated", (1,)),
+                    ("fill_holes", ()),
+                    ("largest", ()),
+                ]
+                for oname, oargs in candidates:
+                    if oname in have or oname not in OP_REGISTRY:
+                        continue
+                    sp = _append_step_clone(current.program, StepCls, ProgramCls, oname, oargs)
+                    if sp is not None:
+                        successors.append(sp)
+
         if depth_here < 2 and _is_shift_name(_last_step_name(current.program)):
             filtered_successors = []
             for sp in successors:
@@ -4777,7 +4813,7 @@ def beam_search_one_pair(
                 if not _is_shift_name(nm):
                     filtered_successors.append(sp)
             successors = filtered_successors
-        # --- end early shift guard ----------------------------------------------------
+        # --- end early opener hygiene -----------------------------------------------
 
         # === GOF-9000: rails + identity policy ===
         try:

@@ -1,3 +1,8 @@
+## v2.9.31 — 2025-11-02
+- **Opening quality:** prune `keep_rings` as a depth-0 move and auto-inject robust object openers (`keep_n_largest(1)`, `remove_isolated(1)`, `fill_holes`, `largest`) when absent.
+- **Endgame finisher:** palette snap plus ±2 micro-shifts run against available truth and only replace the grid when accuracy improves, logging `_telemetry.endgame` breadcrumbs.
+- Keeps prior guardrails: identity/scale rails, shift de-dupe (op + beam), depth-0 identity bans, and interpreter identity fallback.
+
 ## v2.9.30 — 2025-11-02
 - **Interpreter identity fallback:** Treat `None` returns from guarded ops as identity in `apply_step`, preventing `state=None` propagation.
 
