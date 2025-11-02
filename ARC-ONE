@@ -3734,6 +3734,786 @@ except Exception:
 # === end GOF-9000 directional/identity guards ===============================
 
 
+# === GOF-9000: Early-step Directional Guards + Identity Policy ===============
+# Purpose: stop wrong-way resize/scale in the first few steps, and block noop
+# starts unless the task is truly identity. Works regardless of successor API.
+
+# How many earliest steps to police (conservative)
+K_DIR = 3
+# New: forbid any size-changing op on the very first step (structure-first).
+# This is a hard rule; we can make it configurable later if needed.
+K_NO_SIZEOPS_AT_START = 1
+
+
+def _gof_collect_ints(*values):
+    """Collect ints from nested args, tolerating numpy scalars and digit strings."""
+    ints: List[int] = []
+    stack = list(values)
+    np_integer = getattr(np, "integer", ()) if hasattr(np, "integer") else ()
+    while stack:
+        item = stack.pop()
+        if isinstance(item, bool):  # avoid treating booleans as ints
+            continue
+        if isinstance(item, int):
+            ints.append(int(item))
+            continue
+        if np_integer and isinstance(item, np_integer):  # type: ignore[arg-type]
+            ints.append(int(item))
+            continue
+        if isinstance(item, (list, tuple)):
+            stack.extend(item)
+            continue
+        if isinstance(item, str):
+            filtered = "".join(ch for ch in item if ch.isdigit() or ch == "-")
+            if filtered:
+                try:
+                    ints.append(int(filtered))
+                except Exception:
+                    pass
+    ints.reverse()
+    return ints
+
+
+def _gof_prog_from_args(args):
+    for item in args:
+        if hasattr(item, "steps") or hasattr(item, "ctx") or hasattr(item, "input_grid"):
+            return item
+    return None
+
+
+def _gof_depth_maybe(prog):
+    if prog is None:
+        return None
+    try:
+        return len(prog.steps)
+    except Exception:
+        fallback = getattr(prog, "_rails_steps", None)
+        try:
+            return None if fallback is None else int(fallback)
+        except Exception:
+            return None
+
+
+def _gof_identity_from_args(args):
+    for item in args:
+        try:
+            if isinstance(item, np.ndarray):
+                return item.copy()
+            if hasattr(item, "copy") and hasattr(item, "shape"):
+                return item.copy()
+        except Exception:
+            pass
+    for item in args:
+        if isinstance(item, (list, tuple)) and item:
+            try:
+                return np.array(item).copy()
+            except Exception:
+                return item
+    return args[0] if args else None
+
+
+def _gof_sanitize_token(tok: str) -> str:
+    """Normalize token strings so integer arguments appear without extra wrappers."""
+    try:
+        name, rest = tok.split("(", 1)
+        rest = rest.rstrip(")")
+        if not rest:
+            return tok
+        parts = [p.strip() for p in rest.split(",")]
+        cleaned: List[str] = []
+        for part in parts:
+            digits = "".join(ch for ch in part if (ch.isdigit() or ch == "-"))
+            cleaned.append(digits if digits else part)
+        return f"{name}(" + ",".join(cleaned) + ")"
+    except Exception:
+        return tok
+
+
+def _gof_shape_of(g):
+    try:
+        import numpy as _np
+
+        if hasattr(g, "shape") and len(g.shape) >= 2:
+            return (int(g.shape[-2]), int(g.shape[-1]))
+    except Exception:
+        pass
+    if isinstance(g, list) and g and isinstance(g[0], list):
+        return (len(g), len(g[0]))
+    return None
+
+
+def _gof_prog_depth(p):
+    try:
+        return len(p.steps)
+    except Exception:
+        return int(getattr(p, "_rails_steps", 0))
+
+
+def _gof_infer_scale_need_from_prog(p):
+    """Return s in {-1.0, 0.0, +1.0}: compress, neutral, expand."""
+    # Try program.ctx first if present (search layer usually sets these)
+    ctx = getattr(p, "ctx", None)
+    inp = None
+    tgt = None
+    if isinstance(ctx, dict):
+        inp = ctx.get("in_shape") or _gof_shape_of(ctx.get("input") or ctx.get("input_grid"))
+        tgt = ctx.get("out_shape") or _gof_shape_of(ctx.get("target") or ctx.get("target_grid"))
+    # Fall back to common attributes
+    inp = inp or (_gof_shape_of(getattr(p, "input_grid", None))
+                  or _gof_shape_of(getattr(p, "state0", None))
+                  or _gof_shape_of(getattr(p, "state", None)))
+    tgt = tgt or (_gof_shape_of(getattr(p, "target", None))
+                  or _gof_shape_of(getattr(p, "goal", None)))
+    if not (inp and tgt):
+        return 0.0
+    ia, ta = int(inp[0]) * int(inp[1]), int(tgt[0]) * int(tgt[1])
+    if ta < 0.9 * ia:
+        return -1.0  # need shrink
+    if ta > 1.1 * ia:
+        return +1.0  # need expand
+    return 0.0
+
+
+def _gof_is_identity(op_name, args, program):
+    # tile(1,1), scale(1), resize to same size
+    try:
+        if op_name == "tile" and len(args) >= 2:
+            return int(args[0]) == 1 and int(args[1]) == 1
+        if op_name == "scale" and len(args) >= 1:
+            return float(args[0]) == 1.0
+        if op_name == "resize" and len(args) >= 2:
+            h, w = int(args[0]), int(args[1])
+            cur = (_gof_shape_of(getattr(program, "state", None))
+                   or _gof_shape_of(getattr(program, "grid", None))
+                   or _gof_shape_of(getattr(program, "input_grid", None)))
+            return bool(cur) and (tuple(cur) == (h, w))
+    except Exception:
+        pass
+    return False
+
+
+def _gof_wrap_resize(op_obj):
+    """Wrap resize to enforce early identity bans and directional checks."""
+
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            identity = _gof_identity_from_args(a)
+            if depth == 0:
+                return identity
+
+            if depth is not None and prog is not None and depth < K_DIR:
+                s = getattr(prog, "_rails_s", None)
+                if s is None:
+                    s = _gof_infer_scale_need_from_prog(prog)
+                    try:
+                        setattr(prog, "_rails_s", s)
+                    except Exception:
+                        pass
+                try:
+                    nums = _gof_collect_ints(*a)
+                    if len(nums) >= 2:
+                        h, w = nums[-2], nums[-1]
+                        cur_shape = (
+                            _gof_shape_of(getattr(prog, "state", None))
+                            or _gof_shape_of(getattr(prog, "grid", None))
+                            or _gof_shape_of(getattr(prog, "input_grid", None))
+                        )
+                        if cur_shape:
+                            new_area = h * w
+                            cur_area = int(cur_shape[0]) * int(cur_shape[1])
+                            if s <= -1.0 and new_area >= cur_area:
+                                return identity
+                            if s >= +1.0 and new_area <= cur_area:
+                                return identity
+                except Exception:
+                    pass
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+def _gof_wrap_scale(op_obj):
+    """Wrap scale to respect depth-0 bans and directional hints."""
+
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            identity = _gof_identity_from_args(a)
+            if depth == 0:
+                return identity
+
+            if depth is not None and prog is not None and depth < K_DIR:
+                s = getattr(prog, "_rails_s", None)
+                if s is None:
+                    s = _gof_infer_scale_need_from_prog(prog)
+                    try:
+                        setattr(prog, "_rails_s", s)
+                    except Exception:
+                        pass
+                try:
+                    factor = None
+                    for arg in reversed(a):
+                        if isinstance(arg, bool):
+                            continue
+                        if isinstance(arg, (int, float)):
+                            factor = float(arg)
+                            break
+                        if hasattr(np, "floating") and isinstance(arg, np.floating):  # type: ignore[arg-type]
+                            factor = float(arg)
+                            break
+                        if isinstance(arg, str):
+                            filtered = "".join(ch for ch in arg if ch.isdigit() or ch in {".", "-"})
+                            if filtered:
+                                factor = float(filtered)
+                                break
+                    if factor is not None:
+                        if s <= -1.0 and factor >= 1.0:
+                            return identity
+                        if s >= +1.0 and factor <= 1.0:
+                            return identity
+                except Exception:
+                    pass
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+def _gof_wrap_tile_identity(op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            if depth == 0:
+                nums = _gof_collect_ints(*a)
+                if len(nums) >= 2 and nums[-2] == 1 and nums[-1] == 1:
+                    return _gof_identity_from_args(a)
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+# New: also block masked-identity at depth 0: tile_masked(1,1,*)
+def _gof_wrap_tile_masked_identity(op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            if depth == 0:
+                nums = _gof_collect_ints(*a)
+                if len(nums) >= 3 and nums[-3] == 1 and nums[-2] == 1:
+                    return _gof_identity_from_args(a)
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+# Utility: coerce a “single int” argument in many forms into a plain int
+def _gof_coerce_single_int_arg(x):
+    try:
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, int):
+            return int(x)
+        np_integer = getattr(np, "integer", ()) if hasattr(np, "integer") else ()
+        if np_integer and isinstance(x, np_integer):  # type: ignore[arg-type]
+            return int(x)
+        if isinstance(x, (tuple, list)) and len(x) == 1:
+            return _gof_coerce_single_int_arg(x[0])
+        if isinstance(x, str):
+            filtered = "".join(ch for ch in x if ch.isdigit() or ch == "-")
+            if filtered and filtered not in {"-", "--"}:
+                return int(filtered)
+    except Exception:
+        pass
+    return x
+
+
+# Generic single-int sanitizer for ops like remove_isolated, keep_n_largest, etc.
+def _gof_wrap_single_int_arg(op_obj):
+    if hasattr(op_obj, "apply"):
+        original_apply = op_obj.apply
+
+        def _apply(program, *args, **kwargs):
+            if len(args) == 1:
+                coerced = _gof_coerce_single_int_arg(args[0])
+                args = (coerced,)
+            return original_apply(program, *args, **kwargs)
+
+        op_obj.apply = _apply
+        return op_obj
+
+    if callable(op_obj):
+        original_call = op_obj
+
+        def _call(*args, **kwargs):
+            if len(args) == 1:
+                coerced = _gof_coerce_single_int_arg(args[0])
+                args = (coerced,)
+            return original_call(*args, **kwargs)
+
+        return _call
+
+    return op_obj
+
+
+# Depth-0 identity ban for phase-tile family: phase_tile, phase_tile_row, phase_tile_col
+def _gof_wrap_phase_tile_identity(op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            if depth == 0:
+                ints = _gof_collect_ints(*a)
+                if len(ints) >= 2:
+                    if len(ints) >= 3:
+                        ky, kx = ints[-3], ints[-2]
+                    else:
+                        ky, kx = ints[-2], ints[-1]
+                    try:
+                        if int(ky) == 1 and int(kx) == 1:
+                            return _gof_identity_from_args(a)
+                    except Exception:
+                        pass
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+# === GOF-9000: Final early shift de-dupe (apply + args_enum) ================
+# Refuse a second `shift(...)` in the first two steps (depth < 2) and treat
+# `shift(0,0)` as an identity opener. Works for method-style/callable ops and
+# removes bad candidates from args_enum.
+
+# === Name/args helpers for successor gating ==================================
+def _step_name_and_args(program):
+    """Return (name_lower, args_list) for the program's last step, best-effort."""
+    try:
+        step = program.steps[-1]
+        name = str(getattr(step, "op", step)).lower()
+        args = list(getattr(step, "args", []))
+        return name, args
+    except Exception:
+        return str(getattr(program, "_gof_last_op", "")).lower(), []
+
+
+def _is_shift_name(name: str) -> bool:
+    try:
+        return "shift" in str(name).lower()
+    except Exception:
+        return False
+
+
+def _last_step_name(program) -> str:
+    try:
+        step = program.steps[-1]
+        return str(getattr(step, "op", step)).lower()
+    except Exception:
+        return str(getattr(program, "_gof_last_op", "")).lower()
+
+
+def _append_step_clone(program, StepCls, ProgramCls, op_name, args):
+    """Clone program and append Step(op_name, args); return None on failure."""
+    try:
+        new_steps = list(getattr(program, "steps", [])) + [StepCls(op=op_name, args=tuple(args or ()))]
+        return ProgramCls(steps=new_steps)
+    except Exception:
+        return None
+
+
+def _prog_signature(program) -> str:
+    """Compact signature of a Program's steps, to drop duplicates early."""
+    try:
+        items = []
+        for s in getattr(program, "steps", []):
+            name = str(getattr(s, "op", s))
+            args = tuple(getattr(s, "args", ()))
+            items.append((name, args))
+        raw = repr(items).encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _op_class(name: str):
+    """Rough class bucketing using known registries."""
+    n = (name or "").lower()
+    try:
+        if n in (PALETTE_OPS if 'PALETTE_OPS' in globals() else set()):
+            return "palette"
+        if n in (TOPOLOGY_OPS if 'TOPOLOGY_OPS' in globals() else set()):
+            return "topology"
+        if n in (ALIGNMENT_OPS if 'ALIGNMENT_OPS' in globals() else set()):
+            return "align"
+        if n in (EXPANSION_OPS if 'EXPANSION_OPS' in globals() else set()):
+            return "expand"
+        if "color" in n or "swap" in n or "palette" in n:
+            return "palette"
+        if "tile" in n or "resize" in n or "scale" in n:
+            return "expand"
+        if "shift" in n or "center" in n or "align" in n:
+            return "align"
+        return "topology"
+    except Exception:
+        return "other"
+
+
+class SelfMonitor:
+    """Tracks operator pressure, novelty, and duplicate programs."""
+
+    def __init__(self, settings):
+        self.on = bool(getattr(settings, "monitor_enable", True))
+        self.pressure_thresh = float(getattr(settings, "monitor_pressure_thresh", 0.70))
+        self.inject_underused = bool(getattr(settings, "monitor_inject_underused", True))
+        self.drop_dupes = bool(getattr(settings, "monitor_drop_dupe_sigs", True))
+        self.visited_cap = int(getattr(settings, "monitor_visited_cap", 50000))
+        self.sig_set = set()
+        self.sig_q = deque()
+        self.op_counts = {"palette": 0, "topology": 0, "align": 0, "expand": 0, "other": 0}
+        self.face = "Explorer"
+        self.events: List[Any] = []
+
+    def record_accept(self, program):
+        if not self.on or program is None:
+            return
+        name = _last_step_name(program)
+        cls = _op_class(name)
+        self.op_counts[cls] = self.op_counts.get(cls, 0) + 1
+        self.events.append(("accept", name, cls))
+
+    def _pressure(self):
+        total = sum(self.op_counts.values()) or 1
+        top = max(self.op_counts.values()) if total > 0 else 0
+        return top / total
+
+    def prune_dupes(self, successors):
+        if not (self.on and self.drop_dupes):
+            return successors
+        uniq = []
+        for sp in successors:
+            sig = _prog_signature(sp)
+            if sig and sig in self.sig_set:
+                continue
+            uniq.append(sp)
+            if sig:
+                self.sig_set.add(sig)
+                self.sig_q.append(sig)
+                if len(self.sig_q) > self.visited_cap:
+                    old = self.sig_q.popleft()
+                    if old in self.sig_set:
+                        self.sig_set.remove(old)
+        return uniq
+
+    def inject_underused_dimension(self, current, successors):
+        if not (self.on and self.inject_underused):
+            return successors
+        if self._pressure() < self.pressure_thresh:
+            return successors
+        want = min(self.op_counts, key=lambda k: self.op_counts[k])
+        candidates = {
+            "topology": [("keep_n_largest", (1,)), ("remove_isolated", (1,)), ("fill_holes", ())],
+            "align": [("center_largest", ()), ("shift", (1, 0))],
+            "palette": [("fill", (1,)), ("swapcolors", (1, 2))],
+            "expand": [("resize", (3, 3)), ("tile", (2, 2))],
+        }
+        reps = [c for c in candidates.get(want, []) if c[0] in OP_REGISTRY]
+        if not reps:
+            return successors
+        try:
+            StepCls = Step
+            ProgramCls = Program
+        except Exception:
+            return successors
+        have = {_last_step_name(sp) for sp in successors}
+        for oname, oargs in reps:
+            if oname in have:
+                continue
+            sp = _append_step_clone(current.program, StepCls, ProgramCls, oname, oargs)
+            if sp is not None:
+                successors.append(sp)
+                self.events.append(("inject", want, oname))
+                break
+        return successors
+
+    def as_dict(self):
+        data = {
+            "op_counts": dict(self.op_counts),
+            "pressure": self._pressure(),
+            "face": self.face,
+            "events": self.events[:16],
+            "visited": len(self.sig_set),
+        }
+        return data
+
+def _gof_prev_op_lower(prog):
+    """Best-effort previous op name in lowercase."""
+    try:
+        if hasattr(prog, "steps") and prog.steps:
+            op = getattr(prog.steps[-1], "op", None)
+            if isinstance(op, str):
+                return op.lower()
+    except Exception:
+        pass
+    try:
+        return str(getattr(prog, "_gof_last_op", "")).lower()
+    except Exception:
+        return ""
+
+
+def _gof_depth_of(prog):
+    try:
+        return len(prog.steps)
+    except Exception:
+        return int(getattr(prog, "_rails_steps", 0))
+
+
+def _gof_wrap_shift_apply(op_obj):
+    # Works for method-style and callable ops
+    def _wrap(f):
+        def _call(*a, **k):
+            prog = None
+            for x in a:
+                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
+                    prog = x
+                    break
+            if prog is not None:
+                depth = _gof_depth_of(prog)
+                if depth < 2 and _gof_prev_op_lower(prog) == "shift":
+                    return prog
+                if depth == 0:
+                    ints = _gof_collect_ints(*a)
+                    if len(ints) >= 2:
+                        try:
+                            dy, dx = int(ints[-2]), int(ints[-1])
+                            if dy == 0 and dx == 0:
+                                return prog
+                        except Exception:
+                            pass
+            return f(*a, **k)
+
+        return _call
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap(op_obj)
+    return op_obj
+
+
+def _gof_wrap_shift_args_enum(op_obj):
+    # Remove shift candidates entirely if previous op was shift and depth < 2
+    if not hasattr(op_obj, "args_enum"):
+        return op_obj
+
+    original_enum = op_obj.args_enum
+
+    def _enum(*aa, **kk):
+        prog = None
+        for item in aa:
+            if hasattr(item, "steps") or hasattr(item, "ctx") or hasattr(item, "input_grid"):
+                prog = item
+                break
+        if prog is not None and _gof_depth_of(prog) < 2 and _gof_prev_op_lower(prog) == "shift":
+            return iter(())
+        return original_enum(*aa, **kk)
+
+    op_obj.args_enum = _enum
+    return op_obj
+# === end shift de-dupe =======================================================
+
+
+def _gof_wrap_mark_last(op_name, op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            result = f(*a, **k)
+            if result is None:
+                return result
+            prog = None
+            for x in a:
+                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
+                    prog = x
+                    break
+            if prog is not None:
+                try:
+                    setattr(prog, "_gof_last_op", str(op_name).lower())
+                except Exception:
+                    pass
+                try:
+                    op_lower = str(op_name).lower()
+                    if op_lower == "shift":
+                        current = getattr(prog, "_gof_shift_count", 0)
+                        if isinstance(current, bool):
+                            current = 0
+                        try:
+                            current_int = int(current)
+                        except Exception:
+                            current_int = 0
+                        setattr(prog, "_gof_shift_count", current_int + 1)
+                    else:
+                        current = getattr(prog, "_gof_shift_count", 0)
+                        if isinstance(current, bool):
+                            current = 0
+                        try:
+                            current_int = int(current)
+                        except Exception:
+                            current_int = 0
+                        setattr(prog, "_gof_shift_count", current_int)
+                except Exception:
+                    pass
+            return result
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        wrapped = _wrap_apply(op_obj)
+        try:
+            setattr(wrapped, "__name__", getattr(op_obj, "__name__", wrapped.__name__))
+        except Exception:
+            pass
+        if hasattr(op_obj, "name"):
+            try:
+                setattr(wrapped, "name", getattr(op_obj, "name"))
+            except Exception:
+                pass
+        return wrapped
+    return op_obj
+
+
+# Optional: args_enum shields so bad candidates are never proposed
+def _gof_shield_resize_args_enum(op_obj):
+    if not hasattr(op_obj, "args_enum"):
+        return op_obj
+    old = op_obj.args_enum
+
+    def new_enum(*aa, **kk):
+        # Try to pull ctx/program if provided by the framework
+        ctx = None
+        prog = None
+        for x in aa:
+            if isinstance(x, dict):
+                ctx = x
+            else:
+                prog = x if getattr(x, "__class__", None) else prog
+        depth = 0
+        if prog is not None:
+            depth = _gof_prog_depth(prog)
+        if depth < K_NO_SIZEOPS_AT_START:
+            return iter(())
+        s = 0.0
+        if prog is not None:
+            s = getattr(prog, "_rails_s", None)
+            if s is None:
+                s = _gof_infer_scale_need_from_prog(prog)
+                try:
+                    setattr(prog, "_rails_s", s)
+                except Exception:
+                    pass
+        elif isinstance(ctx, dict) and ("in_shape" in ctx and "out_shape" in ctx):
+            ia = int(ctx["in_shape"][0]) * int(ctx["in_shape"][1])
+            oa = int(ctx["out_shape"][0]) * int(ctx["out_shape"][1])
+            s = -1.0 if oa < 0.9 * ia else (+1.0 if oa > 1.1 * ia else 0.0)
+        for args in old(*aa, **kk):
+            try:
+                h, w = int(args[0]), int(args[1])
+            except Exception:
+                continue
+            # No direction known: let non-zero-depth cases through; step-0 will be blocked by apply()
+            if s == 0.0:
+                yield args
+                continue
+            # Direction known: keep only area-consistent candidates
+            # (Shrinking: new area < current; Growing: new area > current.
+            # We can't see current here reliably, so approximate by comparing to out_shape if present.)
+            if isinstance(ctx, dict) and "out_shape" in ctx:
+                oa = int(ctx["out_shape"][0]) * int(ctx["out_shape"][1])
+                na = h * w
+                if s <= -1.0 and na >= oa:  # shrinking needed → prefer <= target area
+                    continue
+                if s >= +1.0 and na <= oa:  # growing needed → prefer >= target area
+                    continue
+            yield args
+
+    op_obj.args_enum = new_enum
+    return op_obj
+
+
+# Patch the current OP_REGISTRY once
+try:
+    _REG = OP_REGISTRY
+    for _k in list(getattr(_REG, "keys", lambda: [])()):
+        _op = _REG[_k]
+        _nm = (getattr(_op, "name", _k)).lower()
+        if _nm == "resize":
+            _op = _gof_wrap_resize(_op)
+            _op = _gof_shield_resize_args_enum(_op)
+            _REG[_k] = _gof_wrap_mark_last("resize", _op)
+        elif _nm == "scale":
+            _REG[_k] = _gof_wrap_mark_last("scale", _gof_wrap_scale(_op))
+        elif _nm == "tile":
+            _REG[_k] = _gof_wrap_mark_last("tile", _gof_wrap_tile_identity(_op))
+        elif _nm == "tile_masked":
+            _REG[_k] = _gof_wrap_mark_last("tile_masked", _gof_wrap_tile_masked_identity(_op))
+        elif _nm in ("phase_tile", "phase_tile_row", "phase_tile_col"):
+            _REG[_k] = _gof_wrap_mark_last(_nm, _gof_wrap_phase_tile_identity(_op))
+        elif _nm in ("remove_isolated", "keep_n_largest", "largest"):
+            _REG[_k] = _gof_wrap_mark_last(_nm, _gof_wrap_single_int_arg(_op))
+        elif "shift" in _nm:
+            _op = _gof_wrap_shift_args_enum(_op)
+            _op = _gof_wrap_shift_apply(_op)
+            _REG[_k] = _gof_wrap_mark_last("shift", _op)
+        else:
+            _REG[_k] = _gof_wrap_mark_last(_nm, _op)
+except Exception:
+    pass
+
+try:
+    _telemetry_note(globals(), early_dir_guard_steps=K_DIR, no_sizeops_start=K_NO_SIZEOPS_AT_START)
+except Exception:
+    pass
+# === end GOF-9000 directional/identity guards ===============================
+
+
 # ============================================================================
 # ============ Operation Order and Families (O2) ============
 # ============================================================================
