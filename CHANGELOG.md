@@ -1,3 +1,7 @@
+## v2.9.26 — 2025-11-01
+- **No-consecutive-shift (beam):** right after successor generation, drop any candidate whose new last op is a shift when the parent just shifted and `depth < 2`, closing the final early-step leak regardless of wrapper timing or aliases.
+- Guardrails now cover depth-0 size/identity bans, phase-tile identities, directional size guards, object-first opening, sanitized args/tokens, and shift de-dupe at both operator and beam layers.
+
 ## v2.9.25 — 2025-11-01
 - **Early shift de-dupe (engine-proof):** rejecting a second early `shift(...)` now returns the unchanged program (instead of `None`), preventing downstream engines from recording a phantom step.
 - **Alias-safe attach:** guards continue to apply to any registry entry whose name includes "shift," so synonyms still obey the guardrails while tokens render as `shift(...)`.

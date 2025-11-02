@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.25"
+__version__ = "v2.9.26"
 
 last_best_program = None
 
@@ -3090,6 +3090,21 @@ def _gof_wrap_phase_tile_identity(op_obj):
 # `shift(0,0)` as an identity opener. Works for method-style/callable ops and
 # removes bad candidates from args_enum.
 
+def _is_shift_name(name: str) -> bool:
+    try:
+        return "shift" in str(name).lower()
+    except Exception:
+        return False
+
+
+def _last_step_name(program) -> str:
+    try:
+        step = program.steps[-1]
+        return str(getattr(step, "op", step)).lower()
+    except Exception:
+        return str(getattr(program, "_gof_last_op", "")).lower()
+
+
 def _gof_prev_op_lower(prog):
     """Best-effort previous op name in lowercase."""
     try:
@@ -4609,6 +4624,20 @@ def beam_search_one_pair(
 
         # Generate successors with gating + O2 ordering
         successors = generate_successors(current.program, ctx_iter, allowed=allowed)
+        # --- GOF-9000: no consecutive shift in the first two ops (successor-level) ---
+        try:
+            depth_here = len(current.program.steps)
+        except Exception:
+            depth_here = 0
+        if depth_here < 2:
+            prev_name = _last_step_name(current.program)
+            if _is_shift_name(prev_name):
+                filtered_successors = []
+                for sp in successors:
+                    if not _is_shift_name(_last_step_name(sp)):
+                        filtered_successors.append(sp)
+                successors = filtered_successors
+        # --- end no-consecutive-shift -------------------------------------------------
 
         # === GOF-9000: rails + identity policy ===
         try:
