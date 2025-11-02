@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.10.1"  # Memory v1.0 + Diversity Guard (A/B) + soft priors
+__version__ = "v2.10.2"  # Seeded motif enqueue + telemetry
 
 last_best_program = None
 
@@ -102,6 +102,118 @@ try:  # Memory helpers are optional
     import arc_memory as MEM
 except Exception:  # pragma: no cover - memory module optional
     MEM = None
+
+
+# ---- Memory motif token parsing & safe telemetry --------------------------------
+_OP_TOKEN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$")
+
+
+def _telemetry_note_safe(carrier, **kv):
+    """Call _telemetry_note if present; otherwise ignore silently."""
+    try:
+        return _telemetry_note(carrier, **kv)
+    except Exception:
+        return None
+
+
+def _parse_tokens_to_program(tokens: List[str]):
+    """Convert a list of op tokens into a Program; fallback to empty Program on failure."""
+    try:
+        prog = _program_from_ops_tokens(tokens)
+        if getattr(prog, "steps", None):
+            return prog
+    except Exception:
+        pass
+
+    StepCls = globals().get("Step")
+    ProgramCls = globals().get("Program")
+    if StepCls is None or ProgramCls is None:
+        return ProgramCls([]) if ProgramCls is not None else []
+
+    steps = []
+    for tok in tokens or []:
+        match = _OP_TOKEN_RE.match(str(tok).strip())
+        if not match:
+            continue
+        name, arg_str = match.group(1), match.group(2).strip()
+        args: List[int] = []
+        if arg_str:
+            for part in arg_str.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    args.append(int(part))
+                except Exception:
+                    continue
+        steps.append(StepCls(op=name, args=tuple(args)))
+    try:
+        return ProgramCls(steps)
+    except Exception:
+        return ProgramCls([]) if ProgramCls is not None else []
+
+
+def _enqueue_seed_programs(
+    frontier: List[Any],
+    train_pairs: Optional[List[Any]],
+    input_grid: np.ndarray,
+    target_grid: np.ndarray,
+    seed_tokens_list: Optional[List[List[str]]],
+    interpret_program_fn,
+    compute_cost_fn,
+    telemetry_sink: Optional[Any] = None,
+):
+    """Insert parsed motif programs into the initial frontier. Returns appended entries."""
+    appended: List[Any] = []
+    if not seed_tokens_list:
+        return appended
+
+    candidate_cls = globals().get("Candidate")
+
+    for toks in seed_tokens_list:
+        try:
+            prog = _parse_tokens_to_program(toks)
+            if not getattr(prog, "steps", None):
+                continue
+            pred = interpret_program_fn(prog, input_grid)
+        except Exception:
+            continue
+
+        try:
+            cost = float(compute_cost_fn(prog, input_grid, target_grid))
+        except Exception:
+            cost = float("inf")
+
+        depth = 0
+        try:
+            depth = len(prog)
+        except Exception:
+            depth = 0
+
+        try:
+            if candidate_cls is not None:
+                entry = candidate_cls(prog, cost, depth=depth)
+            else:
+                raise TypeError
+        except Exception:
+            entry = {"program": prog, "pred": pred, "cost": cost, "depth": depth}
+
+        frontier.append(entry)
+        appended.append(entry)
+
+        _telemetry_note_safe(
+            entry,
+            memory_seeded_motif=list(toks or []),
+            memory_seed_cost=cost,
+        )
+        if telemetry_sink is not None:
+            _telemetry_note_safe(
+                telemetry_sink,
+                memory_seeded_motif=list(toks or []),
+                memory_seed_cost=cost,
+            )
+
+    return appended
 
 
 def _set_determinism(seed=0):
@@ -4934,6 +5046,7 @@ def beam_search_one_pair(
     # === Meta-seed discovery ===
     meta = _quick_shape_candidates(input_grid, target_grid)
     seeds = [prog for (acc, prog) in meta]
+    memory_seed_tokens = list(getattr(settings, "_memory_seed_tokens", []) or [])
     memory_seeds = list(getattr(settings, "_memory_seeded_programs", []) or [])
     if memory_seeds:
         seeds.extend(memory_seeds)
@@ -4978,8 +5091,34 @@ def beam_search_one_pair(
             break  # one is enough
 
     # Initialize beam with scored seeds (plus an empty program fallback)
-    beam = []
-    visited = set()
+    beam: List[Any] = []
+    visited: Set[Tuple] = set()
+
+    seed_entries = _enqueue_seed_programs(
+        frontier=beam,
+        train_pairs=None,
+        input_grid=input_grid,
+        target_grid=target_grid,
+        seed_tokens_list=memory_seed_tokens,
+        interpret_program_fn=interpret_program,
+        compute_cost_fn=lambda prog, ig, tg: compute_cost(prog, ig, tg, phi, settings),
+        telemetry_sink=settings,
+    )
+
+    sig_seen: Set[Tuple] = set()
+    for entry in seed_entries:
+        prog_obj = None
+        if hasattr(entry, "program"):
+            prog_obj = getattr(entry, "program", None)
+        elif isinstance(entry, dict):
+            prog_obj = entry.get("program")
+        if prog_obj is not None:
+            try:
+                sig = prog_obj.to_tuple()
+                sig_seen.add(sig)
+                visited.add(sig)
+            except Exception:
+                pass
 
     def _seed_cost(p):
         try:
@@ -4988,10 +5127,9 @@ def beam_search_one_pair(
             return 1e9
 
     # add deduped seeds
-    sig_seen = set()
     for prog in seeds:
         sig = prog.to_tuple()
-        if sig in sig_seen: 
+        if sig in sig_seen:
             continue
         sig_seen.add(sig)
         beam.append(Candidate(prog, _seed_cost(prog), depth=len(prog)))
@@ -5996,6 +6134,7 @@ def _solve_task_internal(
     memo: Dict[str, Any] = {}
     layout_fp: Dict[str, Any] = {}
     seeded_programs: List[Program] = []
+    seed_token_lists: List[List[str]] = []
     memory_family = None
     priors_applied = False
     phi_family = None
@@ -6025,7 +6164,9 @@ def _solve_task_internal(
                 motif_topk = int(max(0, getattr(settings, "motif_topk", 0) or 0))
                 motif_tokens = MEM.choose_motifs(layout_fp, memo.get("motifs", {}), topk=motif_topk)
                 for toks in motif_tokens:
-                    prog = _program_from_ops_tokens(toks)
+                    toks_list = [str(t) for t in toks]
+                    seed_token_lists.append(toks_list)
+                    prog = _program_from_ops_tokens(toks_list)
                     if prog is not None and prog.steps:
                         seeded_programs.append(prog)
         except Exception as mem_exc:
@@ -6036,12 +6177,14 @@ def _solve_task_internal(
     else:
         memo = {}
         seeded_programs = []
+        seed_token_lists = []
         memory_family = phi_family
 
     if not priors_applied:
         globals().pop("_OP_NAMES_BIASED", None)
 
     setattr(settings, "_memory_seeded_programs", seeded_programs)
+    setattr(settings, "_memory_seed_tokens", seed_token_lists)
     setattr(settings, "_memory_layout_fp", layout_fp)
     setattr(settings, "_memory_family", memory_family)
     setattr(settings, "_phi_family", memory_family or phi_family)
@@ -6135,6 +6278,10 @@ def _solve_task_internal(
             setattr(mode_settings, "_trace_ops", getattr(settings, "_trace_ops", False))
             if hasattr(settings, "_trace_buffer"):
                 setattr(mode_settings, "_trace_buffer", getattr(settings, "_trace_buffer"))
+            if hasattr(settings, "_memory_seed_tokens"):
+                setattr(mode_settings, "_memory_seed_tokens", getattr(settings, "_memory_seed_tokens", []))
+            if hasattr(settings, "_memory_seeded_programs"):
+                setattr(mode_settings, "_memory_seeded_programs", getattr(settings, "_memory_seeded_programs", []))
 
             # Search for program
             prog = beam_search_one_pair(x, y, phi, mode_settings, logger, deadline=deadline)

@@ -194,3 +194,8 @@ Compare `--no_use_memory` vs default on your 60-task slice: track mean/median ac
   - Normalize outputs to list of dicts with `grid` and `_telemetry.ops_tokens`.
   - Print one-time banner: `[ARC-ONE] API shim active — version v2.9.9 | solve_task + SearchSettings normalized.`
 - No changes to core solver behavior; patch is compatibility-only.
+## v2.10.2 — Seeded Motif Enqueue
+- Inject memory motifs into the beam frontier before the first expansion so they participate in scoring immediately.
+- Parse motif tokens defensively and log `memory_seeded_motif`/`memory_seed_cost` telemetry per injected seed.
+- No change in behaviour when memory files are absent; helper silently skips when no motifs are provided.
+
