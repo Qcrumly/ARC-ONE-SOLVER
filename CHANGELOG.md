@@ -1,3 +1,8 @@
+## v2.9.29 — 2025-11-02
+- **Interpreter safety:** refused ops now return the original grid inside `apply_step`, so guardrails that yield `None` behave as identity instead of crashing search.
+- **Wrapper realism:** early-step wrappers only enforce bans when depth is known to be 0 and, when they refuse an op, they hand back the input grid rather than `None`.
+- **Docs:** refreshed README with a one-lungful overview, quick-start, and footguns-fixed notes.
+
 ## v2.9.28 — 2025-11-02
 - **Beam-level identity ban:** drop `shift(0,0)` candidates when generating opening successors so no-ops never leave the queue.
 - **Endgame pack (diagnostics):** palette snap plus ±2 micro-shifts run against available truth and only replace the grid when accuracy improves, logging details under `_telemetry.endgame`.

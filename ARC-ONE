@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.28"
+__version__ = "v2.9.29"
 
 last_best_program = None
 
@@ -2851,6 +2851,44 @@ def _gof_collect_ints(*values):
     return ints
 
 
+def _gof_prog_from_args(args):
+    for item in args:
+        if hasattr(item, "steps") or hasattr(item, "ctx") or hasattr(item, "input_grid"):
+            return item
+    return None
+
+
+def _gof_depth_maybe(prog):
+    if prog is None:
+        return None
+    try:
+        return len(prog.steps)
+    except Exception:
+        fallback = getattr(prog, "_rails_steps", None)
+        try:
+            return None if fallback is None else int(fallback)
+        except Exception:
+            return None
+
+
+def _gof_identity_from_args(args):
+    for item in args:
+        try:
+            if isinstance(item, np.ndarray):
+                return item.copy()
+            if hasattr(item, "copy") and hasattr(item, "shape"):
+                return item.copy()
+        except Exception:
+            pass
+    for item in args:
+        if isinstance(item, (list, tuple)) and item:
+            try:
+                return np.array(item).copy()
+            except Exception:
+                return item
+    return args[0] if args else None
+
+
 def _gof_sanitize_token(tok: str) -> str:
     """Normalize token strings so integer arguments appear without extra wrappers."""
     try:
@@ -2932,22 +2970,17 @@ def _gof_is_identity(op_name, args, program):
 
 
 def _gof_wrap_resize(op_obj):
-    """Wrap both method-style and callable resize ops to enforce early rules."""
+    """Wrap resize to enforce early identity bans and directional checks."""
 
     def _wrap_apply(f):
         def _wrapped(*a, **k):
-            # Try to find the program-ish arg to read depth/ctx
-            prog = None
-            for x in a:
-                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
-                    prog = x
-                    break
-            d = 0 if prog is None else _gof_prog_depth(prog)
-            # Hard ban on size ops at very first step
-            if d < K_NO_SIZEOPS_AT_START:
-                return None
-            # Directional guard for deeper steps
-            if d < K_DIR and prog is not None:
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            identity = _gof_identity_from_args(a)
+            if depth == 0:
+                return identity
+
+            if depth is not None and prog is not None and depth < K_DIR:
                 s = getattr(prog, "_rails_s", None)
                 if s is None:
                     s = _gof_infer_scale_need_from_prog(prog)
@@ -2955,56 +2988,48 @@ def _gof_wrap_resize(op_obj):
                         setattr(prog, "_rails_s", s)
                     except Exception:
                         pass
-                # If shrinking is needed, do not allow area-increasing resize; if growing is needed, forbid shrinking
                 try:
                     nums = _gof_collect_ints(*a)
                     if len(nums) >= 2:
                         h, w = nums[-2], nums[-1]
-                        cur = (
+                        cur_shape = (
                             _gof_shape_of(getattr(prog, "state", None))
                             or _gof_shape_of(getattr(prog, "grid", None))
                             or _gof_shape_of(getattr(prog, "input_grid", None))
                         )
-                        if cur:
-                            newA = h * w
-                            curA = int(cur[0]) * int(cur[1])
-                            if s <= -1.0 and newA >= curA:
-                                return None
-                            if s >= +1.0 and newA <= curA:
-                                return None
+                        if cur_shape:
+                            new_area = h * w
+                            cur_area = int(cur_shape[0]) * int(cur_shape[1])
+                            if s <= -1.0 and new_area >= cur_area:
+                                return identity
+                            if s >= +1.0 and new_area <= cur_area:
+                                return identity
                 except Exception:
                     pass
             return f(*a, **k)
 
         return _wrapped
 
-    # Method-style op class with .apply
     if hasattr(op_obj, "apply"):
         op_obj.apply = _wrap_apply(op_obj.apply)
         return op_obj
-    # Plain callable op: wrap call
     if callable(op_obj):
         return _wrap_apply(op_obj)
     return op_obj
 
 
 def _gof_wrap_scale(op_obj):
-    """Wrap scale op (both method and callable) to enforce early rules."""
+    """Wrap scale to respect depth-0 bans and directional hints."""
 
     def _wrap_apply(f):
         def _wrapped(*a, **k):
-            prog = None
-            for x in a:
-                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
-                    prog = x
-                    break
-            d = 0 if prog is None else _gof_prog_depth(prog)
-            # Hard ban at first step
-            if d < K_NO_SIZEOPS_AT_START:
-                return None
-            if d < K_DIR and prog is None:
-                return None
-            if d < K_DIR and prog is not None:
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            identity = _gof_identity_from_args(a)
+            if depth == 0:
+                return identity
+
+            if depth is not None and prog is not None and depth < K_DIR:
                 s = getattr(prog, "_rails_s", None)
                 if s is None:
                     s = _gof_infer_scale_need_from_prog(prog)
@@ -3024,16 +3049,15 @@ def _gof_wrap_scale(op_obj):
                             factor = float(arg)
                             break
                         if isinstance(arg, str):
-                            filtered = "".join(ch for ch in arg if ch.isdigit() or ch == "." or ch == "-")
+                            filtered = "".join(ch for ch in arg if ch.isdigit() or ch in {".", "-"})
                             if filtered:
                                 factor = float(filtered)
                                 break
-                    if factor is None:
-                        return f(*a, **k)
-                    if s <= -1.0 and factor >= 1.0:
-                        return None
-                    if s >= +1.0 and factor <= 1.0:
-                        return None
+                    if factor is not None:
+                        if s <= -1.0 and factor >= 1.0:
+                            return identity
+                        if s >= +1.0 and factor <= 1.0:
+                            return identity
                 except Exception:
                     pass
             return f(*a, **k)
@@ -3051,16 +3075,12 @@ def _gof_wrap_scale(op_obj):
 def _gof_wrap_tile_identity(op_obj):
     def _wrap_apply(f):
         def _wrapped(*a, **k):
-            prog = None
-            for x in a:
-                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
-                    prog = x
-                    break
-            d = 0 if prog is None else _gof_prog_depth(prog)
-            if d < K_NO_SIZEOPS_AT_START:
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            if depth == 0:
                 nums = _gof_collect_ints(*a)
                 if len(nums) >= 2 and nums[-2] == 1 and nums[-1] == 1:
-                    return None
+                    return _gof_identity_from_args(a)
             return f(*a, **k)
 
         return _wrapped
@@ -3077,16 +3097,12 @@ def _gof_wrap_tile_identity(op_obj):
 def _gof_wrap_tile_masked_identity(op_obj):
     def _wrap_apply(f):
         def _wrapped(*a, **k):
-            prog = None
-            for x in a:
-                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
-                    prog = x
-                    break
-            d = 0 if prog is None else _gof_prog_depth(prog)
-            if d < K_NO_SIZEOPS_AT_START:
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            if depth == 0:
                 nums = _gof_collect_ints(*a)
                 if len(nums) >= 3 and nums[-3] == 1 and nums[-2] == 1:
-                    return None
+                    return _gof_identity_from_args(a)
             return f(*a, **k)
 
         return _wrapped
@@ -3152,13 +3168,9 @@ def _gof_wrap_single_int_arg(op_obj):
 def _gof_wrap_phase_tile_identity(op_obj):
     def _wrap_apply(f):
         def _wrapped(*a, **k):
-            prog = None
-            for x in a:
-                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
-                    prog = x
-                    break
-            d = 0 if prog is None else _gof_prog_depth(prog)
-            if d < K_NO_SIZEOPS_AT_START:
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            if depth == 0:
                 ints = _gof_collect_ints(*a)
                 if len(ints) >= 2:
                     if len(ints) >= 3:
@@ -3167,7 +3179,7 @@ def _gof_wrap_phase_tile_identity(op_obj):
                         ky, kx = ints[-2], ints[-1]
                     try:
                         if int(ky) == 1 and int(kx) == 1:
-                            return None
+                            return _gof_identity_from_args(a)
                     except Exception:
                         pass
             return f(*a, **k)
@@ -3787,6 +3799,12 @@ def apply_step(grid: np.ndarray, step: Step, states=None) -> np.ndarray:
     except Exception as e:
         # If error, return unchanged grid
         result = grid.copy()
+
+    if result is None:
+        try:
+            return grid.copy()
+        except Exception:
+            return grid
 
     return result
 
