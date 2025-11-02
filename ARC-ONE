@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.10.1 — Memory v1.0 (motifs + priors + layout) + Diversity Guard + HFP×GOF
+# Version: v2.10.2 — Memory motif seeding enqueue + Diversity Guard + HFP×GOF
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -109,32 +109,50 @@ _OP_TOKEN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$")
 
 
 def _telemetry_note_safe(carrier, **kv):
-    """Call _telemetry_note if present; otherwise ignore silently."""
+    """Silently attach telemetry if helper is available."""
     try:
-        return _telemetry_note(carrier, **kv)
+        _telemetry_note  # type: ignore[name-defined]
     except Exception:
-        return None
-
-
-def _parse_tokens_to_program(tokens: List[str]):
-    """Convert a list of op tokens into a Program; fallback to empty Program on failure."""
+        return
     try:
-        prog = _program_from_ops_tokens(tokens)
-        if getattr(prog, "steps", None):
-            return prog
+        _telemetry_note(carrier, **kv)  # type: ignore[name-defined]
     except Exception:
         pass
 
-    StepCls = globals().get("Step")
-    ProgramCls = globals().get("Program")
-    if StepCls is None or ProgramCls is None:
-        return ProgramCls([]) if ProgramCls is not None else []
+
+def _parse_seed_tokens_to_program(
+    tokens: Optional[List[str]],
+    StepCls: Optional[Any] = None,
+    ProgramCls: Optional[Any] = None,
+):
+    """Return (Program or None, number_of_steps) for a motif token list."""
+    if not tokens:
+        return None, 0
+
+    StepType = StepCls or globals().get("Step")
+    ProgType = ProgramCls or globals().get("Program")
+    if StepType is None or ProgType is None:
+        return None, 0
 
     steps = []
-    for tok in tokens or []:
-        match = _OP_TOKEN_RE.match(str(tok).strip())
-        if not match:
+    regex_primary = globals().get("_OP_RE")
+    for raw in tokens:
+        tok = (raw or "").strip()
+        if not tok:
             continue
+        match = None
+        if regex_primary is not None:
+            try:
+                match = regex_primary.match(tok)
+            except Exception:
+                match = None
+        if match is None:
+            match = _OP_TOKEN_RE.match(tok)
+        if not match:
+            # allow bare op name by appending ()
+            match = _OP_TOKEN_RE.match(f"{tok}()")
+            if not match:
+                continue
         name, arg_str = match.group(1), match.group(2).strip()
         args: List[int] = []
         if arg_str:
@@ -145,75 +163,82 @@ def _parse_tokens_to_program(tokens: List[str]):
                 try:
                     args.append(int(part))
                 except Exception:
+                    # Ignore non-integer args for v1.0; extend as needed.
                     continue
-        steps.append(StepCls(op=name, args=tuple(args)))
+        try:
+            steps.append(StepType(name, tuple(args)))
+        except Exception:
+            return None, 0
+
+    if not steps:
+        return None, 0
+
     try:
-        return ProgramCls(steps)
+        program = ProgType(steps)
     except Exception:
-        return ProgramCls([]) if ProgramCls is not None else []
+        return None, 0
+    return program, len(steps)
 
 
 def _enqueue_seed_programs(
     frontier: List[Any],
-    train_pairs: Optional[List[Any]],
-    input_grid: np.ndarray,
-    target_grid: np.ndarray,
+    input_grid: Any,
+    target_grid: Any,
     seed_tokens_list: Optional[List[List[str]]],
     interpret_program_fn,
     compute_cost_fn,
-    telemetry_sink: Optional[Any] = None,
-):
-    """Insert parsed motif programs into the initial frontier. Returns appended entries."""
-    appended: List[Any] = []
+    step_cls: Optional[Any] = None,
+    prog_cls: Optional[Any] = None,
+    telem_carrier: Optional[Any] = None,
+) -> int:
+    """Append parsed motif programs to the frontier. Returns count appended."""
     if not seed_tokens_list:
-        return appended
+        return 0
 
-    candidate_cls = globals().get("Candidate")
-
+    pushed = 0
     for toks in seed_tokens_list:
+        prog, nops = _parse_seed_tokens_to_program(toks, StepCls=step_cls, ProgramCls=prog_cls)
+        if prog is None or not getattr(prog, "steps", None):
+            continue
         try:
-            prog = _parse_tokens_to_program(toks)
-            if not getattr(prog, "steps", None):
-                continue
             pred = interpret_program_fn(prog, input_grid)
+            cost = compute_cost_fn(prog, input_grid, target_grid)
         except Exception:
             continue
 
         try:
-            cost = float(compute_cost_fn(prog, input_grid, target_grid))
-        except Exception:
-            cost = float("inf")
-
-        depth = 0
-        try:
-            depth = len(prog)
-        except Exception:
-            depth = 0
-
-        try:
-            if candidate_cls is not None:
-                entry = candidate_cls(prog, cost, depth=depth)
+            if "BeamEntry" in globals():
+                entry = BeamEntry(program=prog, pred=pred, cost=cost)  # type: ignore[name-defined]
             else:
-                raise TypeError
-        except Exception:
-            entry = {"program": prog, "pred": pred, "cost": cost, "depth": depth}
-
-        frontier.append(entry)
-        appended.append(entry)
-
-        _telemetry_note_safe(
-            entry,
-            memory_seeded_motif=list(toks or []),
-            memory_seed_cost=cost,
-        )
-        if telemetry_sink is not None:
+                entry = {"program": prog, "pred": pred, "cost": float(cost)}
+            frontier.append(entry)
             _telemetry_note_safe(
-                telemetry_sink,
+                entry,
                 memory_seeded_motif=list(toks or []),
-                memory_seed_cost=cost,
+                memory_seed_ops=int(nops),
+                memory_seed_cost=float(cost),
             )
+            if telem_carrier is not None:
+                _telemetry_note_safe(
+                    telem_carrier,
+                    memory_seeded_motif=list(toks or []),
+                    memory_seed_ops=int(nops),
+                    memory_seed_cost=float(cost),
+                )
+            pushed += 1
+        except Exception:
+            continue
 
-    return appended
+    return pushed
+
+
+def _parse_tokens_to_program(tokens: List[str]):
+    """Compat shim for callers expecting the older helper name."""
+    prog, _ = _parse_seed_tokens_to_program(tokens)
+    if prog is not None:
+        return prog
+    ProgramCls = globals().get("Program")
+    return ProgramCls([]) if ProgramCls is not None else []
 
 
 def _set_determinism(seed=0):
@@ -5094,19 +5119,27 @@ def beam_search_one_pair(
     beam: List[Any] = []
     visited: Set[Tuple] = set()
 
-    seed_entries = _enqueue_seed_programs(
+    seed_count = _enqueue_seed_programs(
         frontier=beam,
-        train_pairs=None,
         input_grid=input_grid,
         target_grid=target_grid,
         seed_tokens_list=memory_seed_tokens,
         interpret_program_fn=interpret_program,
         compute_cost_fn=lambda prog, ig, tg: compute_cost(prog, ig, tg, phi, settings),
-        telemetry_sink=settings,
+        step_cls=Step,
+        prog_cls=Program,
+        telem_carrier=settings,
     )
 
+    if seed_count:
+        try:
+            print(f"[memory] seeded {seed_count} motif program(s) into frontier")
+        except Exception:
+            pass
+
     sig_seen: Set[Tuple] = set()
-    for entry in seed_entries:
+    seeded_entries: List[Any] = beam[-seed_count:] if seed_count else []
+    for entry in seeded_entries:
         prog_obj = None
         if hasattr(entry, "program"):
             prog_obj = getattr(entry, "program", None)
