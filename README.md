@@ -19,12 +19,13 @@ python arc_one.py --tasks_dir ./arc_tasks --two_attempts --max_tasks 5 --no_poli
 ```
 
 ### Handy flags (abridged)
-Search: `--beam`, `--depth`, `--seconds`  
-OCO costs: `--lambda_len`, `--lambda1`, `--lambda2`  
-Two attempts: `--two_attempts`, `--attempt2_strategy` (e.g., `flipH`, `oco_auto`)  
-Octonion prior: `--no_octo_prior`, `--octo_alpha`, `--octo_clip`  
-Stage/diversity: `--no_polish`, `--stop_if_diversity`  
-Rails/identity: `--no_block_identity`, `--no_rails_scale_hard`, thresholds/steps knobs  
+Search: `--beam`, `--depth`, `--seconds`
+OCO costs: `--lambda_len`, `--lambda1`, `--lambda2`
+Two attempts: `--two_attempts`, `--attempt2_strategy` (e.g., `flipH`, `oco_auto`)
+Octonion prior: `--no_octo_prior`, `--octo_alpha`, `--octo_clip`
+Stage/diversity: `--no_polish`, `--stop_if_diversity`
+Rails/identity: `--no_block_identity`, `--no_rails_scale_hard`, thresholds/steps knobs
+Memory: `--no_use_memory`, `--no_memory_motifs`, `--no_memory_priors`, `--memory_dir`, `--memory_max_seeded`, `--memory_prior_alpha`
 
 ### Map of the beast
 * **DSL & interpreter.** Ops registry + `interpret_program`.  
@@ -38,3 +39,4 @@ Rails/identity: `--no_block_identity`, `--no_rails_scale_hard`, thresholds/steps
 ### Footguns fixed
 * Refused ops no longer propagate `None`—they act as identity inside the interpreter.
 * Wrappers no longer assume `depth=0` when depth is unknown; early bans only at real depth 0.
+* Memory v0.1 loads read-only motifs/priors; missing files simply disable the feature.

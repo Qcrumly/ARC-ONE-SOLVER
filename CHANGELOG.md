@@ -1,3 +1,59 @@
+## v2.10.0 — Memory v0.1 (motifs + priors + layout)
+- Added read-only Long-Term Memory Bank integration:
+  - Motif seeding: inject up to N short, proven sub-programs at search start.
+  - Priors bias: soft op-policy nudge per φ-family (geometry/topology/default).
+  - Layout fingerprinting to pick motifs (divisibility + symmetry).
+- CLI / settings:
+  --no_use_memory, --no_memory_motifs, --no_memory_priors,
+  --memory_dir, --memory_max_seeded, --memory_prior_alpha
+- Telemetry: records seeded motifs and family priors applied.
+- Safe fallback: if memory files missing, solver behaves exactly as before.
+
+✅ How to use
+
+Build memory once (locally/Kaggle dev):
+
+```
+python build_memory_bank.py \
+  -- (expects arc-agi_training_challenges.json and arc-agi_training_solutions.json alongside)
+# Produces ./memory_bank/{motifs,priors,layouts,shapes}.json
+```
+
+Package the memory_bank/ with your Kaggle dataset (or mount via ARC_MEMORY_DIR):
+
+Environment: `export ARC_MEMORY_DIR=/kaggle/input/arc-one-memory-v0p1/memory_bank`
+
+Or pass `--memory_dir /kaggle/input/.../memory_bank`
+
+Run ARC‑ONE:
+
+```
+# default ON: motifs + priors
+python arc_one.py --tasks_dir ./arc_tasks --two_attempts --out submission.json
+
+# ablations
+python arc_one.py --tasks_dir ./arc_tasks --two_attempts --out sub.json --no_memory_priors
+python arc_one.py --tasks_dir ./arc_tasks --two_attempts --out sub.json --no_use_memory
+```
+
+You’ll see a one-liner at startup showing memory switches and directory, and telemetry will include `memory_seeded=[...]` when motifs are injected.
+
+🔬 Sanity probes you can drop into the Kaggle notebook
+
+Verify memory loads and seeds exactly once per task:
+
+```
+print("Memory present keys:", list(load_memory(settings).keys()))
+res = solve_task("135a2760", CH["135a2760"], settings)
+first = res[0]; print(first.get("_telemetry",{}).get("memory_seeded"))
+```
+
+A/B knobs (quick):
+
+Keep HFP×GOF rails as is.
+
+Compare `--no_use_memory` vs default on your 60-task slice: track mean/median acc and “near-misses” (0.80–0.98). Expect earlier convergence on symmetry/topology-heavy cases and fewer duplicated attempts.
+
 ## v2.9.34 — 2025-11-02
 - **HFP × GOF integration**: Hidden-Factor health (ρ) now modulates GOF “consciousness” to balance exploration vs. caution.
   - Boost `C_gof` by +50% when healthy (ρ ≥ 0.80), suppress by −50% when degraded (ρ < 0.55).
