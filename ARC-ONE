@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.23"
+__version__ = "v2.9.24"
 
 last_best_program = None
 
@@ -3086,8 +3086,9 @@ def _gof_wrap_phase_tile_identity(op_obj):
 
 
 # === GOF-9000: Final early shift de-dupe (apply + args_enum) ================
-# Refuse a second `shift(...)` in the first two steps (depth < 2), across
-# method-style and callable ops, and prevent the candidate from being proposed.
+# Refuse a second `shift(...)` in the first two steps (depth < 2) and treat
+# `shift(0,0)` as an identity opener. Works for method-style/callable ops and
+# removes bad candidates from args_enum.
 
 def _gof_prev_op_lower(prog):
     """Best-effort previous op name in lowercase."""
@@ -3124,6 +3125,15 @@ def _gof_wrap_shift_apply(op_obj):
                 depth = _gof_depth_of(prog)
                 if depth < 2 and _gof_prev_op_lower(prog) == "shift":
                     return None
+                if depth == 0:
+                    ints = _gof_collect_ints(*a)
+                    if len(ints) >= 2:
+                        try:
+                            dy, dx = int(ints[-2]), int(ints[-1])
+                            if dy == 0 and dx == 0:
+                                return None
+                        except Exception:
+                            pass
             return f(*a, **k)
 
         return _call
@@ -3296,7 +3306,7 @@ try:
             _REG[_k] = _gof_wrap_mark_last(_nm, _gof_wrap_phase_tile_identity(_op))
         elif _nm in ("remove_isolated", "keep_n_largest", "largest"):
             _REG[_k] = _gof_wrap_mark_last(_nm, _gof_wrap_single_int_arg(_op))
-        elif _nm == "shift":
+        elif "shift" in _nm:
             _op = _gof_wrap_shift_args_enum(_op)
             _op = _gof_wrap_shift_apply(_op)
             _REG[_k] = _gof_wrap_mark_last("shift", _op)

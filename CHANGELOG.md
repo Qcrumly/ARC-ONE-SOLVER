@@ -1,3 +1,8 @@
+## v2.9.24 — 2025-11-01
+- **Early shift de-dupe (alias-safe):** guards now attach to any operator whose name contains "shift" (e.g., `shift_xy`), blocking second shifts within the first two steps at both proposal and apply time.
+- **Depth-0 shift identity:** treat `shift(0,0)` as an identity move and refuse it as the opening action.
+- Completes the early-step guardrail suite alongside depth-0 size/identity bans and sanitized arguments/tokens.
+
 ## v2.9.23 — 2025-11-01
 - **Early shift de-dupe (final):** block a second `shift(...)` within the first two steps via both `args_enum` (proposal) and `apply` (execution), using `steps` and `_gof_last_op` as the sources of truth.
 - Completes the early-step guardrail suite: depth-0 size/identity bans, zero shift→shift openers, and fully sanitized arguments/tokens.
