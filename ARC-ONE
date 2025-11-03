@@ -126,20 +126,19 @@ except Exception:  # pragma: no cover - optional SciPy dependency
         h, w = arr.shape
         labels = np.zeros_like(arr, dtype=np.int32)
         current = 0
-        stack = []
         for y in range(h):
             for x in range(w):
                 if arr[y, x] and labels[y, x] == 0:
                     current += 1
                     labels[y, x] = current
-                    stack.append((y, x))
-                    while stack:
-                        yy, xx = stack.pop()
+                    dq = deque([(y, x)])
+                    while dq:
+                        yy, xx = dq.popleft()
                         for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                             ny, nx = yy + dy, xx + dx
                             if 0 <= ny < h and 0 <= nx < w and arr[ny, nx] and labels[ny, nx] == 0:
                                 labels[ny, nx] = current
-                                stack.append((ny, nx))
+                                dq.append((ny, nx))
         return labels, int(current)
 
 
@@ -2495,23 +2494,6 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                 except Exception:
                     i12 = 0.0
 
-            conf1 = 0.0
-            conf2 = 0.0
-            if isinstance(choice, dict):
-                try:
-                    conf1 = float(choice.get("conf1", 0.0) or 0.0)
-                except Exception:
-                    conf1 = 0.0
-                try:
-                    conf2 = float(choice.get("conf2", 0.0) or 0.0)
-                except Exception:
-                    conf2 = 0.0
-            dis = 1.0 - float(i12 or 0.0)
-            lam = getattr(settings, "div_lambda", 0.30) if settings else 0.30
-            scoreA = conf1 - lam * (1.0 - dis)
-            scoreB = conf2 - lam * (1.0 - dis)
-            pickB = scoreB > scoreA
-
             try:
                 train_pairs = pairs if pairs else []
                 comp_counts = []
@@ -2540,26 +2522,63 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
 
             att1_entry["grid"] = gA
             att2_entry["grid"] = gB
-            final_grid = gB if pickB else gA
+
+            conf1 = (choice or {}).get("conf1") if isinstance(choice, dict) else None
+            conf2 = (choice or {}).get("conf2") if isinstance(choice, dict) else None
+            try:
+                conf1 = float(conf1) if conf1 is not None else _surrogate_conf(att1_entry["grid"], belief)
+            except Exception:
+                conf1 = _surrogate_conf(att1_entry["grid"], belief)
+            try:
+                conf2 = float(conf2) if conf2 is not None else _surrogate_conf(att2_entry["grid"], belief)
+            except Exception:
+                conf2 = _surrogate_conf(att2_entry["grid"], belief)
+
+            i12_float = float(i12 if i12 is not None else 0.0)
+            dis = 1.0 - i12_float
+            lam = float(getattr(settings, "div_lambda", 0.30)) if settings else 0.30
+            mmrA = float(conf1) + lam * dis
+            mmrB = float(conf2) + lam * dis
+            pickB = mmrB > mmrA
+
+            final_grid = att2_entry["grid"] if pickB else att1_entry["grid"]
 
             entry = {
                 "attempt_1": att1_entry["grid"],
                 "attempt_2": att2_entry["grid"],
                 "grid": final_grid,
-                "_telemetry": telemetry,
-                "iou12": i12,
+                "_telemetry": {
+                    **telemetry,
+                    "chosen_attempt": "B" if pickB else "A",
+                    "conf1": float(conf1),
+                    "conf2": float(conf2),
+                    "mmrA": float(mmrA),
+                    "mmrB": float(mmrB),
+                },
+                "iou12": i12 if i12 is not None else i12_float,
             }
+
+            telemetry = entry["_telemetry"]
+            _cap_telemetry(telemetry)
+            att1_entry["_telemetry"] = telemetry
+            att2_entry["_telemetry"] = telemetry
+
             _telemetry_note(
                 entry,
                 seconds_after_schedule=float(getattr(settings, "max_seconds", 0.0) if settings else 0.0),
             )
             _telemetry_note(
                 entry,
+                dis=float(dis),
+                lam=float(lam),
+            )
+            _telemetry_note(
+                entry,
                 chosen=("B" if pickB else "A"),
                 conf1=float(conf1),
                 conf2=float(conf2),
-                dis=float(dis),
-                lam=float(lam),
+                mmrA=float(mmrA),
+                mmrB=float(mmrB),
             )
             cli_args = globals().get("_CLI_ARGS")
             if getattr(cli_args, "octo_stats_csv", None):

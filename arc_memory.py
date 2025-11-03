@@ -60,22 +60,54 @@ def _periodicity(grid: np.ndarray) -> List[int]:
     return [period1d(grid), period1d(grid.T)]
 
 
+def _layout_fp_from_train(train: List[dict]) -> Dict[str, Any]:
+    default = {"sym": {"H": 0, "V": 0, "R180": 0}, "period": [0, 0], "div": [0, 0]}
+    if not train:
+        return default
+
+    Hs, Ws = set(), set()
+    symH = symV = symR = 0
+    perR = perC = 0
+
+    for ex in train:
+        if not isinstance(ex, dict):
+            continue
+        grid = ex.get("output") or ex.get("input")
+        if grid is None:
+            continue
+        arr = np.asarray(grid)
+        if arr.ndim != 2:
+            continue
+        Hs.add(int(arr.shape[0]))
+        Ws.add(int(arr.shape[1]))
+        flags = _symmetry_flags_np(arr)
+        symH |= int(flags.get("H", 0))
+        symV |= int(flags.get("V", 0))
+        symR |= int(flags.get("R180", 0))
+        per_r, per_c = _periodicity(arr)
+        perR = max(perR, int(per_r))
+        perC = max(perC, int(per_c))
+
+    if not Hs or not Ws:
+        return default
+
+    div = [0, 0]
+    if perR and (min(Hs) % perR == 0):
+        div[0] = int(perR)
+    if perC and (min(Ws) % perC == 0):
+        div[1] = int(perC)
+
+    return {"sym": {"H": symH, "V": symV, "R180": symR}, "period": [int(perR), int(perC)], "div": div}
+
+
 def fingerprint_layout(task_json: Dict[str, Any]) -> Dict[str, Any]:
     train = task_json.get("train") or []
-    grid = None
-    if train and isinstance(train[0], dict):
-        grid = train[0].get("output") or train[0].get("input")
-    if grid is None:
+    if not isinstance(train, list):
         return {"sym": {"H": 0, "V": 0, "R180": 0}, "period": [0, 0], "div": [0, 0]}
-    arr = np.array(grid)
-    sym = _symmetry_flags_np(arr)
-    period = _periodicity(arr)
-    div = [0, 0]
-    if period[0] > 0 and arr.shape[0] % period[0] == 0:
-        div[0] = int(period[0])
-    if period[1] > 0 and arr.shape[1] % period[1] == 0:
-        div[1] = int(period[1])
-    return {"sym": sym, "period": period, "div": div}
+    try:
+        return _layout_fp_from_train(train)
+    except Exception:
+        return {"sym": {"H": 0, "V": 0, "R180": 0}, "period": [0, 0], "div": [0, 0]}
 
 
 def detect_family(layout_fp: Dict[str, Any]) -> str:
@@ -109,20 +141,48 @@ def op_prior_for_task(phi_family: str, priors: Dict[str, Any], alpha: float = 1.
 
 def choose_motifs(layout_fp: Dict[str, Any], motifs: Any, topk: int = 1) -> List[List[str]]:
     fam = detect_family(layout_fp)
+
+    def _iter_bucket(bucket: Any):
+        if isinstance(bucket, dict):
+            yield bucket
+        elif isinstance(bucket, (list, tuple)):
+            for item in bucket:
+                if isinstance(item, dict):
+                    yield item
+
+    def _safe_int(value: Any, default: int = 1) -> int:
+        try:
+            iv = int(value)
+        except Exception:
+            iv = default
+        return iv if iv > 0 else default
+
+    k = _safe_int(topk, 1)
+
+    primary: List[Dict[str, Any]] = []
+    alternates: List[Dict[str, Any]] = []
+
     if isinstance(motifs, dict):
-        bucket = motifs.get(fam, [])
+        primary = [m for m in _iter_bucket(motifs.get(fam, [])) if isinstance(m, dict)]
+        for key, bucket in motifs.items():
+            if key == fam:
+                continue
+            alternates.extend([m for m in _iter_bucket(bucket) if isinstance(m, dict)])
     else:
-        bucket = [m for m in (motifs or []) if m.get("family") == fam]
-    try:
-        scored = sorted(bucket, key=lambda m: -int(m.get("hit", 1)))
-    except Exception:
-        scored = []
+        all_motifs = [m for m in _iter_bucket(motifs or []) if isinstance(m, dict)]
+        primary = [m for m in all_motifs if m.get("family") == fam]
+        alternates = [m for m in all_motifs if m.get("family") != fam]
+
+    primary.sort(key=lambda m: -int(m.get("hit", 1)))
+    alternates.sort(key=lambda m: -int(m.get("hit", 1)))
+
+    bag = primary[: max(1, k)] + alternates[: max(0, k - 1)]
     chosen: List[List[str]] = []
-    for motif in scored[: max(0, int(topk))]:
+    for motif in bag:
         ops = motif.get("ops", [])
-        if isinstance(ops, list) and 1 <= len(ops) <= 6:
-            chosen.append(list(ops))
-    return chosen
+        if isinstance(ops, list) and ops:
+            chosen.append([str(t) for t in ops if isinstance(t, str)])
+    return chosen[: max(1, k)]
 
 
 # ---- token parsing ----------------------------------------------------------
