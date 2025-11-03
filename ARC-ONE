@@ -3,7 +3,15 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.10.3-hotfix1 — Exact-match exit guard + IoU fix
+# Version: v2.10.3-hotfix2 — Stack enumeration alignment + guarded toggles
+#
+# CHANGELOG
+# v2.10.3-hotfix2 (2025-11-03)
+# - Fix: stack enumeration filter checked the wrong arg index; no stack candidates were generated.
+#        Now checks axis in args[1], matching executor (axis = int(args[1])).
+# - Dev: Optional ARC_DEBUG_STACK=1 prints a sample of stack combos during enumeration.
+# - (Optional, guarded) Add scale_hard_thresh setting with env override ARC_SCALE_HARD_THRESH.
+# - (Optional, guarded) Prune masked identity tiling during enumeration at depth 0.
 #
 # v2.10.3-hotfix1 (2025-11-03)
 #   - Exact-match early exit is now robust: win logging is wrapped in try/except and task_id is resolved defensively, so a NameError can never block the return. The solver now always exits immediately on exact predictions.
@@ -59,7 +67,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.10.3-hotfix1"  # Exact-match exit guard + IoU fix
+__version__ = "v2.10.3-hotfix2"  # Stack enumeration alignment + guarded toggles
 
 last_best_program = None
 
@@ -4792,8 +4800,6 @@ def _gof_shield_resize_args_enum(op_obj):
         depth = 0
         if prog is not None:
             depth = _gof_prog_depth(prog)
-        if depth < K_NO_SIZEOPS_AT_START:
-            return iter(())
         s = 0.0
         if prog is not None:
             s = getattr(prog, "_rails_s", None)
@@ -4807,6 +4813,15 @@ def _gof_shield_resize_args_enum(op_obj):
             ia = int(ctx["in_shape"][0]) * int(ctx["in_shape"][1])
             oa = int(ctx["out_shape"][0]) * int(ctx["out_shape"][1])
             s = -1.0 if oa < 0.9 * ia else (+1.0 if oa > 1.1 * ia else 0.0)
+        hard = 1.0
+        env_val = os.getenv("ARC_SCALE_HARD_THRESH")
+        if env_val is not None:
+            try:
+                hard = float(env_val)
+            except Exception:
+                pass
+        if depth < K_NO_SIZEOPS_AT_START and abs(s) < hard:
+            return iter(())
         for args in old(*aa, **kk):
             try:
                 h, w = int(args[0]), int(args[1])
@@ -5145,7 +5160,16 @@ def _gate_allowed_ops(
         names -= (PALETTE_OPS & names)
 
     if depth < K_NO_SIZEOPS_AT_START:
-        names = {n for n in names if n not in _RESIZE_OPS and n not in _TILING_OPS}
+        try:
+            s = float(phi[0]) if (phi is not None and len(phi) > 0) else 0.0
+        except Exception:
+            s = 0.0
+        try:
+            hard = float(getattr(settings, "scale_hard_thresh", 1.0))
+        except Exception:
+            hard = 1.0
+        if abs(s) < hard:
+            names = {n for n in names if n not in _RESIZE_OPS and n not in _TILING_OPS}
 
     if getattr(settings, "rails_scale_hard", True) and phi is not None and len(phi) > 0:
         try:
@@ -5605,6 +5629,14 @@ class _InternalSearchSettings:
     hfp_gate_by_health: bool = True
     hfp_gate_keep: bool = True
     hfp_debug_telemetry: bool = True
+
+    def __post_init__(self):
+        env_val = os.getenv("ARC_SCALE_HARD_THRESH")
+        if env_val is not None:
+            try:
+                self.scale_hard_thresh = float(env_val)
+            except Exception:
+                pass
 
 
 def compute_cost(
@@ -6820,6 +6852,18 @@ def enumerate_args(op_name: str, param_types: List[str], ctx) -> List[Tuple[Any,
             if not (len(args) >= 2 and tuple(args[:2]) == (1, 1))
         ]
 
+    if op_name == "tile_masked" and depth_val == 0:
+        filtered = []
+        for args in combos:
+            if len(args) >= 2:
+                try:
+                    if int(args[0]) == 1 and int(args[1]) == 1:
+                        continue
+                except Exception:
+                    pass
+            filtered.append(args)
+        combos = filtered
+
     if op_name == "shift":
         filtered = []
         for args in combos:
@@ -6835,11 +6879,22 @@ def enumerate_args(op_name: str, param_types: List[str], ctx) -> List[Tuple[Any,
         combos = filtered
 
     if op_name == "stack":
-        combos = [
-            args
-            for args in combos
-            if args and args[0] in (0, 1)
-        ]
+        filtered = []
+        for args in combos:
+            if len(args) >= 2:
+                try:
+                    axis = int(args[1])
+                except Exception:
+                    continue
+                if axis in (0, 1):
+                    filtered.append(args)
+        combos = filtered
+        if os.getenv("ARC_DEBUG_STACK") == "1":
+            try:
+                sample = ", ".join(str(c) for c in combos[:4])
+                print(f"[enum/stack] sample: {sample}")
+            except Exception:
+                pass
 
     return combos
 
