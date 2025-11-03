@@ -145,6 +145,7 @@ DIVERSITY_MIN_THRESHOLD = 0.15
 SHAPE_MATCH_BONUS = 0.02
 RHO_HEALTHY = 0.80
 MAX_TELEMETRY_ITEMS = 50
+SEED = 0
 
 _CLI_ARGS: Optional[Any] = None
 
@@ -293,6 +294,71 @@ def _enqueue_seed_programs(
     return pushed
 
 
+def _collect_memory_motif_candidates(
+    task_json: Dict[str, Any],
+    memo: Dict[str, Any],
+    motif_topk: int,
+) -> List[Tuple[List[str], str, float, Program]]:
+    if MEM is None or motif_topk <= 0:
+        return []
+    try:
+        motifs_store = memo.get("motifs", {}) if isinstance(memo, dict) else {}
+    except Exception:
+        motifs_store = {}
+    if not motifs_store:
+        return []
+    train_entries = list(task_json.get("train", []))
+    families: List[str] = []
+    for ex in train_entries:
+        try:
+            fp = MEM.fingerprint_layout({"train": [ex]})
+            fam = MEM.detect_family(fp)
+        except Exception:
+            fam = None
+        if fam and fam not in families:
+            families.append(fam)
+    if not families:
+        try:
+            fp = MEM.fingerprint_layout(task_json)
+            fam = MEM.detect_family(fp)
+            if fam and fam not in families:
+                families.append(fam)
+        except Exception:
+            pass
+    try:
+        for fam in sorted(motifs_store.keys()):
+            if fam not in families:
+                families.append(fam)
+    except Exception:
+        pass
+    seen_tokens: Set[Tuple[str, Tuple[str, ...]]] = set()
+    candidates: List[Tuple[List[str], str, float, Program]] = []
+    for fam in families:
+        bucket = []
+        try:
+            bucket = list(motifs_store.get(fam, []))
+        except Exception:
+            bucket = []
+        for motif in bucket:
+            ops = motif.get("ops") if isinstance(motif, dict) else None
+            if not (isinstance(ops, list) and 1 <= len(ops) <= 6):
+                continue
+            tokens = [str(t) for t in ops]
+            key = (fam or "unknown", tuple(tokens))
+            if key in seen_tokens:
+                continue
+            seen_tokens.add(key)
+            prog = _program_from_ops_tokens(tokens)
+            if prog is None or not getattr(prog, "steps", None):
+                continue
+            try:
+                score = float(motif.get("hit", 1))
+            except Exception:
+                score = 1.0
+            candidates.append((tokens, fam or "unknown", score, prog))
+    return candidates
+
+
 def _parse_tokens_to_program(tokens: List[str]):
     """Compat shim for callers expecting the older helper name."""
     prog, _ = _parse_seed_tokens_to_program(tokens)
@@ -385,15 +451,12 @@ def _set_determinism(seed=0):
     os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 
-_set_determinism(0)
+_set_determinism(SEED)
 
 def _print_banner():
-    import os, random
+    import os
 
-    seed_val = globals().get("SEED", None)
-    if seed_val is None:
-        seed_val = os.environ.get("ARC_SEED") or 0
-    print(f"[ARC-ONE] seed={seed_val}  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
+    print(f"[ARC-ONE] seed={SEED}  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
 
 
 if __name__ == "__main__":
@@ -2009,6 +2072,41 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
                 stage_output = _solve_task_internal(tid, task_json, stage_settings)
             stage_times[name] = float(round(time.perf_counter() - start, 3))
 
+            if logger and hasattr(logger, "log"):
+                try:
+                    monitor = getattr(stage_settings, "_monitor", None)
+                    rho_sm = getattr(monitor, "rho_sm", None) if monitor else None
+                    R_last = getattr(monitor, "R_last", None) if monitor else None
+                    health = getattr(monitor, "health", None) if monitor else None
+                    should_break = bool(monitor.should_health_break()) if monitor else False
+                except Exception:
+                    monitor = None
+                    rho_sm = None
+                    R_last = None
+                    health = None
+                    should_break = False
+                attempt_forced = bool(getattr(stage_settings, "_attemptB_forced_alternate", False))
+                palette_unanimous = bool(getattr(stage_settings, "_palette_unanimous", False))
+                palette_mapping = getattr(stage_settings, "_palette_mapping", None)
+                tel = {
+                    "rho_sm": rho_sm,
+                    "R_last": R_last,
+                    "health": health,
+                    "should_break": should_break,
+                    "break_reason": "low-R" if should_break else None,
+                    "attemptB_forced_alternate": attempt_forced,
+                    "palette_unanimous": palette_unanimous,
+                    "palette_mapping": palette_mapping if palette_mapping else None,
+                    "t_skim": float(stage_times.get("skim", 0.0)),
+                    "t_main": float(stage_times.get("main", 0.0)),
+                    "t_polish": float(stage_times.get("polish", 0.0)),
+                    "stage_time": float(stage_times.get(name, 0.0)),
+                }
+                try:
+                    logger.log(tid, name, tel)
+                except Exception:
+                    pass
+
             pair = _normalize_two_attempts(stage_output)
             diversity = 1.0 - _pixel_iou(pair["attempt_1"], pair["attempt_2"])
 
@@ -2154,6 +2252,9 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             meta_dict = meta if isinstance(meta, dict) else {}
             belief = _build_belief(meta_dict, train_pairs=pairs)
 
+            palette_info = None
+            choice = None
+            forced_alternate = False
             if _is_masked_tiling(meta_dict):
                 att2 = _masked_tiling_alternate(base, meta)
                 policy_tag = "masked_raw"
@@ -2182,6 +2283,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     try:
                         forced = _attempt2_from_strategy(base, strategy, phi, pairs, test_in)
                         candidates.append({"tag": f"forced:{strategy}", "grid": forced, "conf": _surrogate_conf(forced, belief)})
+                        forced_alternate = True
                     except Exception:
                         pass
                 candidates.extend(_alternates_from_belief(base, test_in, belief, pairs))
@@ -2244,13 +2346,16 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         try:
                             regenerated = _regenerate_alt_from_different_bucket(base_ll, belief, pairs)
                             att2 = regenerated
+                            forced_alternate = True
                         except Exception:
                             att2 = np.rot90(np.asarray(base_ll), 2).tolist()
+                            forced_alternate = True
                 except Exception:
                     try:
                         att2 = np.rot90(np.asarray(base), 2).tolist()
                     except Exception:
                         att2 = base
+                    forced_alternate = True
 
                 cand_list: List[Dict[str, Any]] = []
                 for tag_name, grid_val in (("attemptA", base), ("attemptB", att2)):
@@ -2291,6 +2396,27 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
 
                 base = first_sel.get("grid") if isinstance(first_sel, dict) else first_sel
                 att2 = second_sel.get("grid") if isinstance(second_sel, dict) else second_sel
+
+                forced_flag = forced_alternate or (
+                    choice and isinstance(choice.get("tag"), str) and choice["tag"].startswith("forced:")
+                )
+                if forced_flag and not getattr(settings, "_attemptB_forced_alternate", False):
+                    setattr(settings, "_attemptB_forced_alternate", True)
+
+                palette_status = None
+                palette_map_payload = None
+                if palette_info:
+                    palette_status = palette_info.get("palette_map_status")
+                    if palette_info.get("palette_map"):
+                        try:
+                            palette_map_payload = dict(palette_info["palette_map"])
+                        except Exception:
+                            palette_map_payload = None
+                setattr(settings, "_palette_unanimous", bool(palette_status == "unanimous"))
+                if palette_map_payload is not None:
+                    setattr(settings, "_palette_mapping", palette_map_payload)
+                elif palette_status is not None:
+                    setattr(settings, "_palette_mapping", None)
 
                 gof_payload = dict(telemetry_kwargs)
                 gof_payload.update(
@@ -6585,6 +6711,18 @@ class StepLogger:
         status = "✓ SOLVED" if success else "✗ UNSOLVED"
         print(f"{status} ({elapsed:.1f}s)")
 
+    def log(self, task_id: str, stage: str, payload: Dict[str, Any]):
+        """Structured per-stage telemetry logging."""
+        record = {"task_id": task_id, "stage": stage}
+        data = payload or {}
+        try:
+            record.update(data)
+        except Exception:
+            record["payload"] = data
+        if self.jsonl_file:
+            self.jsonl_file.write(json.dumps(record) + "\n")
+            self.jsonl_file.flush()
+
 
 # ============================================================================
 # ============ solver/task_solver.py ============
@@ -6720,13 +6858,57 @@ def _solve_task_internal(
                     priors_applied = True
             if getattr(settings, "memory_use_motifs", True):
                 motif_topk = int(max(0, getattr(settings, "motif_topk", 0) or 0))
-                motif_tokens = MEM.choose_motifs(layout_fp, memo.get("motifs", {}), topk=motif_topk)
-                for toks in motif_tokens:
-                    toks_list = [str(t) for t in toks]
-                    seed_token_lists.append(toks_list)
-                    prog = _program_from_ops_tokens(toks_list)
-                    if prog is not None and prog.steps:
+                candidates = _collect_memory_motif_candidates(task_json, memo, motif_topk)
+                picked: List[Tuple[List[str], str, float, Program]] = []
+                if candidates:
+                    limit = min(motif_topk, 3) if motif_topk else 0
+                    best_per_family: Dict[str, Tuple[List[str], str, float, Program]] = {}
+                    for cand in candidates:
+                        tokens, fam, score, prog = cand
+                        fam_key = fam or "unknown"
+                        existing = best_per_family.get(fam_key)
+                        if existing is None or score > existing[2]:
+                            best_per_family[fam_key] = cand
+                    if limit:
+                        for cand in sorted(best_per_family.values(), key=lambda t: -t[2]):
+                            if len(picked) >= limit:
+                                break
+                            picked.append(cand)
+                        if len(picked) < limit:
+                            for cand in sorted(candidates, key=lambda t: -t[2]):
+                                if cand in picked:
+                                    continue
+                                picked.append(cand)
+                                if len(picked) >= limit:
+                                    break
+                    effect_sigs: Set[Any] = set()
+                    for tokens, fam, score, prog in picked:
+                        if prog is None or not getattr(prog, "steps", None):
+                            continue
+                        sig = None
+                        try:
+                            previews = []
+                            for xi, _yi in train_pairs[:2]:
+                                pred = interpret_program(prog, xi)
+                                arr = np.asarray(pred)
+                                previews.append(tuple(tuple(int(v) for v in row) for row in arr.tolist()))
+                            sig = tuple(previews)
+                        except Exception:
+                            sig = None
+                        if sig is not None:
+                            if sig in effect_sigs:
+                                continue
+                            effect_sigs.add(sig)
+                        seed_token_lists.append(list(tokens))
                         seeded_programs.append(prog)
+                else:
+                    motif_tokens = MEM.choose_motifs(layout_fp, memo.get("motifs", {}), topk=motif_topk)
+                    for toks in motif_tokens:
+                        toks_list = [str(t) for t in toks]
+                        seed_token_lists.append(toks_list)
+                        prog = _program_from_ops_tokens(toks_list)
+                        if prog is not None and prog.steps:
+                            seeded_programs.append(prog)
         except Exception as mem_exc:
             print(f"[MEMORY] disabled ({mem_exc})")
             memo = {}
@@ -6753,6 +6935,9 @@ def _solve_task_internal(
 
     trace = getattr(settings, "_trace_ops", False)
     settings._trace_buffer = []
+    setattr(settings, "_attemptB_forced_alternate", False)
+    setattr(settings, "_palette_unanimous", False)
+    setattr(settings, "_palette_mapping", None)
 
     monitor = SelfMonitor(settings)
     setattr(settings, "_monitor", monitor)
@@ -7882,6 +8067,13 @@ Examples:
 
     global _CLI_ARGS
     _CLI_ARGS = args
+
+    global SEED
+    try:
+        SEED = int(args.seed)
+    except Exception:
+        SEED = 0
+    _set_determinism(SEED)
 
     if not _NUMPY_AVAILABLE:
         print(f"ERROR: {_NUMPY_IMPORT_ERROR}", file=sys.stderr)
