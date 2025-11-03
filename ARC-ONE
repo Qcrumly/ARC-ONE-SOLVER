@@ -7800,7 +7800,7 @@ def _solve_task_internal(
 
     # Meta-controller (opt-in)
     meta = None
-    if settings.use_meta_controller:
+    if getattr(settings, "use_meta_controller", False):
         meta = getattr(_solve_task_internal, "_META", None)
         if meta is None:
             meta = MetaControllerUCB()
@@ -9224,6 +9224,7 @@ class SearchSettings:
     priors_alpha: float = 1.0
     motif_topk: int = 1
     diversity_guard: bool = True
+    use_meta_controller: bool = _envbool("ARC_USE_META", False)
     diversity_b_force_first: bool = False
     attemptB_beam_scale: float = 1.0
     attemptB_time_scale: float = 1.0
