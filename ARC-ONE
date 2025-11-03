@@ -4884,7 +4884,8 @@ def _gof_shield_resize_args_enum(op_obj):
                 hard = float(env_val)
             except Exception:
                 pass
-        if depth < K_NO_SIZEOPS_AT_START and abs(s) < hard:
+        k_no_sizeops = getattr(settings, "K_NO_SIZEOPS_AT_START", K_NO_SIZEOPS_AT_START)
+        if depth < max(0, int(k_no_sizeops)) and abs(s) < hard:
             return iter(())
         for args in old(*aa, **kk):
             try:
@@ -5223,7 +5224,8 @@ def _gate_allowed_ops(
     if depth < max(0, k_palette):
         names -= (PALETTE_OPS & names)
 
-    if depth < K_NO_SIZEOPS_AT_START:
+    k_no_sizeops = getattr(settings, "K_NO_SIZEOPS_AT_START", K_NO_SIZEOPS_AT_START)
+    if depth < max(0, int(k_no_sizeops)):
         try:
             s = float(phi[0]) if (phi is not None and len(phi) > 0) else 0.0
         except Exception:
@@ -5627,15 +5629,15 @@ class _InternalSearchSettings:
     beam_width: int = 128
     max_depth: int = 10
     max_seconds: float = 3.0
-    lambda_len: float = 0.20
-    lambda1: float = 0.30  # program tension weight
-    lambda2: float = 0.20  # slice tension weight
+    lambda_len: float = _envfloat("ARC_LAMBDA_LEN", 0.02)
+    lambda1: float = _envfloat("ARC_LAMBDA1", 0.30)  # program tension weight
+    lambda2: float = _envfloat("ARC_LAMBDA2", 0.20)  # slice tension weight
     slice_guard_thresh: float = 0.80
     allow_offslice_early: bool = False
     public_mode: bool = False
-    log_every: int = 200
+    log_every: int = _envint("ARC_LOG_EVERY", 200)
     seed: int = 1337
-    _disable_rotation: bool = False
+    _disable_rotation: bool = _envbool("ARC_DISABLE_ROTATION", False)
     max_train_pairs_for_beam: int = 2
     use_meta_controller: bool = False
     always_two_attempts: bool = False  # wrapper now manages alternates; keep default conservative
@@ -5643,8 +5645,8 @@ class _InternalSearchSettings:
     allow_finishers_on_masked: bool = False
     no_polish: bool = False
     stop_if_diversity: float = 0.20
-    div_lambda: float = 0.70
-    iou_cap: float = 0.92
+    div_lambda: float = _envfloat("ARC_DIV_LAMBDA", 0.70)
+    iou_cap: float = _envfloat("ARC_IOU_CAP", 0.92)
     max_bounces: int = 8
     _hfp_prevC: Optional[float] = None
     _hfp_rho: Optional[float] = None
@@ -5665,14 +5667,14 @@ class _InternalSearchSettings:
     # GOF-9000 constraint pack
     block_identity: bool = True
     rails_scale_hard: bool = True
-    scale_hard_thresh: float = 0.60
+    scale_hard_thresh: float = _envfloat("ARC_SCALE_HARD_THRESH", 0.60)
     scale_hard_steps: int = 3
     early_palette_block_steps: int = 3
     # GOF-9000 SelfMonitor defaults
     monitor_enable: bool = True
     monitor_pressure_thresh: float = 0.70
-    monitor_plateau_N: int = 3
-    monitor_visited_cap: int = 50000
+    monitor_plateau_N: int = _envint("ARC_PLATEAU_N", 10)
+    monitor_visited_cap: int = _envint("ARC_VISITED_CAP", 8192)
     monitor_inject_underused: bool = True
     monitor_drop_dupe_sigs: bool = True
     # === Memory v1.0 ===
@@ -5684,23 +5686,24 @@ class _InternalSearchSettings:
     motif_topk: int = 1                     # max motifs to seed
     diversity_guard: bool = True            # A/B diversity guard
     diversity_b_force_first: bool = False   # force different first op for B when align-first
-    attemptB_beam_scale: float = 1.0        # heuristic scaling for diversity alt
-    attemptB_time_scale: float = 1.0        # heuristic scaling for debate/time
-    attemptB_auto_boost: bool = True        # auto-boost B when IoU cap keeps triggering
-    attemptB_boost_beam: float = 1.5
-    attemptB_boost_time: float = 1.3
-    shaped_cost: bool = True
-    explore_fraction: float = 0.35
-    allow_uphill: bool = True
-    uphill_keep_fraction: float = 0.15
-    ephemeral_macros: bool = False
-    macro_max_depth_start: int = 2
-    macro_candidates_limit: int = 6
+    attemptB_beam_scale: float = _envfloat("ARC_ATTEMPTB_BEAM_SCALE", 1.0)        # heuristic scaling for diversity alt
+    attemptB_time_scale: float = _envfloat("ARC_ATTEMPTB_TIME_SCALE", 1.0)        # heuristic scaling for debate/time
+    attemptB_auto_boost: bool = _envbool("ARC_ATTEMPTB_AUTO_BOOST", True)        # auto-boost B when IoU cap keeps triggering
+    attemptB_boost_beam: float = _envfloat("ARC_ATTEMPTB_BOOST_BEAM", 1.5)
+    attemptB_boost_time: float = _envfloat("ARC_ATTEMPTB_BOOST_TIME", 1.3)
+    shaped_cost: bool = _envbool("ARC_SHAPED_COST", True)
+    explore_fraction: float = _envfloat("ARC_EXPLORE_FRAC", 0.35)
+    allow_uphill: bool = _envbool("ARC_ALLOW_UPHILL", True)
+    uphill_keep_fraction: float = _envfloat("ARC_UPHILL_KEEP", 0.15)
+    ephemeral_macros: bool = _envbool("ARC_EPHEMERAL_MACROS", False)
+    macro_max_depth_start: int = _envint("ARC_MACRO_MAX_DEPTH_START", 2)
+    macro_candidates_limit: int = _envint("ARC_MACRO_LIMIT", 6)
     hfp_enable: bool = True
     hfp_alpha: float = 0.50
     hfp_rho_hi: float = 0.80
     hfp_rho_lo: float = 0.55
-    hfp_break_R_min: float = 0.010
+    hfp_break_R_min: float = _envfloat("ARC_R_BREAK", 0.0)
+    _hfp_R_good: float = _envfloat("ARC_R_GOOD", 0.0)
     hfp_gate_by_health: bool = True
     hfp_gate_keep: bool = True
     hfp_debug_telemetry: bool = True
@@ -7358,7 +7361,7 @@ class MetaControllerUCB:
 
 def should_rotate(state: ControllerState, current_cost: float, settings: _InternalSearchSettings) -> bool:
     """Decide if controller should rotate to next mode."""
-    if settings._disable_rotation:
+    if getattr(settings, "_disable_rotation", False):
         return False
 
     # Rotate if cost isn't improving
@@ -7640,6 +7643,8 @@ def _solve_task_internal(
           where attempt_2 uses the alternate mode (0↔1 swap)
         - Otherwise: Returns list of grids (np.ndarray format)
     """
+    _ensure_settings_defaults(settings)
+
     if logger:
         logger.log_task_start(task_id)
 
@@ -9198,6 +9203,7 @@ class SearchSettings:
     block_identity: bool = True
     rails_scale_hard: bool = True
     scale_hard_thresh: float = _envfloat("ARC_SCALE_HARD_THRESH", 0.60)
+    K_NO_SIZEOPS_AT_START: int = _envint("ARC_NO_SIZEOPS_DEPTH", 1)
     scale_hard_steps: int = 3
     early_palette_block_steps: int = 3
     # Palette test policy (optional)
@@ -9205,8 +9211,8 @@ class SearchSettings:
     # --- GOF-9000 SelfMonitor -----------------------------------------------
     monitor_enable: bool = True
     monitor_pressure_thresh: float = 0.70
-    monitor_plateau_N: int = 3
-    monitor_visited_cap: int = 50000
+    monitor_plateau_N: int = _envint("ARC_PLATEAU_N", 10)
+    monitor_visited_cap: int = _envint("ARC_VISITED_CAP", 8192)
     monitor_inject_underused: bool = True
     monitor_drop_dupe_sigs: bool = True
     # --- HFP × GOF integration (v2.9.34) -------------------------------------
@@ -9214,7 +9220,8 @@ class SearchSettings:
     hfp_alpha: float = 0.50
     hfp_rho_hi: float = 0.80
     hfp_rho_lo: float = 0.55
-    hfp_break_R_min: float = 0.010
+    hfp_break_R_min: float = _envfloat("ARC_R_BREAK", 0.0)
+    _hfp_R_good: float = _envfloat("ARC_R_GOOD", 0.0)
     hfp_gate_by_health: bool = True
     hfp_gate_keep: bool = True
     hfp_debug_telemetry: bool = True
@@ -9227,9 +9234,10 @@ class SearchSettings:
     motif_topk: int = 1
     diversity_guard: bool = True
     use_meta_controller: bool = _envbool("ARC_USE_META", False)
+    enable_two_attempts: bool = _envbool("ARC_TWO_ATTEMPTS", True)
     diversity_b_force_first: bool = False
-    attemptB_beam_scale: float = 1.0
-    attemptB_time_scale: float = 1.0
+    attemptB_beam_scale: float = _envfloat("ARC_ATTEMPTB_BEAM_SCALE", 1.0)
+    attemptB_time_scale: float = _envfloat("ARC_ATTEMPTB_TIME_SCALE", 1.0)
     div_lambda: float = _envfloat("ARC_DIV_LAMBDA", 0.70)
     iou_cap: float = _envfloat("ARC_IOU_CAP", 0.92)
     attemptB_auto_boost: bool = _envbool("ARC_ATTEMPTB_AUTO_BOOST", True)
@@ -9243,16 +9251,53 @@ class SearchSettings:
     macro_max_depth_start: int = _envint("ARC_MACRO_MAX_DEPTH_START", 2)
     macro_candidates_limit: int = _envint("ARC_MACRO_LIMIT", 6)
     # cost weights (align with internal solver defaults)
-    lambda_len: float = _envfloat("ARC_LAMBDA_LEN", 0.20)
+    lambda_len: float = _envfloat("ARC_LAMBDA_LEN", 0.02)
     lambda1: float = _envfloat("ARC_LAMBDA1", 0.30)
     lambda2: float = _envfloat("ARC_LAMBDA2", 0.20)
+    _disable_rotation: bool = _envbool("ARC_DISABLE_ROTATION", False)
     max_bounces: int = 8
+
+
+def _ensure_settings_defaults(settings):
+    """Back-fill expected attributes on older settings objects."""
+    defaults = {
+        "log_every": 200,
+        "use_meta_controller": False,
+        "lambda_len": 0.02,
+        "lambda1": 0.30,
+        "lambda2": 0.20,
+        "iou_cap": 0.92,
+        "div_lambda": 0.70,
+        "enable_two_attempts": True,
+        "attemptB_beam_scale": 1.0,
+        "attemptB_time_scale": 1.0,
+        "attemptB_auto_boost": True,
+        "attemptB_boost_beam": 1.5,
+        "attemptB_boost_time": 1.3,
+        "K_NO_SIZEOPS_AT_START": 1,
+        "scale_hard_thresh": 0.60,
+        "hfp_break_R_min": 0.0,
+        "_hfp_R_good": 0.0,
+        "_disable_rotation": False,
+        "shaped_cost": True,
+        "explore_fraction": 0.35,
+        "allow_uphill": True,
+        "uphill_keep_fraction": 0.15,
+        "monitor_plateau_N": 10,
+        "monitor_visited_cap": 8192,
+    }
+    for attr, default in defaults.items():
+        if not hasattr(settings, attr):
+            setattr(settings, attr, default)
+    return settings
+
 
 _INTERNAL_SETTINGS_CLS = globals().get("_InternalSearchSettings")
 _SETTINGS_SYNC_ATTRS = (
     "beam_width",
     "max_depth",
     "max_seconds",
+    "log_every",
     "block_identity",
     "rails_scale_hard",
     "scale_hard_thresh",
@@ -9280,6 +9325,10 @@ _SETTINGS_SYNC_ATTRS = (
     "attemptB_boost_time",
     "div_lambda",
     "iou_cap",
+    "lambda_len",
+    "lambda1",
+    "lambda2",
+    "_disable_rotation",
     "shaped_cost",
     "explore_fraction",
     "allow_uphill",
