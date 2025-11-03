@@ -4,7 +4,7 @@ import json
 import math
 import os
 import re  # FIX: needed by _OP_TOKEN_RE
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -180,10 +180,16 @@ def choose_motifs(layout_fp: Dict[str, Any], motifs: Any, topk: int = 1) -> List
 
     bag = primary[:k] + alternates[: max(0, k - 1)]
     chosen: List[List[str]] = []
+    seen: set[Tuple[str, ...]] = set()
     for motif in bag:
         ops = motif.get("ops", [])
-        if isinstance(ops, list) and ops:
-            chosen.append([str(t) for t in ops if isinstance(t, str)])
+        if not isinstance(ops, list) or not ops:
+            continue
+        ops_tuple = tuple(str(t) for t in ops if isinstance(t, str))
+        if not ops_tuple or ops_tuple in seen:
+            continue
+        seen.add(ops_tuple)
+        chosen.append(list(ops_tuple))
 
     return chosen[:k] if chosen else []
 

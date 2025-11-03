@@ -1,7 +1,7 @@
 # ARC‑ONE (Octonionic Control Overlay ARC solver)
 
 **What this is (one lungful).**
-ARC‑ONE v2.10.3-hotfix1 couples a compact ARC DSL (ops like `tile`, `rot90`, `keep_n_largest`, …) with octonion task embeddings **φ** that steer a staged beam-search pipeline (**skim → main → polish**). The solver now drives two diverse attempts via a strict confidence-minus-IoU chooser, protects them with the GOF-9000 self-monitor + HFP health gates, and lands solutions with palette-safe finishers. Telemetry (JSONL + optional CSVs) keeps the entire run explainable.
+ARC‑ONE v2.10.3-hotfix2 couples a compact ARC DSL (ops like `tile`, `rot90`, `keep_n_largest`, …) with octonion task embeddings **φ** that steer a staged beam-search pipeline (**skim → main → polish**). The solver now drives two diverse attempts via a strict confidence-minus-IoU chooser, protects them with the GOF-9000 self-monitor + HFP health gates, and lands solutions with palette-safe finishers. Telemetry (JSONL + optional CSVs) keeps the entire run explainable.
 
 ## Quick start
 Requires Python, `numpy`, `scipy` (for connected components).
@@ -47,6 +47,7 @@ Telemetry: `--jsonl`, `--exact_wins_csv`, `--octo_stats_csv`, `--public_mode`
 * Exact-match exits are hardened (no NameErrors) and pixel IoU guards tolerate empty grids.
 * SciPy is optional—connected components falls back to a pure NumPy implementation.
 * Memory v1.0 loads read-only motifs/priors; missing files simply disable the feature.
+* Stack candidates are enumerated again (axis guard in v2.10.3-hotfix2). Set `ARC_DEBUG_STACK=1` to print sample combinations during search debugging.
 
 ### Memory v1.0 (read-only) & Diversity Guard
 
