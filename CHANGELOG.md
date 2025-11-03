@@ -1,3 +1,11 @@
+## v2.10.3 (2025-11-03)
+- Strict two-attempts chooser: Attempt-B picked by score = conf - λ·IoU(first), with hard IoU cap.
+- Optional CSV logs: exact-win attribution (which op closed the solution) and octonion-telemetry (x_oct + confounds).
+- Robust seed parsing: prefer arc_memory.parse_op_tokens; normalize bare tokens to name() / name(1).
+- SciPy-free fallback for connected components labeling.
+- Vectorized pixel IoU; applied small telemetry size cap to prevent runaway logs.
+- Kept everything Kaggle-safe and off by default unless flags are passed.
+
 ## v2.10.1 — Memory v1.0 + Diversity Guard (2025-11-02)
 - **Memory v1.0 (read-only):** Loads `memory_bank/{priors,motifs,layouts,shapes}.json` once, fingerprints task layouts, and caches the detected family on the settings object.
 - **Soft priors:** Applies bounded logit boosts to successor ordering using `--priors_alpha` per φ-family; safely no-ops when files are absent.
