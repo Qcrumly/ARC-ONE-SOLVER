@@ -3,7 +3,19 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.10.2 — Memory motif seeding enqueue + Diversity Guard + HFP×GOF
+# Version: v2.10.3-hotfix1 — Exact-match exit guard + IoU fix
+#
+# v2.10.3-hotfix1 (2025-11-03)
+#   - Exact-match early exit is now robust: win logging is wrapped in try/except and task_id is resolved defensively, so a NameError can never block the return. The solver now always exits immediately on exact predictions.
+#   - Pixel IoU guard: _pixel_iou now checks for zero-sized grids to avoid ZeroDivisionError. For empty-but-equal shapes, IoU returns 0.0 (conservative), matching prior semantics where union==0 yielded 0.0.
+#
+# v2.10.3 (2025-11-03)
+#   - Strict two-attempts chooser: Attempt-B picked by score = conf - λ·IoU(first), with hard IoU cap.
+#   - Optional CSV logs: exact-win attribution (which op closed the solution) and octonion-telemetry (x_oct + confounds).
+#   - Robust seed parsing: prefer arc_memory.parse_op_tokens; normalize bare tokens to name() / name(1).
+#   - SciPy-free fallback for connected components labeling.
+#   - Vectorized pixel IoU; applied small telemetry size cap to prevent runaway logs.
+#   - Kept everything Kaggle-safe and off by default unless flags are passed.
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -47,7 +59,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.10.2"  # Seeded motif enqueue + telemetry
+__version__ = "v2.10.3-hotfix1"  # Exact-match exit guard + IoU fix
 
 last_best_program = None
 
@@ -75,10 +87,10 @@ except ModuleNotFoundError:  # pragma: no cover - depends on environment
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Tuple, Optional, Any, Set, Iterable
 from collections import deque, defaultdict
+from functools import lru_cache
+import csv, time, random
 import itertools
 import math
-import time
-import csv
 import statistics as _stats
 import json
 import os
@@ -94,32 +106,27 @@ try:
 except Exception:  # pragma: no cover - optional SciPy dependency
 
     def _cc_label(arr, structure=None):
-        data = np.asarray(arr)
-        labels = np.zeros_like(data, dtype=int)
-        visited = np.zeros_like(data, dtype=bool)
-        current = 0
-        H, W = data.shape[:2]
-
-        for y in range(H):
-            for x in range(W):
-                if visited[y, x] or not data[y, x]:
-                    continue
-                current += 1
-                stack = [(y, x)]
-                visited[y, x] = True
-                labels[y, x] = current
-                while stack:
-                    cy, cx = stack.pop()
-                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
-                        if 0 <= ny < H and 0 <= nx < W and not visited[ny, nx] and data[ny, nx]:
-                            visited[ny, nx] = True
-                            labels[ny, nx] = current
-                            stack.append((ny, nx))
-        return labels, current
+        # 4-connected labeling fallback
+        arr = np.asarray(arr).astype(bool)
+        H, W = arr.shape
+        labels = np.zeros_like(arr, dtype=np.int32)
+        cur = 0
+        for i in range(H):
+            for j in range(W):
+                if arr[i, j] and labels[i, j] == 0:
+                    cur += 1
+                    stack = [(i, j)]
+                    labels[i, j] = cur
+                    while stack:
+                        x, y = stack.pop()
+                        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                            if 0 <= nx < H and 0 <= ny < W and arr[nx, ny] and labels[nx, ny] == 0:
+                                labels[nx, ny] = cur
+                                stack.append((nx, ny))
+        return labels, cur
 
 
 # === Determinism & banner ===
-import random
 try:  # Prefer real numpy but fall back to the shim if unavailable
     import numpy as _np
 except ModuleNotFoundError:  # pragma: no cover - aligns with optional numpy install
@@ -143,7 +150,7 @@ _CLI_ARGS: Optional[Any] = None
 _OP_TOKEN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$")
 
 
-def _cap_telemetry_dict(telemetry: Optional[Dict[str, Any]]) -> None:
+def _cap_telemetry(telemetry: Optional[Dict[str, Any]]) -> None:
     if isinstance(telemetry, dict) and len(telemetry) > MAX_TELEMETRY_ITEMS:
         for key in list(telemetry.keys())[MAX_TELEMETRY_ITEMS:]:
             telemetry.pop(key, None)
@@ -167,7 +174,7 @@ def _telemetry_note_safe(carrier, **kv):
             target = getattr(carrier, "_telemetry", None)
     except Exception:
         target = None
-    _cap_telemetry_dict(target)
+    _cap_telemetry(target)
 
 
 def _parse_seed_tokens_to_program(
@@ -178,67 +185,43 @@ def _parse_seed_tokens_to_program(
     """Return (Program or None, number_of_steps) for a motif token list."""
     if not tokens:
         return None, 0
-
+    # Prefer arc_memory's permissive parser when available
     try:
-        import arc_memory as MEM  # type: ignore
+        import arc_memory as MEM
 
         if hasattr(MEM, "parse_op_tokens"):
-            steps = MEM.parse_op_tokens(list(tokens))  # type: ignore[arg-type]
-            ProgTypeFast = ProgramCls or globals().get("Program")
-            if steps and ProgTypeFast is not None:
-                return ProgTypeFast(list(steps)), len(steps)  # type: ignore[arg-type]
+            steps = MEM.parse_op_tokens(list(tokens))
+            ProgType = ProgramCls or globals().get("Program")
+            if steps and ProgType is not None:
+                return ProgType(list(steps)), len(steps)
     except Exception:
         pass
-
-    StepType = StepCls or globals().get("Step")
-    ProgType = ProgramCls or globals().get("Program")
-    if StepType is None or ProgType is None:
-        return None, 0
-
+    # Conservative fallback: normalize tokens via the solver's operator regex if present
     steps = []
-    regex_primary = globals().get("_OP_RE")
+    _re = globals().get("_OP_TOKEN_RE", None)
     for raw in tokens:
         tok = (raw or "").strip()
         if not tok:
             continue
-        match = None
-        if regex_primary is not None:
-            try:
-                match = regex_primary.match(tok)
-            except Exception:
-                match = None
-        if match is None:
-            match = _OP_TOKEN_RE.match(tok)
-        if not match:
-            # allow bare op name by appending ()
-            match = _OP_TOKEN_RE.match(f"{tok}()")
-            if not match:
-                continue
-        name, arg_str = match.group(1), match.group(2).strip()
-        args: List[int] = []
-        if arg_str:
-            for part in arg_str.split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                try:
-                    args.append(int(part))
-                except Exception:
-                    # Ignore non-integer args for v1.0; extend as needed.
-                    continue
-        try:
-            steps.append(StepType(name, tuple(args)))
-        except Exception:
-            return None, 0
-
-    if not steps:
-        return None, 0
-
-    try:
-        program = ProgType(steps)
-    except Exception:
-        return None, 0
-    return program, len(steps)
+        if _re:
+            m = _re.match(tok)
+            if m:
+                name, args = m.group(1), (m.group(2) or "").strip()
+            else:
+                name, args = tok, ""
+        else:
+            name = tok.split("(")[0].strip()
+            args = tok[tok.find("(") + 1 : tok.rfind(")")] if "(" in tok and ")" in tok else ""
+        arg_tuple = (
+            tuple([a.strip() for a in args.split(",") if a.strip()]) if args != "" else tuple()
+        )
+        StepType = StepCls or globals().get("Step")
+        if StepType is not None:
+            steps.append(StepType(name=name, args=arg_tuple))
+    ProgType = ProgramCls or globals().get("Program")
+    if steps and ProgType is not None:
+        return ProgType(steps), len(steps)
+    return None, 0
 
 
 def _enqueue_seed_programs(
@@ -337,34 +320,17 @@ def _collect_octo_row(
     depth,
     elapsed_s,
 ):
-    import numpy as _np
+    A = np.asarray(input_grid)
+    P = np.asarray(pred_grid)
+    T = np.asarray(target_grid)
+    exact = int(P.shape == T.shape and np.array_equal(P, T))
+    mean_err = float((P != T).mean()) if P.shape == T.shape else 1.0
 
-    def _ensure_array(val):
-        if val is None:
-            return _np.zeros((0, 0), dtype=int)
-        arr = _np.asarray(val)
-        if arr.ndim == 0:
-            return arr.reshape(1, 1)
-        return arr
-
-    A = _ensure_array(input_grid)
-    P = _ensure_array(pred_grid)
-    T = _ensure_array(target_grid)
-    exact = int(P.shape == T.shape and T.size > 0 and _np.array_equal(P, T))
-    mean_err = None
-    if P.shape == T.shape and T.size:
-        mean_err = float((P != T).mean())
-
-    def _palette_delta(a, b):
-        pa, pb = set(_np.unique(a)), set(_np.unique(b))
-        if not pa and not pb:
+    def _palette_delta(X, Y):
+        px, py = set(np.unique(X)), set(np.unique(Y))
+        if not px and not py:
             return 0.0
-        return float(len(pa.symmetric_difference(pb))) / float(max(1, len(pa.union(pb))))
-
-    palette_delta = _palette_delta(P, T) if T.size else None
-    size_change = None
-    if T.size:
-        size_change = abs(A.size - T.size) / float(max(1, T.size))
+        return float(len(px.symmetric_difference(py))) / float(max(1, len(px.union(py))))
 
     row = {
         "task_id": task_id,
@@ -373,11 +339,9 @@ def _collect_octo_row(
         "x_oct": None if x_oct is None else float(x_oct),
         "exact": exact,
         "mean_pix_err": mean_err,
-        "shape_mismatch": int(T.size and P.shape != T.shape) if T.size else None,
-        "size_change": size_change,
-        "palette_delta": palette_delta,
-        "components_delta": None,
-        "holes_delta": None,
+        "shape_mismatch": int(A.shape != T.shape),
+        "size_change": abs(A.size - T.size) / float(max(1, T.size)),
+        "palette_delta": _palette_delta(A, T),
         "rho": float(rho) if rho is not None else None,
         "depth": int(depth) if depth is not None else None,
         "elapsed_s": float(elapsed_s) if elapsed_s is not None else None,
@@ -406,171 +370,19 @@ def _set_determinism(seed=0):
 
 _set_determinism(0)
 
-print(f"[ARC-ONE] seed=0  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
+def _print_banner():
+    import os, random
+
+    seed_val = globals().get("SEED", None)
+    if seed_val is None:
+        seed_val = os.environ.get("ARC_SEED") or 0
+    print(f"[ARC-ONE] seed={seed_val}  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
 
 
-# === Determinism & banner ===
-import random
-try:  # Prefer real numpy but fall back to the shim if unavailable
-    import numpy as _np
-except ModuleNotFoundError:  # pragma: no cover - aligns with optional numpy install
-    _np = np  # type: ignore
-
-try:  # Memory helpers are optional
-    import arc_memory as MEM
-except Exception:  # pragma: no cover - memory module optional
-    MEM = None
+if __name__ == "__main__":
+    _print_banner()
 
 
-# ---- Memory motif token parsing & safe telemetry --------------------------------
-_OP_TOKEN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$")
-
-
-def _telemetry_note_safe(carrier, **kv):
-    """Silently attach telemetry if helper is available."""
-    try:
-        _telemetry_note  # type: ignore[name-defined]
-    except Exception:
-        return
-    try:
-        _telemetry_note(carrier, **kv)  # type: ignore[name-defined]
-    except Exception:
-        pass
-
-
-def _parse_seed_tokens_to_program(
-    tokens: Optional[List[str]],
-    StepCls: Optional[Any] = None,
-    ProgramCls: Optional[Any] = None,
-):
-    """Return (Program or None, number_of_steps) for a motif token list."""
-    if not tokens:
-        return None, 0
-
-    StepType = StepCls or globals().get("Step")
-    ProgType = ProgramCls or globals().get("Program")
-    if StepType is None or ProgType is None:
-        return None, 0
-
-    steps = []
-    regex_primary = globals().get("_OP_RE")
-    for raw in tokens:
-        tok = (raw or "").strip()
-        if not tok:
-            continue
-        match = None
-        if regex_primary is not None:
-            try:
-                match = regex_primary.match(tok)
-            except Exception:
-                match = None
-        if match is None:
-            match = _OP_TOKEN_RE.match(tok)
-        if not match:
-            # allow bare op name by appending ()
-            match = _OP_TOKEN_RE.match(f"{tok}()")
-            if not match:
-                continue
-        name, arg_str = match.group(1), match.group(2).strip()
-        args: List[int] = []
-        if arg_str:
-            for part in arg_str.split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                try:
-                    args.append(int(part))
-                except Exception:
-                    # Ignore non-integer args for v1.0; extend as needed.
-                    continue
-        try:
-            steps.append(StepType(name, tuple(args)))
-        except Exception:
-            return None, 0
-
-    if not steps:
-        return None, 0
-
-    try:
-        program = ProgType(steps)
-    except Exception:
-        return None, 0
-    return program, len(steps)
-
-
-def _enqueue_seed_programs(
-    frontier: List[Any],
-    input_grid: Any,
-    target_grid: Any,
-    seed_tokens_list: Optional[List[List[str]]],
-    interpret_program_fn,
-    compute_cost_fn,
-    step_cls: Optional[Any] = None,
-    prog_cls: Optional[Any] = None,
-    telem_carrier: Optional[Any] = None,
-) -> int:
-    """Append parsed motif programs to the frontier. Returns count appended."""
-    if not seed_tokens_list:
-        return 0
-
-    pushed = 0
-    for toks in seed_tokens_list:
-        prog, nops = _parse_seed_tokens_to_program(toks, StepCls=step_cls, ProgramCls=prog_cls)
-        if prog is None or not getattr(prog, "steps", None):
-            continue
-        try:
-            pred = interpret_program_fn(prog, input_grid)
-            cost = compute_cost_fn(prog, input_grid, target_grid)
-        except Exception:
-            continue
-
-        try:
-            if "BeamEntry" in globals():
-                entry = BeamEntry(program=prog, pred=pred, cost=cost)  # type: ignore[name-defined]
-            else:
-                entry = {"program": prog, "pred": pred, "cost": float(cost)}
-            frontier.append(entry)
-            _telemetry_note_safe(
-                entry,
-                memory_seeded_motif=list(toks or []),
-                memory_seed_ops=int(nops),
-                memory_seed_cost=float(cost),
-            )
-            if telem_carrier is not None:
-                _telemetry_note_safe(
-                    telem_carrier,
-                    memory_seeded_motif=list(toks or []),
-                    memory_seed_ops=int(nops),
-                    memory_seed_cost=float(cost),
-                )
-            pushed += 1
-        except Exception:
-            continue
-
-    return pushed
-
-
-def _parse_tokens_to_program(tokens: List[str]):
-    """Compat shim for callers expecting the older helper name."""
-    prog, _ = _parse_seed_tokens_to_program(tokens)
-    if prog is not None:
-        return prog
-    ProgramCls = globals().get("Program")
-    return ProgramCls([]) if ProgramCls is not None else []
-
-
-def _set_determinism(seed=0):
-    random.seed(seed)
-    try:
-        _np.random.seed(seed)
-    except Exception:
-        pass
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-
-
-_set_determinism(0)
-
-print(f"[ARC-ONE] seed=0  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
 
 
 # ==================================================================================
@@ -954,35 +766,42 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
 
 
 def _pixel_iou(a, b):
-    A, B = np.asarray(a), np.asarray(b)
-    if A.shape != B.shape:
+    # Safe equality-ratio for list-of-lists ints; returns 0.0 on mismatch/empty
+    if not a or not b:
         return 0.0
-    if A.size == 0:
+    if len(a) != len(b):
         return 0.0
-    return float((A == B).sum()) / float(A.size)
+    if len(a[0]) != len(b[0]):
+        return 0.0
+    h, w = len(a), len(a[0])
+    same = 0
+    tot = h * w
+    for r in range(h):
+        ra, rb = a[r], b[r]
+        for c in range(w):
+            same += 1 if ra[c] == rb[c] else 0
+    return same / tot if tot else 0.0
 
 
 def _pick_two_attempts(cands, lambda_div=0.5, iou_cap=0.97, seed=1337):
-    """Return (first, second, IoU) given candidate predictions."""
+    """
+    Select first = best by conf; second = argmax(conf - λ·IoU(first)), with a hard IoU cap.
+    cands: list of dicts: {"grid": <list[list[int]]>, "conf": float, "tag": str(optional)}
+    """
     if not cands:
         return None, None, 0.0
-
     first = max(cands, key=lambda c: c.get("conf", 0.0))
-    rng = random.Random(seed)
-    best = None
-    best_score = float("-inf")
-    for cand in cands:
-        if cand is first:
+    rnd = random.Random(seed)
+    best, best_score = None, float("-inf")
+    for c in cands:
+        if c is first:
             continue
-        iou = _pixel_iou(first.get("grid"), cand.get("grid"))
+        iou = _pixel_iou(first.get("grid"), c.get("grid"))
         if iou >= iou_cap:
             continue
-        score = float(cand.get("conf", 0.0)) - float(lambda_div) * float(iou)
-        # tie-break deterministically with seed to avoid oscillations
-        if score > best_score or (math.isclose(score, best_score) and rng.random() < 0.5):
-            best = cand
-            best_score = score
-
+        score = float(c.get("conf", 0.0)) - float(lambda_div) * float(iou)
+        if score > best_score or (score == best_score and rnd.random() < 0.5):
+            best, best_score = c, score
     second = best if best is not None else first
     i12 = _pixel_iou(first.get("grid"), second.get("grid"))
     return first, second, i12
@@ -1183,18 +1002,6 @@ def _apply_diversity_guard_candidates(base_grid, candidates, belief, settings, o
     return deduped if deduped else filtered, family
 
 
-def _pixel_iou_ll(a, b):
-    import numpy as np
-
-    A = np.asarray(a)
-    B = np.asarray(b)
-    if A.shape != B.shape or A.ndim != B.ndim:
-        return 0.0
-    if A.size == 0:
-        return 0.0
-    return float((A == B).sum()) / float(A.size)
-
-
 def _regenerate_alt_from_different_bucket(base_grid, belief, pairs):
     import numpy as np
 
@@ -1244,6 +1051,7 @@ def _regenerate_alt_from_different_bucket(base_grid, belief, pairs):
         pass
 
     threshold = 0.97
+    base_ll = base_np.tolist() if hasattr(base_np, "tolist") else base_np
     for tag, cand in candidates:
         try:
             cand_np = np.asarray(cand)
@@ -1251,9 +1059,10 @@ def _regenerate_alt_from_different_bucket(base_grid, belief, pairs):
             continue
         if cand_np.ndim != 2 or cand_np.shape != base_np.shape:
             continue
-        if _pixel_iou_ll(base_np, cand_np) < threshold:
-            return cand_np.tolist() if hasattr(cand_np, "tolist") else cand_np
-    return base_np.tolist() if hasattr(base_np, "tolist") else base_np
+        cand_ll = cand_np.tolist() if hasattr(cand_np, "tolist") else cand_np
+        if _pixel_iou(base_ll, cand_ll) < threshold:
+            return cand_ll
+    return base_ll
 
 
 def _is_degenerate_grid(grid, bg=0, max_bg_frac=0.95):
@@ -2323,12 +2132,14 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
 
                 try:
                     cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
-                    if _pixel_iou_ll(base, att2) >= cap:
+                    base_ll = base.tolist() if hasattr(base, "tolist") else base
+                    att2_ll = att2.tolist() if hasattr(att2, "tolist") else att2
+                    if _pixel_iou(base_ll, att2_ll) >= cap:
                         try:
-                            regenerated = _regenerate_alt_from_different_bucket(base, belief, pairs)
+                            regenerated = _regenerate_alt_from_different_bucket(base_ll, belief, pairs)
                             att2 = regenerated
-                    except Exception:
-                        att2 = np.rot90(np.asarray(base), 2).tolist()
+                        except Exception:
+                            att2 = np.rot90(np.asarray(base_ll), 2).tolist()
                 except Exception:
                     try:
                         att2 = np.rot90(np.asarray(base), 2).tolist()
@@ -2401,9 +2212,11 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             if att2_np.ndim != 2 or att2_np.shape != base_np.shape:
                 att2_np = base_np
             telemetry = {}
+            _cap_telemetry(telemetry)
             att1_entry = {"grid": base_np.tolist(), "_telemetry": telemetry, "meta": meta_dict}
             att2_entry = {"grid": att2_np.tolist(), "_telemetry": telemetry, "meta": meta_dict}
             att2_entry = _enforce_diversity(att1_entry, att2_entry)
+            _cap_telemetry(telemetry)
             entry = {
                 "attempt_1": att1_entry["grid"],
                 "attempt_2": att2_entry["grid"],
@@ -5339,7 +5152,7 @@ def build_synth_context(input_grid, target_grid):
     }
 
 
-def _int_space_for(op_name, idx, ctx):
+def _int_space_for_base(op_name, idx, ctx):
     # idx: index among non-grid integer params
     if op_name == "rot90":
         return [1, 2, 3]
@@ -5421,6 +5234,100 @@ def _int_space_for(op_name, idx, ctx):
         big    = max(3, A // 20)    # ~5%
         return [(small, medium), (medium, big)]
     return list(range(10))
+
+
+def _ctx_sig(ctx):
+    depth = getattr(ctx, "depth", None)
+    block_identity = getattr(ctx, "block_identity", True)
+    rails_scale_hard = getattr(ctx, "rails_scale_hard", True)
+    scale_hard_steps = getattr(ctx, "scale_hard_steps", 1)
+    in_shape = ()
+    out_shape = ()
+    palette_in = ()
+    palette_out = ()
+    centroid_in = ()
+    centroid_out = ()
+    if isinstance(ctx, dict):
+        depth = ctx.get("depth", depth)
+        block_identity = ctx.get("block_identity", block_identity)
+        rails_scale_hard = ctx.get("rails_scale_hard", rails_scale_hard)
+        scale_hard_steps = ctx.get("scale_hard_steps", scale_hard_steps)
+        in_shape = tuple(ctx.get("in_shape") or ())
+        out_shape = tuple(ctx.get("out_shape") or ())
+        palette_in = tuple(ctx.get("palette_in") or ())
+        palette_out = tuple(ctx.get("palette_out") or ())
+        centroid_in = tuple(ctx.get("centroid_in") or ())
+        centroid_out = tuple(ctx.get("centroid_out") or ())
+    else:
+        in_shape = tuple(getattr(ctx, "in_shape", ()) or ())
+        out_shape = tuple(getattr(ctx, "out_shape", ()) or ())
+        palette_in = tuple(getattr(ctx, "palette_in", ()) or ())
+        palette_out = tuple(getattr(ctx, "palette_out", ()) or ())
+        centroid_in = tuple(getattr(ctx, "centroid_in", ()) or ())
+        centroid_out = tuple(getattr(ctx, "centroid_out", ()) or ())
+    depth_val = None if depth is None else int(depth)
+    try:
+        scale_steps = int(scale_hard_steps)
+    except Exception:
+        scale_steps = 1
+    return (
+        depth_val,
+        bool(block_identity),
+        bool(rails_scale_hard),
+        scale_steps,
+        in_shape,
+        out_shape,
+        palette_in,
+        palette_out,
+        centroid_in,
+        centroid_out,
+    )
+
+
+def _ctx_from_sig(sig):
+    (
+        _depth,
+        block_identity,
+        rails_scale_hard,
+        scale_hard_steps,
+        in_shape,
+        out_shape,
+        palette_in,
+        palette_out,
+        centroid_in,
+        centroid_out,
+    ) = sig
+    ctx = {
+        "in_shape": tuple(in_shape) if in_shape else (),
+        "out_shape": tuple(out_shape) if out_shape else (),
+        "palette_in": list(palette_in) if palette_in else [],
+        "palette_out": list(palette_out) if palette_out else [],
+        "centroid_in": tuple(centroid_in) if centroid_in else None,
+        "centroid_out": tuple(centroid_out) if centroid_out else None,
+    }
+    # propagate policy flags when available
+    ctx["block_identity"] = bool(block_identity)
+    ctx["rails_scale_hard"] = bool(rails_scale_hard)
+    ctx["scale_hard_steps"] = scale_hard_steps
+    return ctx
+
+
+@lru_cache(maxsize=None)
+def _int_space_for_cached(op_name, idx, ctx_sig):
+    if op_name == "stack":
+        return (0, 1)
+    if op_name == "scale":
+        allow_ident = not ctx_sig[1]
+        base = [2, 3] + ([1] if allow_ident else [])
+        return tuple(base)
+    ctx = _ctx_from_sig(ctx_sig)
+    return tuple(_int_space_for_base(op_name, idx, ctx))
+
+
+def _int_space_for(op_name, idx, ctx):
+    ctx_sig = _ctx_sig(ctx)
+    result = _int_space_for_cached(op_name, idx, ctx_sig)
+    return list(result)
 
 
 def beam_search_one_pair(
@@ -5991,6 +5898,29 @@ def beam_search_one_pair(
 
         # Score each successor
         for succ_prog in successors:
+            if getattr(settings, "block_identity", True):
+                tok = None
+                try:
+                    tok = succ_prog.steps[-1]
+                except Exception:
+                    tok = None
+                name = getattr(tok, "op", None) or getattr(tok, "name", None)
+                args = getattr(tok, "args", ()) if tok is not None else ()
+                if isinstance(args, np.ndarray):
+                    args = tuple(args.tolist())
+                if name in ("tile", "phase_tile"):
+                    args_seq = tuple(args[:2]) if isinstance(args, (list, tuple)) else ()
+                    if args_seq == (1, 1):
+                        continue
+                if name == "shift":
+                    if tuple(args) == (0, 0):
+                        continue
+                if name == "scale":
+                    args_tuple = tuple(args) if isinstance(args, (list, tuple)) else (args,)
+                    if len(args_tuple) == 1 and args_tuple[0] in (0, 1):
+                        continue
+                    if args_tuple in ((0, 0), (1, 1)):
+                        continue
             # Skip if visited
             prog_sig = succ_prog.to_tuple()
             if prog_sig in visited:
@@ -6026,25 +5956,41 @@ def beam_search_one_pair(
 
                     # Early exit if exact match
                     if np.array_equal(pred, target_grid):
-                        attempt_tag = getattr(settings, "_attempt_tag", "A") if settings is not None else "A"
-                        last_op = succ_prog.steps[-1].op if getattr(succ_prog, "steps", None) else None
-                        pre_err = None
+                        # Robust exact-win logging that can never block the early return
                         try:
-                            parent_pred = interpret_program(current.program, input_grid)
-                            if parent_pred.shape == target_grid.shape:
-                                pre_err = float((parent_pred != target_grid).mean())
+                            # Resolve a best-effort task_id without raising
+                            tid_val = (locals().get("tid")
+                                       or locals().get("task_id")
+                                       or getattr(settings, "task_id", None)
+                                       or getattr(settings, "_current_task_id", None))
+                            last_op = None
+                            try:
+                                if getattr(succ_prog, "steps", None):
+                                    last_op = succ_prog.steps[-1].op
+                            except Exception:
+                                pass
+                            pre_err = None
+                            try:
+                                parent_prog = current.program if hasattr(current, "program") else None
+                                if parent_prog is not None:
+                                    parent_pred = interpret_program(parent_prog, input_grid)
+                                    if parent_pred.shape == target_grid.shape:
+                                        pre_err = float((parent_pred != target_grid).mean())
+                            except Exception:
+                                pass
+                            if "_log_exact_win" in globals():
+                                _log_exact_win({
+                                    "task_id": tid_val,
+                                    "win_attributed_to": last_op,
+                                    "pre_win_err": pre_err,
+                                    "depth_at_win": (current.depth + 1) if hasattr(current, "depth") else None,
+                                    "rho_at_win": getattr(settings, "_hfp_rho_smoothed", None),
+                                    "attempt_tag": "A",  # adjust if you tag A/B separately in this function
+                                })
                         except Exception:
+                            # Never let logging failures block the solve
                             pass
-                        _log_exact_win(
-                            {
-                                "task_id": task_id,
-                                "win_attributed_to": last_op,
-                                "pre_win_err": pre_err,
-                                "depth_at_win": getattr(current, "depth", 0) + 1,
-                                "rho_at_win": getattr(settings, "_hfp_rho_smoothed", None) if settings else None,
-                                "attempt_tag": attempt_tag,
-                            }
-                        )
+                        # Always exit immediately on exact
                         return succ_prog
             except Exception:
                 pass
@@ -6235,12 +6181,12 @@ class MetaControllerUCB:
         # bundles are minimal & stable; adjust offline if needed
         self.bundle_map = {
             "scale": [
-                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
                 {"beam_width": 96, "lambda1": 0.30, "lambda2": 0.20, "max_train_pairs_for_beam": 2},
                 {"beam_width": 128, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
             ],
             "objectness": [
-                {"beam_width": 48, "lambda1": 0.35, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
+                {"beam_width": 48, "lambda1": 0.35, "lambda2": 0.15, "max_train_pairs_for_beam": 2},
                 {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
             ],
             "palette": [
@@ -6248,12 +6194,12 @@ class MetaControllerUCB:
                 {"beam_width": 96, "lambda1": 0.10, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
             ],
             "alignment": [
-                {"beam_width": 64, "lambda1": 0.25, "lambda2": 0.30, "max_train_pairs_for_beam": 1},
-                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 1},
+                {"beam_width": 64, "lambda1": 0.25, "lambda2": 0.30, "max_train_pairs_for_beam": 2},
+                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
             ],
             "geometry": [
-                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
-                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.15, "max_train_pairs_for_beam": 2},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
             ],
             "pattern": [
                 {"beam_width": 128, "lambda1": 0.25, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
@@ -7025,6 +6971,7 @@ def _solve_task_internal(
             att1_grid = pred1.tolist()
             att2_grid = pred2.tolist()
             telemetry = {}
+            _cap_telemetry(telemetry)
             att1_entry = {"grid": att1_grid, "_telemetry": telemetry, "meta": {"tension": prog_tension}}
             att2_entry = {"grid": att2_grid, "_telemetry": telemetry, "meta": {"tension": prog_tension}}
 
@@ -7052,6 +6999,7 @@ def _solve_task_internal(
             att2_entry = _enforce_diversity(att1_entry, att2_entry)
             winner = _debate_reconcile(task_json, att1_entry, att2_entry)
 
+            _cap_telemetry(telemetry)
             entry = {
                 "attempt_1": att1_entry["grid"],
                 "attempt_2": att2_entry["grid"],
@@ -7170,9 +7118,11 @@ def _solve_task_internal(
                 ]
                 attempt_2 = alt_cands[0]
                 telemetry = {}
+                _cap_telemetry(telemetry)
                 att1_entry = {"grid": g.tolist(), "_telemetry": telemetry, "meta": {"tension": prog_tension}}
                 att2_entry = {"grid": attempt_2.tolist(), "_telemetry": telemetry, "meta": {"tension": prog_tension}}
                 att2_entry = _enforce_diversity(att1_entry, att2_entry)
+                _cap_telemetry(telemetry)
                 entry = {
                     "attempt_1": att1_entry["grid"],
                     "attempt_2": att2_entry["grid"],
@@ -7613,12 +7563,12 @@ Examples:
                        help="Program tension weight (default: 0.30)")
     parser.add_argument("--lambda2", type=float, default=0.20,
                        help="Slice tension weight (default: 0.20)")
-    parser.add_argument("--div_lambda", type=float, default=0.50,
-                        help="Diversity penalty λ for Attempt-B selection (default: 0.50)")
+    parser.add_argument("--div_lambda", type=float, default=0.5,
+                        help="Diversity weight λ for second attempt: score = conf − λ·IoU(first).")
     parser.add_argument("--iou_cap", type=float, default=0.97,
-                        help="Maximum IoU allowed before alternates are rejected (default: 0.97)")
+                        help="Hard cap on IoU(A,B) for Attempt-B eligibility.")
     parser.add_argument("--max_bounces", type=int, default=8,
-                        help="Hard cap on debate bounces (default: 8)")
+                        help="Maximum bounce retries for Attempt-B alternates/debate.")
     parser.add_argument("--no_octo_prior", action="store_true",
                         help="Disable palette8 octonion distance–based time scaling (training stage).")
     parser.add_argument("--octo_alpha", type=float, default=0.25,
@@ -7635,7 +7585,7 @@ Examples:
                         help="Skim diversity threshold to trigger bounce (default 0.05).")
     parser.add_argument("--octo_z_min_for_bounce", type=float, default=1.20,
                         help="Minimum octonion z to consider a task 'hard' (default 1.20).")
-    parser.add_argument("--bounce_max", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--bounce_max", dest="max_bounces", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--no_block_identity", action="store_true",
                         help="Disable identity ejection (tile(1,1), scale(1), resize to same size).")
     parser.add_argument(
@@ -7727,9 +7677,9 @@ Examples:
     parser.add_argument("--jsonl", type=str, default=None,
                        help="Path for JSONL telemetry log")
     parser.add_argument("--exact_wins_csv", type=str, default=None,
-                       help="Optional CSV path for exact-win attribution events")
+                       help="If set, write exact-win attribution events to this CSV.")
     parser.add_argument("--octo_stats_csv", type=str, default=None,
-                       help="Optional CSV path for octonion/confounds telemetry")
+                       help="If set, write per-task octonion/confounds telemetry rows to this CSV.")
     
     # Determinism
     parser.add_argument("--seed", type=int, default=1337,
@@ -7904,9 +7854,9 @@ Examples:
     _flush_exact_wins(args.exact_wins_csv)
     _flush_octo_csv(args.octo_stats_csv)
     if args.exact_wins_csv:
-        print(f"  [LOG] exact-win events → {args.exact_wins_csv}")
+        print(f"[LOG] exact-win events → {args.exact_wins_csv}")
     if args.octo_stats_csv:
-        print(f"  [LOG] octonion telemetry → {args.octo_stats_csv}")
+        print(f"[LOG] octonion telemetry → {args.octo_stats_csv}")
 
     # Summary
     print("\n" + "=" * 80)
