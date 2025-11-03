@@ -1,3 +1,12 @@
+## v2.10.5 — 2025-11-03
+**Shaped & Two-Lane**
+- New: *Shaped cost* blends soft IoU, centroid error, and palette histogram terms (env `ARC_SHAPED_COST=1`).
+- New: *Two-lane beam* keeps an exploit lane by cost plus an explore lane guided by soft IoU progress; uphill moves are rationed via `ARC_ALLOW_UPHILL` / `ARC_UPHILL_KEEP`.
+- New: *Stronger A/B debate* with lower IoU cap defaults, calibrated diversity weight, and auto-boosted Attempt-B beam/time when similarity keeps hitting the cap (`ARC_ATTEMPTB_AUTO_BOOST`, `ARC_ATTEMPTB_BOOST_*`).
+- Tune: Default `ARC_SCALE_HARD_THRESH=0.60` so obvious scale cues can open with size ops at depth 0 without flipping the legacy rails.
+- Docs: φ embedding description now reflects its 8D feature vector (no octonion algebra), matching telemetry.
+- Keeps v2.10.4: stack axis filter, calibrated R thresholds, motif seeding fallback, and face dwell hysteresis.
+
 ## v2.10.4 — 2025-11-03
 
 ### Fixed
