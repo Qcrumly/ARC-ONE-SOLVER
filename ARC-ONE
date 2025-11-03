@@ -3,7 +3,11 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.10.3 — Strict two-attempts chooser + telemetry logging
+# Version: v2.10.3-hotfix1 — Exact-match exit guard + IoU fix
+#
+# v2.10.3-hotfix1 (2025-11-03)
+#   - Exact-match early exit is now robust: win logging is wrapped in try/except and task_id is resolved defensively, so a NameError can never block the return. The solver now always exits immediately on exact predictions.
+#   - Pixel IoU guard: _pixel_iou now checks for zero-sized grids to avoid ZeroDivisionError. For empty-but-equal shapes, IoU returns 0.0 (conservative), matching prior semantics where union==0 yielded 0.0.
 #
 # v2.10.3 (2025-11-03)
 #   - Strict two-attempts chooser: Attempt-B picked by score = conf - λ·IoU(first), with hard IoU cap.
@@ -55,7 +59,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.10.3"  # Strict two-attempts chooser + telemetry logging
+__version__ = "v2.10.3-hotfix1"  # Exact-match exit guard + IoU fix
 
 last_best_program = None
 
@@ -902,7 +906,11 @@ def _pixel_iou(a, b):
     A, B = np.asarray(a), np.asarray(b)
     if A.shape != B.shape:
         return 0.0
-    return float((A == B).sum()) / float(A.size)
+    # Guard against empty arrays (0x0 region) to avoid ZeroDivisionError.
+    n = A.size
+    if n == 0:
+        return 0.0  # conservative: treat empty shapes as non-informative
+    return float((A == B).sum()) / float(n)
 
 
 def _pick_two_attempts(cands, lambda_div=0.5, iou_cap=0.97, seed=1337):
@@ -5969,25 +5977,41 @@ def beam_search_one_pair(
 
                     # Early exit if exact match
                     if np.array_equal(pred, target_grid):
-                        attempt_tag = getattr(settings, "_attempt_tag", "A") if settings is not None else "A"
-                        last_op = succ_prog.steps[-1].op if getattr(succ_prog, "steps", None) else None
-                        pre_err = None
+                        # Robust exact-win logging that can never block the early return
                         try:
-                            parent_pred = interpret_program(current.program, input_grid)
-                            if parent_pred.shape == target_grid.shape:
-                                pre_err = float((parent_pred != target_grid).mean())
+                            # Resolve a best-effort task_id without raising
+                            tid_val = (locals().get("tid")
+                                       or locals().get("task_id")
+                                       or getattr(settings, "task_id", None)
+                                       or getattr(settings, "_current_task_id", None))
+                            last_op = None
+                            try:
+                                if getattr(succ_prog, "steps", None):
+                                    last_op = succ_prog.steps[-1].op
+                            except Exception:
+                                pass
+                            pre_err = None
+                            try:
+                                parent_prog = current.program if hasattr(current, "program") else None
+                                if parent_prog is not None:
+                                    parent_pred = interpret_program(parent_prog, input_grid)
+                                    if parent_pred.shape == target_grid.shape:
+                                        pre_err = float((parent_pred != target_grid).mean())
+                            except Exception:
+                                pass
+                            if "_log_exact_win" in globals():
+                                _log_exact_win({
+                                    "task_id": tid_val,
+                                    "win_attributed_to": last_op,
+                                    "pre_win_err": pre_err,
+                                    "depth_at_win": (current.depth + 1) if hasattr(current, "depth") else None,
+                                    "rho_at_win": getattr(settings, "_hfp_rho_smoothed", None),
+                                    "attempt_tag": "A",  # adjust if you tag A/B separately in this function
+                                })
                         except Exception:
+                            # Never let logging failures block the solve
                             pass
-                        _log_exact_win(
-                            {
-                                "task_id": task_id,
-                                "win_attributed_to": last_op,
-                                "pre_win_err": pre_err,
-                                "depth_at_win": getattr(current, "depth", 0) + 1,
-                                "rho_at_win": getattr(settings, "_hfp_rho_smoothed", None) if settings else None,
-                                "attempt_tag": attempt_tag,
-                            }
-                        )
+                        # Always exit immediately on exact
                         return succ_prog
             except Exception:
                 pass
