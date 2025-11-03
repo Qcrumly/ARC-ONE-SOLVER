@@ -1296,33 +1296,30 @@ class _Deadline:
         return _now() >= self.t_end
 
 
+def _as_array2(grid):
+    """Return (np.ndarray, H, W); accepts list-of-lists or ndarray. dtype=int."""
+    import numpy as _np
+
+    arr = _np.asarray(grid, dtype=int)
+    if arr.ndim != 2:
+        return _np.zeros((0, 0), dtype=int), 0, 0
+    h, w = arr.shape
+    return arr, int(h), int(w)
+
+
+def _as_list2(grid):
+    """Coerce grid to list-of-lists (even if already LoL)."""
+    import numpy as _np
+
+    if isinstance(grid, _np.ndarray):
+        return grid.tolist()
+    return grid
+
+
 def _grid_shape(grid):
-    """Return (H, W) for list-of-lists or numpy arrays. Never uses truthiness of array rows."""
-    if grid is None:
-        return (0, 0)
-    # Fast path for numpy arrays
-    try:
-        import numpy as _np
-        if isinstance(grid, _np.ndarray):
-            if grid.ndim != 2:
-                return (0, 0)
-            h, w = grid.shape
-            return int(h), int(w)
-    except Exception:
-        pass
-    # Python lists/tuples
-    try:
-        h = len(grid)
-    except Exception:
-        return (0, 0)
-    if h == 0:
-        return (0, 0)
-    row0 = grid[0]
-    try:
-        w = len(row0)
-    except Exception:
-        return (h, 0)
-    return (h, w)
+    """Return (H, W) for list-of-lists or ndarray. Never uses truthiness."""
+    _arr, h, w = _as_array2(grid)
+    return h, w
 
 
 def _shift_grid(grid, dy, dx, fill=0):
@@ -1352,11 +1349,30 @@ def _shift_grid(grid, dy, dx, fill=0):
 
 
 def _rot180(grid):
-    return [row[::-1] for row in grid[::-1]] if grid else grid
+    import numpy as _np
+
+    arr, H, W = _as_array2(grid)
+    if H == 0 or W == 0:
+        return _as_list2(arr)
+    return _np.flip(_np.flip(arr, axis=0), axis=1).tolist()
 
 
 def _mirror_lr(grid):
-    return [row[::-1] for row in grid] if grid else grid
+    import numpy as _np
+
+    arr, H, W = _as_array2(grid)
+    if H == 0 or W == 0:
+        return _as_list2(arr)
+    return _np.flip(arr, axis=1).tolist()
+
+
+def _mirror_ud(grid):
+    import numpy as _np
+
+    arr, H, W = _as_array2(grid)
+    if H == 0 or W == 0:
+        return _as_list2(arr)
+    return _np.flip(arr, axis=0).tolist()
 
 
 def _largest_component_only(grid, bg=0):
@@ -1430,6 +1446,7 @@ def _build_belief(meta, train_pairs=None, phi=None, palette_safe=None, learned_m
 
 
 def _alternates_from_belief(att1, test_x, belief, train_pairs):
+    att1 = _as_list2(att1)
     alts = []
     dy, dx = 0, 0
     if belief.get("align_dy_dx") and len(belief["align_dy_dx"]) == 2:
@@ -2354,6 +2371,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         forced_alternate = True
                     except Exception:
                         pass
+                base = _as_list2(base)
                 candidates.extend(_alternates_from_belief(base, test_in, belief, pairs))
                 ops_tokens = (meta_dict.get("_telemetry", {}) or {}).get("ops_tokens", [])
                 candidates, family_tag = _apply_diversity_guard_candidates(base, candidates, belief, settings, ops_tokens)
