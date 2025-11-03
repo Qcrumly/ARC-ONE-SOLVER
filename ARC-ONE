@@ -9192,6 +9192,8 @@ class SearchSettings:
     beam_width: int = 64
     max_depth: int = 8
     max_seconds: float = 30.0
+    # StepLogger / beam-loop logging cadence (iterations between messages)
+    log_every: int = _envint("ARC_LOG_EVERY", 200)
     # GOF-9000 policy knobs (default ON; modules may ignore)
     block_identity: bool = True
     rails_scale_hard: bool = True
