@@ -1,7 +1,7 @@
-# ARC‑ONE (Octonion‑guided ARC solver)
+# ARC‑ONE (Octonionic Control Overlay ARC solver)
 
-**What this is (one lungful).**  
-An ARC solver built around a tiny DSL (ops like `tile`, `rot90`, `keep_n_largest`, …), an octonion task embedding **φ** that nudges search, and a staged beam-search pipeline (**skim → main → polish**) that emits two diverse attempts with palette safety and blockwise/align finishers. Telemetry is threaded through so you can see why the search did what it did.
+**What this is (one lungful).**
+ARC‑ONE v2.10.3-hotfix2 couples a compact ARC DSL (ops like `tile`, `rot90`, `keep_n_largest`, …) with octonion task embeddings **φ** that steer a staged beam-search pipeline (**skim → main → polish**). The solver now drives two diverse attempts via a strict confidence-minus-IoU chooser, protects them with the GOF-9000 self-monitor + HFP health gates, and lands solutions with palette-safe finishers. Telemetry (JSONL + optional CSVs) keeps the entire run explainable.
 
 ## Quick start
 Requires Python, `numpy`, `scipy` (for connected components).
@@ -21,26 +21,33 @@ python arc_one.py --tasks_dir ./arc_tasks --two_attempts --max_tasks 5 --no_poli
 ### Handy flags (abridged)
 Search: `--beam`, `--depth`, `--seconds`
 OCO costs: `--lambda_len`, `--lambda1`, `--lambda2`
-Two attempts: `--two_attempts`, `--attempt2_strategy` (e.g., `flipH`, `oco_auto`)
+Two attempts: `--two_attempts`, `--attempt2_strategy`, `--div_lambda`, `--iou_cap`, `--max_bounces`
 Octonion prior: `--no_octo_prior`, `--octo_alpha`, `--octo_clip`
-Stage/diversity: `--no_polish`, `--stop_if_diversity`
-Rails/identity: `--no_block_identity`, `--no_rails_scale_hard`, thresholds/steps knobs
+Stage/diversity: `--no_polish`, `--stop_if_diversity`, `--no_bounce`, `--lowdiv_thr`, `--octo_z_min_for_bounce`
+Rails/identity: `--no_block_identity`, `--no_rails_scale_hard`, `--scale_hard_thresh`, `--scale_hard_steps`, `--early_palette_block_steps`
+Self-monitor: `--no_monitor`, `--monitor_pressure_thresh`, `--monitor_plateau_N`, `--monitor_visited_cap`, `--no_monitor_inject_underused`, `--no_monitor_drop_dupe_sigs`
+HFP × GOF health: `--no_hfp`, `--hfp_alpha`, `--hfp_rho_hi`, `--hfp_rho_lo`, `--hfp_break_R_min`, `--no_hfp_gate_by_health`, `--no_hfp_gate_keep`
 Memory: `--use_memory/--no_use_memory`, `--memory_dir`, `--priors_alpha`, `--motif_topk`, `--no_memory_motifs`, `--no_memory_priors`
 Diversity guard: `--diversity_guard/--no_diversity_guard`, `--diversity_b_force_first`, `--attemptB_beam_scale`, `--attemptB_time_scale`
+Telemetry: `--jsonl`, `--exact_wins_csv`, `--octo_stats_csv`, `--public_mode`
 
 ### Map of the beast
-* **DSL & interpreter.** Ops registry + `interpret_program`.  
-* **Search.** Staged beam search with φ-aware priors, live ρ, bounded debate.  
-* **OCO guidance.** 8-D φ vectors, tension, palette difficulty, time scaling.  
-* **Two attempts & diversity.** Automatic 2nd attempt with IoU diversity & palette safety.  
-* **Finishers.** Align (learned (dy,dx)), block masks, blockwise dominant color, denoising.  
-* **Telemetry.** Stage times, ops tokens, rails settings in `_telemetry`.  
+* **DSL & interpreter.** Ops registry + `interpret_program` with guardrails (identity ejection, directional rails, safe refusals).
+* **Search.** Staged beam search with φ-aware priors, live ρ, bounded debate, and GOF-9000 self-monitor pressure relief.
+* **OCO guidance.** 8-D φ vectors, tension, palette difficulty, time scaling, bounce heuristics.
+* **Two attempts & diversity.** Confidence-minus-IoU Attempt-B chooser, diversity guardrails, micro-debate repairs.
+* **Health gating (HFP × GOF).** Hidden-factor ρ health bands gate successors and break futile loops while logging `hfp_gof` telemetry.
+* **Finishers.** Align (learned (dy,dx)), block masks, blockwise dominant color, denoising, palette snap + micro-shifts.
+* **Telemetry.** Stage times, ops tokens, rails settings, memory/diversity notes, and optional CSVs for exact wins & octonion stats.
 * **API shim.** `SearchSettings`, `solve_task(...)` for notebooks.
 
-### Footguns fixed
-* Refused ops no longer propagate `None`—they act as identity inside the interpreter.
-* Wrappers no longer assume `depth=0` when depth is unknown; early bans only at real depth 0.
+### Footguns fixed (v2.10.x)
+* Refused ops act as identity inside the interpreter, so guardrails cannot crash search.
+* Early-step wrappers respect true depth, enforcing opening bans only when appropriate.
+* Exact-match exits are hardened (no NameErrors) and pixel IoU guards tolerate empty grids.
+* SciPy is optional—connected components falls back to a pure NumPy implementation.
 * Memory v1.0 loads read-only motifs/priors; missing files simply disable the feature.
+* Stack candidates are enumerated again (axis guard in v2.10.3-hotfix2). Set `ARC_DEBUG_STACK=1` to print sample combinations during search debugging.
 
 ### Memory v1.0 (read-only) & Diversity Guard
 
@@ -52,9 +59,9 @@ Diversity guard: `--diversity_guard/--no_diversity_guard`, `--diversity_b_force_
 **Two attempts with Diversity Guard** (default ON):
 * `--diversity_guard` / `--no_diversity_guard`
 * `--diversity_b_force_first` (force Attempt‑B to open with a different family when Attempt‑A was align-first)
-* `--attemptB_beam_scale`, `--attemptB_time_scale` (heuristic scaling for alternates/debate)
+* `--attemptB_beam_scale`, `--attemptB_time_scale`, `--div_lambda`, `--iou_cap`, `--max_bounces`
 
-The guard inspects Attempt‑A’s first ops (`ops_tokens`) to infer a family (align/object/color/tiling) and biases Attempt‑B away from it by trimming same-family alternates, injecting complementary motifs (e.g., `keep_n_largest`), and tagging telemetry with `diversity_family`.
+Attempt-B is picked by score = confidence − λ·IoU(Attempt-A) with a hard IoU cap. The guard inspects Attempt‑A’s first ops (`ops_tokens`) to infer a family (align/object/color/tiling), trims same-family alternates, injects complementary motifs (e.g., `keep_n_largest`), and tags telemetry with `diversity_family`.
 
 ### Preparing the memory bank (offline)
 
