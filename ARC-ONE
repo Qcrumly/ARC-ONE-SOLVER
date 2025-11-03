@@ -1208,7 +1208,7 @@ def _regenerate_alt_from_different_bucket(base_grid, belief, pairs):
     except Exception:
         pass
 
-    threshold = 0.97
+    threshold = _envfloat("ARC_IOU_CAP", 0.97)
     base_ll = base_np.tolist() if hasattr(base_np, "tolist") else base_np
     for tag, cand in candidates:
         try:
@@ -2425,7 +2425,8 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         pass
 
                 try:
-                    cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
+                    cap_default = float(getattr(settings, "iou_cap", 0.97)) if settings else 0.97
+                    cap = _envfloat("ARC_IOU_CAP", cap_default)
                     base_ll = base.tolist() if hasattr(base, "tolist") else base
                     att2_ll = att2.tolist() if hasattr(att2, "tolist") else att2
                     if _pixel_iou(base_ll, att2_ll) >= cap:
@@ -2436,6 +2437,16 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         except Exception:
                             att2 = np.rot90(np.asarray(base_ll), 2).tolist()
                             forced_alternate = True
+                    # ensure post-regeneration diversity if still over cap
+                    att2_ll = att2.tolist() if hasattr(att2, "tolist") else att2
+                    if _pixel_iou(base_ll, att2_ll) >= cap:
+                        try:
+                            att2_np = np.asarray(att2_ll)
+                            if att2_np.ndim == 2:
+                                att2 = np.fliplr(att2_np).tolist()
+                                att2_ll = att2
+                        except Exception:
+                            pass
                 except Exception:
                     try:
                         att2 = np.rot90(np.asarray(base), 2).tolist()
@@ -2454,9 +2465,11 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         }
                     )
 
-                lam_final = float(getattr(settings, "div_lambda", 0.50)) if settings else 0.50
+                lam_default = float(getattr(settings, "div_lambda", 0.50)) if settings else 0.50
+                lam_final = _envfloat("ARC_DIV_LAMBDA", lam_default)
                 lam_final *= float(getattr(settings, "attemptB_beam_scale", 1.0) if settings else 1.0)
-                cap_final = float(getattr(settings, "iou_cap", 0.97)) if settings else 0.97
+                cap_default = float(getattr(settings, "iou_cap", 0.97)) if settings else 0.97
+                cap_final = _envfloat("ARC_IOU_CAP", cap_default)
                 seed_val = int(getattr(settings, "seed", 1337)) if settings and hasattr(settings, "seed") else 1337
                 first_sel, second_sel, i12 = _pick_two_attempts(
                     cand_list,
@@ -2584,7 +2597,8 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
 
             i12_float = float(i12 if i12 is not None else 0.0)
             dis = 1.0 - i12_float
-            lam = float(getattr(settings, "div_lambda", 0.30)) if settings else 0.30
+            lam_default = float(getattr(settings, "div_lambda", 0.30)) if settings else 0.30
+            lam = _envfloat("ARC_DIV_LAMBDA", lam_default)
             mmrA = float(conf1) + lam * dis
             mmrB = float(conf2) + lam * dis
             pickB = mmrB > mmrA
