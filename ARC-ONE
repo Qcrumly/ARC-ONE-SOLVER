@@ -582,6 +582,56 @@ def _palette_map_from_train_pairs(train_pairs):
     return _majority_palette_mapping(train_pairs)
 
 
+def _palette_mapping_disagreement(train_pairs, mapping, cached=None):
+    if not mapping:
+        return None
+    cached = cached or _palette_confusion_from_train_pairs(train_pairs, max_colors=6)
+    if cached is None:
+        return None
+    in_set, out_set, C = cached
+    if C is None or not in_set:
+        return None
+    idx_in = {c: i for i, c in enumerate(in_set)}
+    idx_out = {c: j for j, c in enumerate(out_set)}
+    total_cost = 0
+    for src in in_set:
+        i = idx_in[src]
+        row_total = int(C[i].sum())
+        dst = mapping.get(src, src)
+        j = idx_out.get(dst)
+        if j is None:
+            total_cost += row_total
+        else:
+            total_cost += int(row_total - C[i, j])
+    return int(total_cost)
+
+
+def _try_palette_hungarian(train_pairs):
+    cached = _palette_confusion_from_train_pairs(train_pairs, max_colors=6)
+    if cached is None:
+        return None
+    in_set, out_set, C = cached
+    if C is None or not in_set or len(in_set) != len(out_set) or len(in_set) > 6:
+        return None
+    totals = C.sum(axis=1)
+    best_map = None
+    best_cost = None
+    n = len(in_set)
+    for perm in itertools.permutations(range(n)):
+        cost = 0
+        for i, j in enumerate(perm):
+            row_total = int(totals[i])
+            cost += row_total - int(C[i, j])
+        if best_cost is None or cost < best_cost:
+            best_cost = int(cost)
+            best_map = {in_set[idx]: out_set[perm[idx]] for idx in range(n)}
+    if best_map is None:
+        return None
+    if best_map.get(0, None) == 0:
+        best_map.pop(0, None)
+    return best_map, int(best_cost)
+
+
 def _palette_map_is_unanimous(train_pairs, mapping):
     if not mapping or not train_pairs:
         return False
@@ -1519,15 +1569,17 @@ def _bounded_debate(att1, att2, test_x, belief, rho_s, max_bounces):
 def _apply_test_palette_policy_pair(att1, att2, train_pairs, test_x, settings):
     policy = getattr(settings, "test_palette_policy", "second_only_guarded") if settings else "second_only_guarded"
     if policy in (None, "none"):
-        return att1, att2, "no_palette"
+        return att1, att2, "no_palette", {"palette_map_status": "disabled"}
     if policy == "both":
         policy = "second_only_guarded"
-    mapped, ok = _palette_map_if_pareto_safe(att2, train_pairs)
+    mapped, ok, info = _palette_map_if_pareto_safe(att2, train_pairs)
     if policy == "second_only":
-        return att1, (mapped if ok else att2), "second_only" if ok else "second_only(noop)"
+        tag = "second_only" if ok else "second_only(noop)"
+        return att1, (mapped if ok else att2), tag, info
     if policy == "second_only_guarded":
-        return att1, (mapped if ok else att2), "second_only_guarded" if ok else "guard_blocked"
-    return att1, att2, "unknown_policy"
+        tag = "second_only_guarded" if ok else "guard_blocked"
+        return att1, (mapped if ok else att2), tag, info
+    return att1, att2, "unknown_policy", info
 
 
 # === Accuracy helpers ========================================================
@@ -1632,18 +1684,45 @@ def _structure_ok(a, b, train_pairs=None):
 
 
 def _palette_map_if_pareto_safe(grid, train_pairs):
+    info = {"palette_map_status": None}
+    pairs = train_pairs or []
     try:
-        mapping = _palette_map_from_train_pairs(train_pairs or [])
+        mapping = _palette_map_from_train_pairs(pairs)
         if not mapping:
-            return grid, False
-        if not _palette_map_is_unanimous(train_pairs or [], mapping):
-            return grid, False
+            info["palette_map_status"] = "empty"
+            return grid, False, info
+        cached = _palette_confusion_from_train_pairs(pairs, max_colors=6)
+        base_cost = _palette_mapping_disagreement(pairs, mapping, cached)
+        if _palette_map_is_unanimous(pairs, mapping):
+            status = "unanimous"
+        else:
+            status = "non_unanimous"
+            hungarian = _try_palette_hungarian(pairs)
+            if hungarian:
+                hung_map, hung_cost = hungarian
+                if base_cost is None or hung_cost <= base_cost:
+                    mapping = hung_map
+                    base_cost = hung_cost
+                    status = "hungarian"
+                else:
+                    status = "hungarian_rejected"
+            if status not in ("unanimous", "hungarian"):
+                info["palette_map_status"] = status
+                return grid, False, info
         candidate = _apply_palette_map_ll(grid, mapping)
-        if not _structure_ok(grid, candidate, train_pairs):
-            return grid, False
-        return candidate, True
+        if not _structure_ok(grid, candidate, pairs):
+            info["palette_map_status"] = "structure_block"
+            return grid, False, info
+        info.update({
+            "palette_map_status": status,
+            "palette_map": dict(mapping),
+        })
+        if base_cost is not None:
+            info["palette_map_cost"] = int(base_cost)
+        return candidate, True, info
     except Exception:
-        return grid, False
+        info["palette_map_status"] = "error"
+        return grid, False, info
 
 
 # === Octonion palette8 encoding & running stats ===============================
@@ -2123,7 +2202,9 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                 att1_deb, att2_deb, bounces = _bounded_debate(base, att2, test_in, belief, rho_sm, max_b)
                 base = att1_deb
                 att2 = att2_deb
-                base, att2, policy_tag = _apply_test_palette_policy_pair(base, att2, pairs, test_in, settings or _InternalSearchSettings())
+                base, att2, policy_tag, palette_info = _apply_test_palette_policy_pair(
+                    base, att2, pairs, test_in, settings or _InternalSearchSettings()
+                )
 
                 telemetry_kwargs = {
                     "alt_tag": choice.get("tag") if choice else None,
@@ -2134,6 +2215,14 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     "attempt_policy": policy_tag,
                     "diversity_family": family_tag,
                 }
+                if palette_info:
+                    status = palette_info.get("palette_map_status")
+                    if status is not None:
+                        telemetry_kwargs["palette_map_status"] = status
+                    if palette_info.get("palette_map"):
+                        telemetry_kwargs["palette_map"] = palette_info["palette_map"]
+                    if "palette_map_cost" in palette_info and palette_info["palette_map_cost"] is not None:
+                        telemetry_kwargs["palette_map_cost"] = palette_info["palette_map_cost"]
 
                 bg_val = belief.get("bg", 0)
                 for key_name, grid_val in (("attempt_1", base), ("attempt_2", att2)):
@@ -7381,6 +7470,13 @@ def solve_task_with_schedule(
         if score == 1.0:
             break
 
+    if best_preds is not None:
+        try:
+            refined = _endgame_refine(task_json, best_preds)
+            if refined is not None:
+                best_preds = refined
+        except Exception:
+            pass
     return (best_preds if best_preds is not None else last_preds), best_cfg
 
 
