@@ -1,3 +1,22 @@
+## v2.10.4 — 2025-11-03
+
+### Fixed
+- **stack() enumeration bug:** axis filter checked the wrong slot; candidates were pruned. Now checks `args[1] ∈ {0,1}` to align with the executor and emits a one-shot debug sample when `ARC_DEBUG_STACK=1`.
+- **Motif seeding fallback:** if `arc_memory.parse_op_tokens(...)` returns zero steps, the solver now falls back to the local parser so seeds never silently no-op.
+- **Anti-friction (GOF) thresholds:** Calibrated `_hfp_R_good` and `hfp_break_R_min` to the analytic max of `R(ρ)=ρ^7|lnρ|` (`R_MAX = 1/(7e)`), keeping the “good” stretch band reachable while softening the break floor. Env overrides (`ARC_R_GOOD` / `ARC_R_BREAK`) still win.
+
+### Added
+- **ONE face hysteresis:** dwell-based stabilization for Explorer/Navigator/Observer transitions (`ARC_FACE_DWELL_STEPS`, default 6) to prevent chatter.
+- **Depth-0 size-op carve-out:** size operations remain banned at step 0 unless the scale cue `|φ[0]|` clears `scale_hard_thresh` (`ARC_SCALE_HARD_THRESH` env), preserving legacy rails by default.
+- **Debug:** optional one-shot print of enumerated `stack` combos when `ARC_DEBUG_STACK=1` is set.
+
+### Notes
+- Defaults preserve prior behavior unless env knobs are supplied. Suggested exploratory tuning:
+  - `ARC_IOU_CAP=0.92`, `ARC_DIV_LAMBDA=0.70`
+  - `ARC_SCALE_HARD_THRESH=0.6` (only if early size ops are desired for clear tilers)
+  - Calibrated R thresholds now ship by default; override via `ARC_R_GOOD` / `ARC_R_BREAK` only if experimenting.
+- Documentation now flags the stack enumeration fix, calibrated R thresholds, and the fail-safe motif seeding fallback so the README stays aligned with the code.
+
 ## v2.10.3 (2025-11-03)
 - Strict two-attempts chooser: Attempt-B picked by score = conf - λ·IoU(first), with hard IoU cap.
 - Optional CSV logs: exact-win attribution (which op closed the solution) and octonion-telemetry (x_oct + confounds).
