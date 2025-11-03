@@ -5944,6 +5944,81 @@ class Candidate:
         return self.cost < other.cost
 
 
+def _is_candidate(obj: Any) -> bool:
+    """Return True if the object behaves like a Candidate entry."""
+    return hasattr(obj, "program") and hasattr(obj, "cost")
+
+
+def _candidate_cost(obj: Any, default: float = 1e9) -> float:
+    """Best-effort accessor for a candidate's cost when sorting fallbacks are needed."""
+    try:
+        return float(getattr(obj, "cost"))
+    except Exception:
+        if isinstance(obj, dict):
+            try:
+                return float(obj.get("cost", default))
+            except Exception:
+                return default
+        return default
+
+
+def _try_wrap_dict_as_candidate(
+    entry: Any,
+    input_grid: np.ndarray,
+    target_grid: np.ndarray,
+    phi: np.ndarray,
+    settings: _InternalSearchSettings,
+) -> Optional[Candidate]:
+    """Attempt to convert a legacy dict beam entry into a Candidate instance."""
+    if not isinstance(entry, dict):
+        return None
+
+    Cand = globals().get("Candidate")
+    ProgCls = globals().get("Program")
+    if Cand is None or ProgCls is None:
+        return None
+
+    prog = entry.get("program")
+    if prog is None:
+        return None
+
+    cost = entry.get("cost")
+    if cost is None:
+        try:
+            cost = compute_cost(prog, input_grid, target_grid, phi, settings)
+        except Exception:
+            return None
+
+    telemetry: Dict[str, Any] = {}
+    telem_src = entry.get("telemetry")
+    if isinstance(telem_src, dict):
+        telemetry = dict(telem_src)
+
+    depth = entry.get("depth")
+    if depth is None:
+        try:
+            depth = len(getattr(prog, "steps", []))
+        except Exception:
+            depth = 0
+
+    cost_delta = entry.get("cost_delta", 0.0)
+    try:
+        cost_delta = float(cost_delta)
+    except Exception:
+        cost_delta = 0.0
+
+    try:
+        return Cand(
+            program=prog,
+            cost=float(cost),
+            depth=int(depth),
+            telemetry=telemetry,
+            cost_delta=cost_delta,
+        )
+    except Exception:
+        return None
+
+
 def _two_lane_prune(beam: List[Candidate], beam_width: int, best_cost: float, settings) -> List[Candidate]:
     if not beam:
         return []
@@ -6496,9 +6571,30 @@ def beam_search_one_pair(
             )
             visited.add(sig)
 
-    # prune to beam width right away
-    beam.sort()
-    beam = beam[:settings.beam_width]
+    # prune to beam width right away, tolerating legacy dict entries from motif seeding
+    sanitized: List[Candidate] = []
+    for entry in beam:
+        if _is_candidate(entry):
+            sanitized.append(entry)
+            continue
+        wrapped = _try_wrap_dict_as_candidate(entry, input_grid, target_grid, phi, settings)
+        if wrapped is not None:
+            sanitized.append(wrapped)
+    if not sanitized:
+        ProgCls = globals().get("Program")
+        CandCls = globals().get("Candidate")
+        if ProgCls is not None and CandCls is not None:
+            identity_prog = ProgCls([])
+            try:
+                base_cost = compute_cost(identity_prog, input_grid, target_grid, phi, settings)
+            except Exception:
+                base_cost = 1e9
+            sanitized.append(CandCls(identity_prog, float(base_cost), depth=0, telemetry={}, cost_delta=0.0))
+    try:
+        sanitized.sort()
+    except Exception:
+        sanitized = sorted(sanitized, key=_candidate_cost)
+    beam = sanitized[: settings.beam_width]
 
     # Track best solution found
     if best_so_far is None:
