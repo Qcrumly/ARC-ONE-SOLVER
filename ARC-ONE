@@ -3,15 +3,22 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.10.3-hotfix2 — Stack enumeration alignment + guarded toggles
+# Version: v2.10.4 — Stack restore, GOF calibration, face hysteresis
 #
 # CHANGELOG
+# v2.10.4 (2025-11-03)
+# - Fix: stack enumeration filter now validates axis at args[1] and restores stack candidates;
+#        optional ARC_DEBUG_STACK=1 prints a one-shot sample for inspection.
+# - Fix: motif seeding falls back to the local parser when memory returns zero steps.
+# - Fix: GOF R-thresholds calibrated to the kernel maximum so stretch/break gates are reachable.
+# - Add: ONE controller face dwell (ARC_FACE_DWELL_STEPS) to stabilize Explorer/Navigator/Observer.
+# - Add: Optional depth-0 size-op carve-out driven by scale_hard_thresh/ARC_SCALE_HARD_THRESH.
+#
 # v2.10.3-hotfix2 (2025-11-03)
 # - Fix: stack enumeration filter checked the wrong arg index; no stack candidates were generated.
 #        Now checks axis in args[1], matching executor (axis = int(args[1])).
 # - Dev: Optional ARC_DEBUG_STACK=1 prints a sample of stack combos during enumeration.
 # - (Optional, guarded) Add scale_hard_thresh setting with env override ARC_SCALE_HARD_THRESH.
-# - (Optional, guarded) Prune masked identity tiling during enumeration at depth 0.
 #
 # v2.10.3-hotfix1 (2025-11-03)
 #   - Exact-match early exit is now robust: win logging is wrapped in try/except and task_id is resolved defensively, so a NameError can never block the return. The solver now always exits immediately on exact predictions.
@@ -67,7 +74,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.10.3-hotfix2"  # Stack enumeration alignment + guarded toggles
+__version__ = "v2.10.4"  # Stack restore, GOF calibration, face hysteresis
 
 last_best_program = None
 
@@ -4430,6 +4437,12 @@ class SelfMonitor:
         self.conflict_spike = float(getattr(settings, "monitor_conflict_spike", 0.03))
         self.novelty_bonus = float(getattr(settings, "monitor_novelty_bonus", 0.1))
         self.face_enabled = bool(getattr(settings, "monitor_face_log", True))
+        try:
+            dwell_default = int(os.getenv("ARC_FACE_DWELL_STEPS", "6"))
+        except Exception:
+            dwell_default = 6
+        self._face_dwell = 0
+        self._face_dwell_max = max(0, int(getattr(settings, "face_dwell_steps", dwell_default)))
 
         # HFP integration
         self.hfp_on = bool(getattr(settings, "hfp_enable", True))
@@ -4574,19 +4587,34 @@ class SelfMonitor:
 
     def determine_face(self, C_mod: float) -> str:
         try:
-            hi, lo = self.hfp_rho_hi, self.hfp_rho_lo
+            lo = self.hfp_rho_lo
+            candidate = self.face
+
             if self.rho_sm < lo:
-                return "Explorer" if C_mod >= 50.0 else "Navigator"
-            sustained = False
-            if len(self.rho_hist) >= 3:
-                sustained = (self.rho_hist[-1] > 1.0 and self.rho_hist[-2] > 1.0)
-            if sustained:
-                return "Navigator" if C_mod >= 50.0 else "Observer"
-            if C_mod < 50.0:
-                return "Observer"
-            if C_mod < 150.0:
-                return "Navigator"
-            return "Explorer"
+                candidate = "Explorer" if C_mod >= 50.0 else "Navigator"
+            else:
+                sustained = False
+                if hasattr(self, "rho_hist") and len(self.rho_hist) >= 3:
+                    sustained = self.rho_hist[-1] > 1.0 and self.rho_hist[-2] > 1.0
+                if sustained:
+                    candidate = "Navigator" if C_mod >= 50.0 else "Observer"
+                else:
+                    if C_mod < 50.0:
+                        candidate = "Observer"
+                    elif C_mod < 150.0:
+                        candidate = "Navigator"
+                    else:
+                        candidate = "Explorer"
+
+            if candidate != self.face and self._face_dwell > 0:
+                self._face_dwell -= 1
+                return self.face
+
+            if candidate != self.face:
+                self.face = candidate
+                self._face_dwell = self._face_dwell_max
+
+            return self.face
         except Exception:
             return self.face
 
@@ -6879,20 +6907,18 @@ def enumerate_args(op_name: str, param_types: List[str], ctx) -> List[Tuple[Any,
         combos = filtered
 
     if op_name == "stack":
-        filtered = []
-        for args in combos:
-            if len(args) >= 2:
-                try:
-                    axis = int(args[1])
-                except Exception:
-                    continue
-                if axis in (0, 1):
-                    filtered.append(args)
-        combos = filtered
-        if os.getenv("ARC_DEBUG_STACK") == "1":
+        # --- stack enumeration fix & optional debug ---
+        combos = [args for args in combos if len(args) >= 2 and int(args[1]) in (0, 1)]
+
+        try:
+            _dbg = os.getenv("ARC_DEBUG_STACK", "0") == "1"
+        except Exception:
+            _dbg = False
+
+        if _dbg and not globals().get("_DEBUG_STACK_ONCE_FLAG__", False):
+            globals()["_DEBUG_STACK_ONCE_FLAG__"] = True
             try:
-                sample = ", ".join(str(c) for c in combos[:4])
-                print(f"[enum/stack] sample: {sample}")
+                print("[debug] enumerate_args('stack') combos (sample):", combos[:8])
             except Exception:
                 pass
 
@@ -8742,10 +8768,22 @@ Examples:
             print(f"[A/B] AttemptB boosted ×{_boost:.2f}")
     except Exception:
         pass
-    settings.hfp_break_R_min = _envfloat(
-        "ARC_R_BREAK", getattr(settings, "hfp_break_R_min", 0.010)
-    )
-    settings._hfp_R_good = _envfloat("ARC_R_GOOD", getattr(settings, "_hfp_R_good", 0.080))
+    R_MAX = 1.0 / (7.0 * math.e)
+    if "ARC_R_GOOD" in os.environ:
+        try:
+            settings._hfp_R_good = float(os.getenv("ARC_R_GOOD"))
+        except Exception:
+            settings._hfp_R_good = 0.60 * R_MAX
+    else:
+        settings._hfp_R_good = 0.60 * R_MAX
+
+    if "ARC_R_BREAK" in os.environ:
+        try:
+            settings.hfp_break_R_min = float(os.getenv("ARC_R_BREAK"))
+        except Exception:
+            settings.hfp_break_R_min = 0.15 * R_MAX
+    else:
+        settings.hfp_break_R_min = 0.15 * R_MAX
     
     # Apply ablation if specified
     if args.ablation:
