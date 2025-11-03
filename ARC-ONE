@@ -1297,22 +1297,58 @@ class _Deadline:
 
 
 def _grid_shape(grid):
-    if grid is None or len(grid) == 0:
+    """Return (H, W) for list-of-lists or numpy arrays. Never uses truthiness of array rows."""
+    if grid is None:
         return (0, 0)
-    return len(grid), len(grid[0]) if grid[0] else 0
+    # Fast path for numpy arrays
+    try:
+        import numpy as _np
+        if isinstance(grid, _np.ndarray):
+            if grid.ndim != 2:
+                return (0, 0)
+            h, w = grid.shape
+            return int(h), int(w)
+    except Exception:
+        pass
+    # Python lists/tuples
+    try:
+        h = len(grid)
+    except Exception:
+        return (0, 0)
+    if h == 0:
+        return (0, 0)
+    row0 = grid[0]
+    try:
+        w = len(row0)
+    except Exception:
+        return (h, 0)
+    return (h, w)
 
 
 def _shift_grid(grid, dy, dx, fill=0):
-    H, W = _grid_shape(grid)
-    if H == 0 or W == 0:
+    """Shift grid by (dy, dx). Robust to numpy/list input. Returns list-of-lists."""
+    import numpy as _np
+
+    arr = _np.asarray(grid, dtype=int)
+    if arr.ndim != 2:
         return grid
-    out = [[fill] * W for _ in range(H)]
-    for i in range(H):
-        for j in range(W):
-            ni, nj = i + dy, j + dx
-            if 0 <= ni < H and 0 <= nj < W:
-                out[ni][nj] = grid[i][j]
-    return out
+    H, W = arr.shape
+    out = _np.full((H, W), int(fill), dtype=int)
+
+    # Compute overlapping slice boxes
+    y_src_start = max(0, 0 - dy)
+    y_src_end = min(H, H - dy)
+    x_src_start = max(0, 0 - dx)
+    x_src_end = min(W, W - dx)
+
+    y_dst_start = y_src_start + dy
+    y_dst_end = y_src_end + dy
+    x_dst_start = x_src_start + dx
+    x_dst_end = x_src_end + dx
+
+    if (y_src_start < y_src_end) and (x_src_start < x_src_end):
+        out[y_dst_start:y_dst_end, x_dst_start:x_dst_end] = arr[y_src_start:y_src_end, x_src_start:x_src_end]
+    return out.tolist()
 
 
 def _rot180(grid):
@@ -1395,7 +1431,7 @@ def _build_belief(meta, train_pairs=None, phi=None, palette_safe=None, learned_m
 
 def _alternates_from_belief(att1, test_x, belief, train_pairs):
     alts = []
-    dy, dx = (0, 0)
+    dy, dx = 0, 0
     if belief.get("align_dy_dx") and len(belief["align_dy_dx"]) == 2:
         dy, dx = belief["align_dy_dx"]
     alts.append({"tag": "align_shift", "grid": _shift_grid(att1, dy, dx, fill=belief.get("bg", 0))})
