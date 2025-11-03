@@ -172,26 +172,68 @@ def _structure_area(arr, bg=0):
     return int((a != bg).sum())
 
 
-def _modal_train_components(train_pairs, bg=0):
-    try:
-        counts: List[int] = []
-        for (_x, y) in train_pairs or []:
-            arr = np.asarray(y)
-            labels, k = _cc_label((arr != bg).astype(np.uint8))
-            counts.append(int(k))
-        if not counts:
-            return None
-        values, freqs = np.unique(np.asarray(counts), return_counts=True)
-        return int(values[int(np.argmax(freqs))])
-    except Exception:
-        return None
+# --- Train-aware single-object heuristics (no test target required) ---
 
 
-def _area_nonbg(grid, bg=0):
+def _nonbg_area(grid, bg=0):
     try:
-        return int((np.asarray(grid) != bg).sum())
+        arr = np.asarray(grid)
+        return int((arr != bg).sum())
     except Exception:
         return 0
+
+
+def _modal_components_and_area(train_pairs, bg=0):
+    """
+    From training outputs, estimate typical component count and area.
+    Returns (modal_components, median_area) or (None, None) if unknown.
+    """
+
+    comps: List[int] = []
+    areas: List[int] = []
+    try:
+        for (_x, y) in (train_pairs or []):
+            arr = np.asarray(y)
+            labels, k = _cc_label((arr != bg).astype(np.uint8))
+            comps.append(int(k))
+            areas.append(int((arr != bg).sum()))
+        if not comps:
+            return (None, None)
+        vals, freqs = np.unique(np.array(comps), return_counts=True)
+        modal_k = int(vals[int(np.argmax(freqs))])
+        med_area = int(np.median(np.array(areas))) if areas else None
+        return (modal_k, med_area)
+    except Exception:
+        return (None, None)
+
+
+def _keep1_guard(candidate, train_pairs, belief, loosen=0.40):
+    """
+    If training suggests a single object, keep the single largest component.
+    Only apply if candidate area is 'reasonable' vs typical train area.
+    """
+
+    bg = (belief.get("bg", 0) if isinstance(belief, dict) else 0)
+    modal_k, med_area = _modal_components_and_area(train_pairs, bg=bg)
+    if modal_k != 1:
+        return candidate, False
+
+    cand_area = _nonbg_area(candidate, bg)
+    if med_area is None or cand_area == 0:
+        return candidate, False
+
+    lo = int((1.0 - loosen) * med_area)
+    hi = int((1.0 + loosen) * med_area)
+    if lo <= cand_area <= hi:
+        try:
+            try:
+                out = _keep_n_largest_ll(candidate, 1)
+            except Exception:
+                out = _largest_component_only(candidate, bg=bg)
+            return out, True
+        except Exception:
+            return candidate, False
+    return candidate, False
 
 
 def _fill_holes_ll(grid_ll):
@@ -1147,57 +1189,94 @@ def _first_candidate_by_family(candidates: Sequence[Dict[str, Any]], family: str
     return None
 
 
-# --- Forced diversity helper for Attempt-B ---
+# --- Stronger diversity forcing for Attempt-B ---
 import os
 
 
-def _force_diversity_B(base_grid, att2_grid, belief, pairs, settings, ops_tokens):
-    cap_default = float(getattr(settings, "iou_cap", 0.95)) if settings else 0.95
-    cap = float(os.getenv("ARC_IOU_CAP", str(cap_default)))
+def _force_diversity_B(gridA, gridB, belief, pairs, settings, ops_tokens):
+    """
+    Ensure B is sufficiently different from A by trying family alternates
+    and macro transforms until IoU(A,B) < ARC_IOU_CAP.
+    """
 
-    base_ll = _as_list2(base_grid)
-    att2_ll = _as_list2(att2_grid)
+    cap = float(os.getenv("ARC_IOU_CAP", getattr(settings, "iou_cap", 0.95)))
+
+    def _ok(candidate):
+        try:
+            return _pixel_iou(base_ll, candidate) < cap
+        except Exception:
+            return False
+
+    base_ll = _as_list2(gridA)
+    att2_ll = _as_list2(gridB)
     try:
         current_iou = _pixel_iou(base_ll, att2_ll)
     except Exception:
         current_iou = 1.0
     if current_iou < cap:
-        return att2_ll, current_iou
+        return att2_ll, current_iou, "as_is"
 
-    try:
-        families = _distinct_families_cycle(ops_tokens or [], exclude=ops_tokens)
-    except Exception:
-        families = ["align_first", "blockwise", "projection", "mirror_sym", "ring_fill"]
     tried = 0
-    for fam in families:
-        if tried >= 3:
+    try:
+        fams = _distinct_families_cycle(ops_tokens or [], exclude=ops_tokens)
+    except Exception:
+        fams = ["align_first", "blockwise", "projection", "mirror_sym", "ring_fill", "palette_map"]
+
+    for fam in fams:
+        if tried >= 4:
             break
         tried += 1
         try:
-            alternates = _build_family_alternates(base_ll, belief, fam)
+            cand = _build_program_variant(
+                base_ll,
+                None,
+                belief,
+                pairs,
+                settings,
+                ops_tokens,
+                force_family=fam,
+                forced_refiners=["fill_holes", "keep_n_largest(1)"],
+            )
         except Exception:
-            alternates = []
-        for alt in alternates:
-            grid_val = alt.get("grid") if isinstance(alt, dict) else alt
-            if grid_val is None:
-                continue
-            cand_ll = _apply_morph_pivot(_as_list2(grid_val))
-            try:
-                cand_iou = _pixel_iou(base_ll, cand_ll)
-            except Exception:
-                cand_iou = 1.0
-            if cand_iou < cap:
-                return cand_ll, cand_iou
+            cand = None
+        if cand is None:
+            continue
+        if _ok(cand):
+            return _as_list2(cand), _pixel_iou(base_ll, cand), f"family:{fam}"
+
+    pivots = []
+    try:
+        pivots = [
+            ("rot90", _rot90(att2_ll)),
+            ("rot180", _rot180(att2_ll)),
+            ("rot270", _rot270(att2_ll)),
+            ("mirror", _mirror_lr(att2_ll)),
+            ("flipud", _mirror_ud(att2_ll)),
+            ("transpose", _transpose(att2_ll)),
+        ]
+    except Exception:
+        pivots = []
+
+    for tag, pivot_grid in pivots:
+        try:
+            if _ok(pivot_grid):
+                return _as_list2(pivot_grid), _pixel_iou(base_ll, pivot_grid), f"pivot:{tag}"
+        except Exception:
+            continue
 
     try:
-        fallback = _mirror_lr(att2_ll)
+        remapped = _shift_grid(
+            _remap_palette_like_train(att2_ll, pairs),
+            1,
+            0,
+            fill=belief.get("bg", 0) if isinstance(belief, dict) else 0,
+        )
+        if _ok(remapped):
+            return _as_list2(remapped), _pixel_iou(base_ll, remapped), "remap+shift"
     except Exception:
-        fallback = att2_ll
-    try:
-        fallback_iou = _pixel_iou(base_ll, fallback)
-    except Exception:
-        fallback_iou = current_iou
-    return fallback, fallback_iou
+        pass
+
+    return att2_ll, current_iou, "stuck"
 
 
 def _build_family_alternates(base_grid, belief, family: str) -> List[Dict[str, Any]]:
@@ -2545,8 +2624,9 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     except Exception:
                         pass
 
+                forced_div_tag = "as_is"
                 try:
-                    att2_variant, i12_forced = _force_diversity_B(
+                    att2_variant, i12_forced, forced_div_tag = _force_diversity_B(
                         base,
                         att2,
                         belief,
@@ -2558,12 +2638,15 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     i12 = i12_forced
                     forced_alternate = True
                 except Exception:
+                    forced_div_tag = "error"
                     try:
                         att2 = _mirror_lr(att2)
                         i12 = _pixel_iou(base, att2)
                         forced_alternate = True
+                        forced_div_tag = "mirror"
                     except Exception:
                         i12 = i12 if i12 is not None else None
+                telemetry_kwargs["b_forced"] = forced_div_tag
 
                 cap_default_env = float(getattr(settings, "iou_cap", 0.95)) if settings else 0.95
                 cap_env = float(os.getenv("ARC_IOU_CAP", str(cap_default_env)))
@@ -2670,48 +2753,27 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             att2_entry = _enforce_diversity(att1_entry, att2_entry)
             _cap_telemetry(telemetry)
 
-            if i12 is None:
-                try:
-                    i12 = _pixel_iou(att1_entry["grid"], att2_entry["grid"])
-                except Exception:
-                    i12 = 0.0
+            telemetry["b_forced"] = telemetry_kwargs.get("b_forced", "as_is")
 
-            i12_float = float(i12 if i12 is not None else 0.0)
-            telemetry["ab_diversity_cap"] = float(telemetry_kwargs.get("ab_diversity_cap", cap_final))
-            telemetry["ab_iou12"] = float(i12_float)
-
-            gA = att1_entry["grid"]
-            gB = att2_entry["grid"]
-            tgt = target
-            bg_val = belief.get("bg", 0)
-            mode_comp = _modal_train_components(pairs if pairs else [], bg=bg_val)
-            single_object = mode_comp == 1 if mode_comp is not None else False
-            keep_applied = False
-
-            def _maybe_keep1(candidate, target_grid):
-                nonlocal keep_applied
-                if not single_object or target_grid is None:
-                    return candidate
-                try:
-                    cand_area = _area_nonbg(candidate, bg=bg_val)
-                    tgt_area = _area_nonbg(target_grid, bg=bg_val)
-                except Exception:
-                    return candidate
-                if cand_area >= tgt_area:
-                    try:
-                        refined = _keep_n_largest_ll(candidate, 1)
-                    except Exception:
-                        return candidate
-                    if refined != candidate:
-                        keep_applied = True
-                    return refined
-                return candidate
-
-            gA = _maybe_keep1(gA, tgt)
-            gB = _maybe_keep1(gB, tgt)
-
+            gA, keepA = _keep1_guard(att1_entry["grid"], pairs, belief)
+            gB, keepB = _keep1_guard(att2_entry["grid"], pairs, belief)
             att1_entry["grid"] = gA
             att2_entry["grid"] = gB
+            telemetry["keep1_A"] = bool(keepA)
+            telemetry["keep1_B"] = bool(keepB)
+            telemetry["keep1_applied"] = bool(keepA or keepB)
+
+            cap_default_env = float(getattr(settings, "iou_cap", 0.95)) if settings else 0.95
+            cap_env = float(os.getenv("ARC_IOU_CAP", str(cap_default_env)))
+            try:
+                i12 = _pixel_iou(att1_entry["grid"], att2_entry["grid"])
+            except Exception:
+                if i12 is None:
+                    i12 = 1.0
+            i12_float = float(i12 if i12 is not None else 0.0)
+            telemetry["ab_diversity_cap"] = cap_env
+            telemetry["ab_cap"] = cap_env
+            telemetry["ab_iou12"] = float(i12_float)
 
             conf1 = (choice or {}).get("conf1") if isinstance(choice, dict) else None
             conf2 = (choice or {}).get("conf2") if isinstance(choice, dict) else None
@@ -2748,15 +2810,18 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             pickB = mmrB > mmrA
 
             gap = abs(mmrA - mmrB)
-            strong_div = diversity >= 0.65
-            if (not pickB) and strong_div and (gap <= 0.02):
+            strong_div = diversity >= 0.55
+            if (not pickB) and strong_div and (gap <= 0.05):
                 pickB = True
 
             telemetry.update(
                 {
                     "diversity": float(diversity),
                     "div_lambda": float(div_lambda),
-                    "keep1_applied": bool(keep_applied),
+                    "keep1_applied": bool(telemetry.get("keep1_applied", False)),
+                    "keep1_A": bool(telemetry.get("keep1_A", False)),
+                    "keep1_B": bool(telemetry.get("keep1_B", False)),
+                    "b_forced": telemetry.get("b_forced", "as_is"),
                     "conf1": float(conf1),
                     "conf2": float(conf2),
                     "conf1_cal": float(cA),
@@ -2788,12 +2853,14 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             lam_str = f"{lam_val:.3f}" if isinstance(lam_val, (int, float)) else str(lam_val)
             div_val = entry["_telemetry"].get("diversity", 0.0)
             iou_val = entry["_telemetry"].get("ab_iou12", -1.0)
-            keep_flag = entry["_telemetry"].get("keep1_applied", False)
+            keepA = entry["_telemetry"].get("keep1_A", False)
+            keepB = entry["_telemetry"].get("keep1_B", False)
             chosen = entry["_telemetry"].get("chosen_attempt", "?")
             gap_val = entry["_telemetry"].get("gap", 0.0)
+            forced_tag = entry["_telemetry"].get("b_forced", "as_is")
             print(
                 f"[A/B] iou12={float(iou_val):.3f} div={float(div_val):.3f} λ={lam_str} "
-                f"chosen={chosen} gap={float(gap_val):.3f} keep1={keep_flag}"
+                f"chosen={chosen} gap={float(gap_val):.3f} keepA={keepA} keepB={keepB} forced={forced_tag}"
             )
 
             try:
@@ -8612,6 +8679,14 @@ Examples:
     settings.attemptB_time_scale = _envfloat(
         "ARC_ATTEMPTB_TIME_SCALE", getattr(settings, "attemptB_time_scale", 1.0)
     )
+    try:
+        _boost = float(os.getenv("ARC_ATTEMPTB_BOOST", "1.0"))
+        if _boost > 1.0:
+            settings.attemptB_beam_scale = getattr(settings, "attemptB_beam_scale", 1.0) * _boost
+            settings.attemptB_time_scale = getattr(settings, "attemptB_time_scale", 1.0) * _boost
+            print(f"[A/B] AttemptB boosted ×{_boost:.2f}")
+    except Exception:
+        pass
     settings.hfp_break_R_min = _envfloat(
         "ARC_R_BREAK", getattr(settings, "hfp_break_R_min", 0.010)
     )
