@@ -87,6 +87,7 @@ except ModuleNotFoundError:  # pragma: no cover - depends on environment
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Tuple, Optional, Any, Set, Iterable
 from collections import deque, defaultdict
+from functools import lru_cache
 import csv, time, random
 import itertools
 import math
@@ -369,157 +370,19 @@ def _set_determinism(seed=0):
 
 _set_determinism(0)
 
-print(f"[ARC-ONE] seed=0  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
+def _print_banner():
+    import os, random
+
+    seed_val = globals().get("SEED", None)
+    if seed_val is None:
+        seed_val = os.environ.get("ARC_SEED") or 0
+    print(f"[ARC-ONE] seed={seed_val}  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
 
 
-# === Determinism & banner ===
-try:  # Prefer real numpy but fall back to the shim if unavailable
-    import numpy as _np
-except ModuleNotFoundError:  # pragma: no cover - aligns with optional numpy install
-    _np = np  # type: ignore
-
-try:  # Memory helpers are optional
-    import arc_memory as MEM
-except Exception:  # pragma: no cover - memory module optional
-    MEM = None
+if __name__ == "__main__":
+    _print_banner()
 
 
-# ---- Memory motif token parsing & safe telemetry --------------------------------
-_OP_TOKEN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$")
-
-
-def _telemetry_note_safe(carrier, **kv):
-    """Silently attach telemetry if helper is available."""
-    try:
-        _telemetry_note  # type: ignore[name-defined]
-    except Exception:
-        return
-    try:
-        _telemetry_note(carrier, **kv)  # type: ignore[name-defined]
-    except Exception:
-        pass
-
-
-def _parse_seed_tokens_to_program(
-    tokens: Optional[List[str]],
-    StepCls: Optional[Any] = None,
-    ProgramCls: Optional[Any] = None,
-):
-    """Return (Program or None, number_of_steps) for a motif token list."""
-    if not tokens:
-        return None, 0
-    # Prefer arc_memory's permissive parser when available
-    try:
-        import arc_memory as MEM
-
-        if hasattr(MEM, "parse_op_tokens"):
-            steps = MEM.parse_op_tokens(list(tokens))
-            ProgType = ProgramCls or globals().get("Program")
-            if steps and ProgType is not None:
-                return ProgType(list(steps)), len(steps)
-    except Exception:
-        pass
-    # Conservative fallback: normalize tokens via the solver's operator regex if present
-    steps = []
-    _re = globals().get("_OP_TOKEN_RE", None)
-    for raw in tokens:
-        tok = (raw or "").strip()
-        if not tok:
-            continue
-        if _re:
-            m = _re.match(tok)
-            if m:
-                name, args = m.group(1), (m.group(2) or "").strip()
-            else:
-                name, args = tok, ""
-        else:
-            name = tok.split("(")[0].strip()
-            args = tok[tok.find("(") + 1 : tok.rfind(")")] if "(" in tok and ")" in tok else ""
-        arg_tuple = (
-            tuple([a.strip() for a in args.split(",") if a.strip()]) if args != "" else tuple()
-        )
-        StepType = StepCls or globals().get("Step")
-        if StepType is not None:
-            steps.append(StepType(name=name, args=arg_tuple))
-    ProgType = ProgramCls or globals().get("Program")
-    if steps and ProgType is not None:
-        return ProgType(steps), len(steps)
-    return None, 0
-
-
-def _enqueue_seed_programs(
-    frontier: List[Any],
-    input_grid: Any,
-    target_grid: Any,
-    seed_tokens_list: Optional[List[List[str]]],
-    interpret_program_fn,
-    compute_cost_fn,
-    step_cls: Optional[Any] = None,
-    prog_cls: Optional[Any] = None,
-    telem_carrier: Optional[Any] = None,
-) -> int:
-    """Append parsed motif programs to the frontier. Returns count appended."""
-    if not seed_tokens_list:
-        return 0
-
-    pushed = 0
-    for toks in seed_tokens_list:
-        prog, nops = _parse_seed_tokens_to_program(toks, StepCls=step_cls, ProgramCls=prog_cls)
-        if prog is None or not getattr(prog, "steps", None):
-            continue
-        try:
-            pred = interpret_program_fn(prog, input_grid)
-            cost = compute_cost_fn(prog, input_grid, target_grid)
-        except Exception:
-            continue
-
-        try:
-            if "BeamEntry" in globals():
-                entry = BeamEntry(program=prog, pred=pred, cost=cost)  # type: ignore[name-defined]
-            else:
-                entry = {"program": prog, "pred": pred, "cost": float(cost)}
-            frontier.append(entry)
-            _telemetry_note_safe(
-                entry,
-                memory_seeded_motif=list(toks or []),
-                memory_seed_ops=int(nops),
-                memory_seed_cost=float(cost),
-            )
-            if telem_carrier is not None:
-                _telemetry_note_safe(
-                    telem_carrier,
-                    memory_seeded_motif=list(toks or []),
-                    memory_seed_ops=int(nops),
-                    memory_seed_cost=float(cost),
-                )
-            pushed += 1
-        except Exception:
-            continue
-
-    return pushed
-
-
-def _parse_tokens_to_program(tokens: List[str]):
-    """Compat shim for callers expecting the older helper name."""
-    prog, _ = _parse_seed_tokens_to_program(tokens)
-    if prog is not None:
-        return prog
-    ProgramCls = globals().get("Program")
-    return ProgramCls([]) if ProgramCls is not None else []
-
-
-def _set_determinism(seed=0):
-    random.seed(seed)
-    try:
-        _np.random.seed(seed)
-    except Exception:
-        pass
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-
-
-_set_determinism(0)
-
-print(f"[ARC-ONE] seed=0  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
 
 
 # ==================================================================================
@@ -903,14 +766,21 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
 
 
 def _pixel_iou(a, b):
-    A, B = np.asarray(a), np.asarray(b)
-    if A.shape != B.shape:
+    # Safe equality-ratio for list-of-lists ints; returns 0.0 on mismatch/empty
+    if not a or not b:
         return 0.0
-    # Guard against empty arrays (0x0 region) to avoid ZeroDivisionError.
-    n = A.size
-    if n == 0:
-        return 0.0  # conservative: treat empty shapes as non-informative
-    return float((A == B).sum()) / float(n)
+    if len(a) != len(b):
+        return 0.0
+    if len(a[0]) != len(b[0]):
+        return 0.0
+    h, w = len(a), len(a[0])
+    same = 0
+    tot = h * w
+    for r in range(h):
+        ra, rb = a[r], b[r]
+        for c in range(w):
+            same += 1 if ra[c] == rb[c] else 0
+    return same / tot if tot else 0.0
 
 
 def _pick_two_attempts(cands, lambda_div=0.5, iou_cap=0.97, seed=1337):
@@ -1132,18 +1002,6 @@ def _apply_diversity_guard_candidates(base_grid, candidates, belief, settings, o
     return deduped if deduped else filtered, family
 
 
-def _pixel_iou_ll(a, b):
-    import numpy as np
-
-    A = np.asarray(a)
-    B = np.asarray(b)
-    if A.shape != B.shape or A.ndim != B.ndim:
-        return 0.0
-    if A.size == 0:
-        return 0.0
-    return float((A == B).sum()) / float(A.size)
-
-
 def _regenerate_alt_from_different_bucket(base_grid, belief, pairs):
     import numpy as np
 
@@ -1193,6 +1051,7 @@ def _regenerate_alt_from_different_bucket(base_grid, belief, pairs):
         pass
 
     threshold = 0.97
+    base_ll = base_np.tolist() if hasattr(base_np, "tolist") else base_np
     for tag, cand in candidates:
         try:
             cand_np = np.asarray(cand)
@@ -1200,9 +1059,10 @@ def _regenerate_alt_from_different_bucket(base_grid, belief, pairs):
             continue
         if cand_np.ndim != 2 or cand_np.shape != base_np.shape:
             continue
-        if _pixel_iou_ll(base_np, cand_np) < threshold:
-            return cand_np.tolist() if hasattr(cand_np, "tolist") else cand_np
-    return base_np.tolist() if hasattr(base_np, "tolist") else base_np
+        cand_ll = cand_np.tolist() if hasattr(cand_np, "tolist") else cand_np
+        if _pixel_iou(base_ll, cand_ll) < threshold:
+            return cand_ll
+    return base_ll
 
 
 def _is_degenerate_grid(grid, bg=0, max_bg_frac=0.95):
@@ -2272,12 +2132,14 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
 
                 try:
                     cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
-                    if _pixel_iou_ll(base, att2) >= cap:
+                    base_ll = base.tolist() if hasattr(base, "tolist") else base
+                    att2_ll = att2.tolist() if hasattr(att2, "tolist") else att2
+                    if _pixel_iou(base_ll, att2_ll) >= cap:
                         try:
-                            regenerated = _regenerate_alt_from_different_bucket(base, belief, pairs)
+                            regenerated = _regenerate_alt_from_different_bucket(base_ll, belief, pairs)
                             att2 = regenerated
                         except Exception:
-                            att2 = np.rot90(np.asarray(base), 2).tolist()
+                            att2 = np.rot90(np.asarray(base_ll), 2).tolist()
                 except Exception:
                     try:
                         att2 = np.rot90(np.asarray(base), 2).tolist()
@@ -5290,7 +5152,7 @@ def build_synth_context(input_grid, target_grid):
     }
 
 
-def _int_space_for(op_name, idx, ctx):
+def _int_space_for_base(op_name, idx, ctx):
     # idx: index among non-grid integer params
     if op_name == "rot90":
         return [1, 2, 3]
@@ -5372,6 +5234,100 @@ def _int_space_for(op_name, idx, ctx):
         big    = max(3, A // 20)    # ~5%
         return [(small, medium), (medium, big)]
     return list(range(10))
+
+
+def _ctx_sig(ctx):
+    depth = getattr(ctx, "depth", None)
+    block_identity = getattr(ctx, "block_identity", True)
+    rails_scale_hard = getattr(ctx, "rails_scale_hard", True)
+    scale_hard_steps = getattr(ctx, "scale_hard_steps", 1)
+    in_shape = ()
+    out_shape = ()
+    palette_in = ()
+    palette_out = ()
+    centroid_in = ()
+    centroid_out = ()
+    if isinstance(ctx, dict):
+        depth = ctx.get("depth", depth)
+        block_identity = ctx.get("block_identity", block_identity)
+        rails_scale_hard = ctx.get("rails_scale_hard", rails_scale_hard)
+        scale_hard_steps = ctx.get("scale_hard_steps", scale_hard_steps)
+        in_shape = tuple(ctx.get("in_shape") or ())
+        out_shape = tuple(ctx.get("out_shape") or ())
+        palette_in = tuple(ctx.get("palette_in") or ())
+        palette_out = tuple(ctx.get("palette_out") or ())
+        centroid_in = tuple(ctx.get("centroid_in") or ())
+        centroid_out = tuple(ctx.get("centroid_out") or ())
+    else:
+        in_shape = tuple(getattr(ctx, "in_shape", ()) or ())
+        out_shape = tuple(getattr(ctx, "out_shape", ()) or ())
+        palette_in = tuple(getattr(ctx, "palette_in", ()) or ())
+        palette_out = tuple(getattr(ctx, "palette_out", ()) or ())
+        centroid_in = tuple(getattr(ctx, "centroid_in", ()) or ())
+        centroid_out = tuple(getattr(ctx, "centroid_out", ()) or ())
+    depth_val = None if depth is None else int(depth)
+    try:
+        scale_steps = int(scale_hard_steps)
+    except Exception:
+        scale_steps = 1
+    return (
+        depth_val,
+        bool(block_identity),
+        bool(rails_scale_hard),
+        scale_steps,
+        in_shape,
+        out_shape,
+        palette_in,
+        palette_out,
+        centroid_in,
+        centroid_out,
+    )
+
+
+def _ctx_from_sig(sig):
+    (
+        _depth,
+        block_identity,
+        rails_scale_hard,
+        scale_hard_steps,
+        in_shape,
+        out_shape,
+        palette_in,
+        palette_out,
+        centroid_in,
+        centroid_out,
+    ) = sig
+    ctx = {
+        "in_shape": tuple(in_shape) if in_shape else (),
+        "out_shape": tuple(out_shape) if out_shape else (),
+        "palette_in": list(palette_in) if palette_in else [],
+        "palette_out": list(palette_out) if palette_out else [],
+        "centroid_in": tuple(centroid_in) if centroid_in else None,
+        "centroid_out": tuple(centroid_out) if centroid_out else None,
+    }
+    # propagate policy flags when available
+    ctx["block_identity"] = bool(block_identity)
+    ctx["rails_scale_hard"] = bool(rails_scale_hard)
+    ctx["scale_hard_steps"] = scale_hard_steps
+    return ctx
+
+
+@lru_cache(maxsize=None)
+def _int_space_for_cached(op_name, idx, ctx_sig):
+    if op_name == "stack":
+        return (0, 1)
+    if op_name == "scale":
+        allow_ident = not ctx_sig[1]
+        base = [2, 3] + ([1] if allow_ident else [])
+        return tuple(base)
+    ctx = _ctx_from_sig(ctx_sig)
+    return tuple(_int_space_for_base(op_name, idx, ctx))
+
+
+def _int_space_for(op_name, idx, ctx):
+    ctx_sig = _ctx_sig(ctx)
+    result = _int_space_for_cached(op_name, idx, ctx_sig)
+    return list(result)
 
 
 def beam_search_one_pair(
@@ -5942,6 +5898,29 @@ def beam_search_one_pair(
 
         # Score each successor
         for succ_prog in successors:
+            if getattr(settings, "block_identity", True):
+                tok = None
+                try:
+                    tok = succ_prog.steps[-1]
+                except Exception:
+                    tok = None
+                name = getattr(tok, "op", None) or getattr(tok, "name", None)
+                args = getattr(tok, "args", ()) if tok is not None else ()
+                if isinstance(args, np.ndarray):
+                    args = tuple(args.tolist())
+                if name in ("tile", "phase_tile"):
+                    args_seq = tuple(args[:2]) if isinstance(args, (list, tuple)) else ()
+                    if args_seq == (1, 1):
+                        continue
+                if name == "shift":
+                    if tuple(args) == (0, 0):
+                        continue
+                if name == "scale":
+                    args_tuple = tuple(args) if isinstance(args, (list, tuple)) else (args,)
+                    if len(args_tuple) == 1 and args_tuple[0] in (0, 1):
+                        continue
+                    if args_tuple in ((0, 0), (1, 1)):
+                        continue
             # Skip if visited
             prog_sig = succ_prog.to_tuple()
             if prog_sig in visited:
@@ -6202,12 +6181,12 @@ class MetaControllerUCB:
         # bundles are minimal & stable; adjust offline if needed
         self.bundle_map = {
             "scale": [
-                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
                 {"beam_width": 96, "lambda1": 0.30, "lambda2": 0.20, "max_train_pairs_for_beam": 2},
                 {"beam_width": 128, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
             ],
             "objectness": [
-                {"beam_width": 48, "lambda1": 0.35, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
+                {"beam_width": 48, "lambda1": 0.35, "lambda2": 0.15, "max_train_pairs_for_beam": 2},
                 {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
             ],
             "palette": [
@@ -6215,12 +6194,12 @@ class MetaControllerUCB:
                 {"beam_width": 96, "lambda1": 0.10, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
             ],
             "alignment": [
-                {"beam_width": 64, "lambda1": 0.25, "lambda2": 0.30, "max_train_pairs_for_beam": 1},
-                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 1},
+                {"beam_width": 64, "lambda1": 0.25, "lambda2": 0.30, "max_train_pairs_for_beam": 2},
+                {"beam_width": 64, "lambda1": 0.30, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
             ],
             "geometry": [
-                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.15, "max_train_pairs_for_beam": 1},
-                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 1},
+                {"beam_width": 48, "lambda1": 0.25, "lambda2": 0.15, "max_train_pairs_for_beam": 2},
+                {"beam_width": 128, "lambda1": 0.20, "lambda2": 0.10, "max_train_pairs_for_beam": 2},
             ],
             "pattern": [
                 {"beam_width": 128, "lambda1": 0.25, "lambda2": 0.25, "max_train_pairs_for_beam": 2},
