@@ -9240,6 +9240,10 @@ class SearchSettings:
     ephemeral_macros: bool = _envbool("ARC_EPHEMERAL_MACROS", False)
     macro_max_depth_start: int = _envint("ARC_MACRO_MAX_DEPTH_START", 2)
     macro_candidates_limit: int = _envint("ARC_MACRO_LIMIT", 6)
+    # cost weights (align with internal solver defaults)
+    lambda_len: float = _envfloat("ARC_LAMBDA_LEN", 0.20)
+    lambda1: float = _envfloat("ARC_LAMBDA1", 0.30)
+    lambda2: float = _envfloat("ARC_LAMBDA2", 0.20)
     max_bounces: int = 8
 
 _INTERNAL_SETTINGS_CLS = globals().get("_InternalSearchSettings")
