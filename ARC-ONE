@@ -3,7 +3,22 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.10.3-hotfix1 — Exact-match exit guard + IoU fix
+# Version: v2.10.5 — Shaped cost, two-lane beam, stronger A/B debate
+#
+# CHANGELOG
+# v2.10.4 (2025-11-03)
+# - Fix: stack enumeration filter now validates axis at args[1] and restores stack candidates;
+#        optional ARC_DEBUG_STACK=1 prints a one-shot sample for inspection.
+# - Fix: motif seeding falls back to the local parser when memory returns zero steps.
+# - Fix: GOF R-thresholds calibrated to the kernel maximum so stretch/break gates are reachable.
+# - Add: ONE controller face dwell (ARC_FACE_DWELL_STEPS) to stabilize Explorer/Navigator/Observer.
+# - Add: Optional depth-0 size-op carve-out driven by scale_hard_thresh/ARC_SCALE_HARD_THRESH.
+#
+# v2.10.3-hotfix2 (2025-11-03)
+# - Fix: stack enumeration filter checked the wrong arg index; no stack candidates were generated.
+#        Now checks axis in args[1], matching executor (axis = int(args[1])).
+# - Dev: Optional ARC_DEBUG_STACK=1 prints a sample of stack combos during enumeration.
+# - (Optional, guarded) Add scale_hard_thresh setting with env override ARC_SCALE_HARD_THRESH.
 #
 # v2.10.3-hotfix1 (2025-11-03)
 #   - Exact-match early exit is now robust: win logging is wrapped in try/except and task_id is resolved defensively, so a NameError can never block the return. The solver now always exits immediately on exact predictions.
@@ -59,7 +74,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.10.3-hotfix1"  # Exact-match exit guard + IoU fix
+__version__ = "v2.10.5"  # Shaped cost, two-lane beam, stronger A/B debate
 
 last_best_program = None
 
@@ -85,8 +100,8 @@ except ModuleNotFoundError:  # pragma: no cover - depends on environment
 
     np = _MissingNumpy()  # type: ignore
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Tuple, Optional, Any, Set, Iterable
-from collections import deque, defaultdict
+from typing import Dict, List, Tuple, Optional, Any, Set, Iterable, Sequence
+from collections import Counter, deque, defaultdict
 from functools import lru_cache
 import csv, time, random
 import itertools
@@ -101,6 +116,36 @@ import tempfile
 import shutil
 import hashlib
 import re
+
+
+def _envfloat(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _envint(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _envbool(name, default):
+    """Read boolean from env using permissive parsing (0/1, true/false)."""
+    default_str = "1" if default else "0"
+    raw = os.getenv(name, default_str)
+    try:
+        return bool(int(raw))
+    except Exception:
+        if isinstance(raw, str):
+            val = raw.strip().lower()
+            if val in {"true", "t", "yes", "y", "on"}:
+                return True
+            if val in {"false", "f", "no", "n", "off"}:
+                return False
+        return default
 try:
     from scipy.ndimage import label as _cc_label
 except Exception:  # pragma: no cover - optional SciPy dependency
@@ -112,21 +157,131 @@ except Exception:  # pragma: no cover - optional SciPy dependency
         h, w = arr.shape
         labels = np.zeros_like(arr, dtype=np.int32)
         current = 0
-        stack = []
         for y in range(h):
             for x in range(w):
                 if arr[y, x] and labels[y, x] == 0:
                     current += 1
                     labels[y, x] = current
-                    stack.append((y, x))
-                    while stack:
-                        yy, xx = stack.pop()
+                    dq = deque([(y, x)])
+                    while dq:
+                        yy, xx = dq.popleft()
                         for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                             ny, nx = yy + dy, xx + dx
                             if 0 <= ny < h and 0 <= nx < w and arr[ny, nx] and labels[ny, nx] == 0:
                                 labels[ny, nx] = current
-                                stack.append((ny, nx))
+                                dq.append((ny, nx))
         return labels, int(current)
+
+
+def _keep_n_largest_ll(grid_ll, n=1):
+    g = np.asarray(grid_ll)
+    if g.size == 0:
+        return g.tolist()
+    bg = 0
+    mask = (g != bg).astype(np.uint8)
+    labels, k = _cc_label(mask)
+    if k <= n:
+        return g.tolist()
+    areas = [(i, int((labels == i).sum())) for i in range(1, k + 1)]
+    areas.sort(key=lambda t: t[1], reverse=True)
+    keep = {i for i, _ in areas[: max(1, n)]}
+    out = g.copy()
+    out[~np.isin(labels, list(keep))] = bg
+    return out.tolist()
+
+
+def _structure_tuple(arr):
+    a = np.asarray(arr)
+    h, w = a.shape
+    return (h, w, int((a != 0).sum()))
+
+
+def _structure_area(arr, bg=0):
+    a = np.asarray(arr)
+    if a.ndim != 2:
+        return 0
+    return int((a != bg).sum())
+
+
+# --- Train-aware single-object heuristics (no test target required) ---
+
+
+def _nonbg_area(grid, bg=0):
+    try:
+        arr = np.asarray(grid)
+        return int((arr != bg).sum())
+    except Exception:
+        return 0
+
+
+def _modal_components_and_area(train_pairs, bg=0):
+    """
+    From training outputs, estimate typical component count and area.
+    Returns (modal_components, median_area) or (None, None) if unknown.
+    """
+
+    comps: List[int] = []
+    areas: List[int] = []
+    try:
+        for (_x, y) in (train_pairs or []):
+            arr = np.asarray(y)
+            labels, k = _cc_label((arr != bg).astype(np.uint8))
+            comps.append(int(k))
+            areas.append(int((arr != bg).sum()))
+        if not comps:
+            return (None, None)
+        vals, freqs = np.unique(np.array(comps), return_counts=True)
+        modal_k = int(vals[int(np.argmax(freqs))])
+        med_area = int(np.median(np.array(areas))) if areas else None
+        return (modal_k, med_area)
+    except Exception:
+        return (None, None)
+
+
+def _keep1_guard(candidate, train_pairs, belief, loosen=0.40):
+    """
+    If training suggests a single object, keep the single largest component.
+    Only apply if candidate area is 'reasonable' vs typical train area.
+    """
+
+    bg = (belief.get("bg", 0) if isinstance(belief, dict) else 0)
+    modal_k, med_area = _modal_components_and_area(train_pairs, bg=bg)
+    if modal_k != 1:
+        return candidate, False
+
+    cand_area = _nonbg_area(candidate, bg)
+    if med_area is None or cand_area == 0:
+        return candidate, False
+
+    lo = int((1.0 - loosen) * med_area)
+    hi = int((1.0 + loosen) * med_area)
+    if lo <= cand_area <= hi:
+        try:
+            try:
+                out = _keep_n_largest_ll(candidate, 1)
+            except Exception:
+                out = _largest_component_only(candidate, bg=bg)
+            return out, True
+        except Exception:
+            return candidate, False
+    return candidate, False
+
+
+def _fill_holes_ll(grid_ll):
+    arr = np.asarray(grid_ll)
+    if arr.ndim != 2:
+        return arr.tolist() if hasattr(arr, "tolist") else grid_ll
+    try:
+        filled = _op_fill_holes(arr)
+    except Exception:
+        return arr.tolist()
+    filled_arr = np.asarray(filled)
+    return filled_arr.tolist() if hasattr(filled_arr, "tolist") else filled
+
+
+def _apply_morph_pivot(grid_ll):
+    pivot = _keep_n_largest_ll(grid_ll, 1)
+    return _fill_holes_ll(pivot)
 
 
 # === Determinism & banner ===
@@ -161,16 +316,8 @@ def _cap_telemetry(telemetry: Optional[Dict[str, Any]]) -> None:
 
 
 def rvd_R(rho: float, eps: float = 1e-12) -> float:
-    """
-    Canonical Recursive Vantage Dynamics measure:
-      R(rho) = rho^7 * |ln(rho)|,  rho in (0,1]
-    Low R indicates stall/decay; use as break predicate.
-    """
-    rho = float(max(rho, eps))
-    if rho > 1.0:
-        # (optional) symmetric variant; comment out if not desired:
-        # rho = 1.0 / rho
-        rho = min(rho, 1.0)  # conservative: clamp to 1
+    """Anti-friction metric R(ρ)=ρ⁷·|ln ρ| for ρ∈(0,1]."""
+    rho = max(eps, min(1.0, float(rho)))
     return (rho ** 7) * abs(math.log(rho))
 
 
@@ -1051,6 +1198,118 @@ def _candidate_family_from_tag(tag: str) -> str:
     return "unknown"
 
 
+def _distinct_families_cycle(ops_tokens: Sequence[str], exclude: Optional[Sequence[str]] = None) -> List[str]:
+    used = _detect_strategy_family(list(ops_tokens) if ops_tokens is not None else [])
+    ordered = ["align_first", "object_first", "color_first", "tiling_first"]
+    if used in ordered:
+        ordered.remove(used)
+    if exclude:
+        exclude_set = {str(x) for x in exclude}
+        ordered = [fam for fam in ordered if fam not in exclude_set]
+    return ordered
+
+
+def _first_candidate_by_family(candidates: Sequence[Dict[str, Any]], family: str) -> Optional[Dict[str, Any]]:
+    for cand in candidates or []:
+        try:
+            tag = cand.get("tag")
+        except Exception:
+            tag = None
+        if _candidate_family_from_tag(str(tag)) == family:
+            return cand
+    return None
+
+
+# --- Stronger diversity forcing for Attempt-B ---
+import os
+
+
+def _force_diversity_B(gridA, gridB, belief, pairs, settings, ops_tokens):
+    """
+    Ensure B is sufficiently different from A by trying family alternates
+    and macro transforms until IoU(A,B) < ARC_IOU_CAP.
+    """
+
+    cap = float(os.getenv("ARC_IOU_CAP", getattr(settings, "iou_cap", 0.95)))
+
+    def _ok(candidate):
+        try:
+            return _pixel_iou(base_ll, candidate) < cap
+        except Exception:
+            return False
+
+    base_ll = _as_list2(gridA)
+    att2_ll = _as_list2(gridB)
+    try:
+        current_iou = _pixel_iou(base_ll, att2_ll)
+    except Exception:
+        current_iou = 1.0
+    if current_iou < cap:
+        return att2_ll, current_iou, "as_is"
+
+    tried = 0
+    try:
+        fams = _distinct_families_cycle(ops_tokens or [], exclude=ops_tokens)
+    except Exception:
+        fams = ["align_first", "blockwise", "projection", "mirror_sym", "ring_fill", "palette_map"]
+
+    for fam in fams:
+        if tried >= 4:
+            break
+        tried += 1
+        try:
+            cand = _build_program_variant(
+                base_ll,
+                None,
+                belief,
+                pairs,
+                settings,
+                ops_tokens,
+                force_family=fam,
+                forced_refiners=["fill_holes", "keep_n_largest(1)"],
+            )
+        except Exception:
+            cand = None
+        if cand is None:
+            continue
+        if _ok(cand):
+            return _as_list2(cand), _pixel_iou(base_ll, cand), f"family:{fam}"
+
+    pivots = []
+    try:
+        pivots = [
+            ("rot90", _rot90(att2_ll)),
+            ("rot180", _rot180(att2_ll)),
+            ("rot270", _rot270(att2_ll)),
+            ("mirror", _mirror_lr(att2_ll)),
+            ("flipud", _mirror_ud(att2_ll)),
+            ("transpose", _transpose(att2_ll)),
+        ]
+    except Exception:
+        pivots = []
+
+    for tag, pivot_grid in pivots:
+        try:
+            if _ok(pivot_grid):
+                return _as_list2(pivot_grid), _pixel_iou(base_ll, pivot_grid), f"pivot:{tag}"
+        except Exception:
+            continue
+
+    try:
+        remapped = _shift_grid(
+            _remap_palette_like_train(att2_ll, pairs),
+            1,
+            0,
+            fill=belief.get("bg", 0) if isinstance(belief, dict) else 0,
+        )
+        if _ok(remapped):
+            return _as_list2(remapped), _pixel_iou(base_ll, remapped), "remap+shift"
+    except Exception:
+        pass
+
+    return att2_ll, current_iou, "stuck"
+
+
 def _build_family_alternates(base_grid, belief, family: str) -> List[Dict[str, Any]]:
     import numpy as _np
 
@@ -1180,7 +1439,7 @@ def _regenerate_alt_from_different_bucket(base_grid, belief, pairs):
     except Exception:
         pass
 
-    threshold = 0.97
+    threshold = _envfloat("ARC_IOU_CAP", 0.97)
     base_ll = base_np.tolist() if hasattr(base_np, "tolist") else base_np
     for tag, cand in candidates:
         try:
@@ -1268,31 +1527,83 @@ class _Deadline:
         return _now() >= self.t_end
 
 
+def _as_array2(grid):
+    """Return (np.ndarray, H, W); accepts list-of-lists or ndarray. dtype=int."""
+    import numpy as _np
+
+    arr = _np.asarray(grid, dtype=int)
+    if arr.ndim != 2:
+        return _np.zeros((0, 0), dtype=int), 0, 0
+    h, w = arr.shape
+    return arr, int(h), int(w)
+
+
+def _as_list2(grid):
+    """Coerce grid to list-of-lists (even if already LoL)."""
+    import numpy as _np
+
+    if isinstance(grid, _np.ndarray):
+        return grid.tolist()
+    return grid
+
+
 def _grid_shape(grid):
-    if grid is None or len(grid) == 0:
-        return (0, 0)
-    return len(grid), len(grid[0]) if grid[0] else 0
+    """Return (H, W) for list-of-lists or ndarray. Never uses truthiness."""
+    _arr, h, w = _as_array2(grid)
+    return h, w
 
 
 def _shift_grid(grid, dy, dx, fill=0):
-    H, W = _grid_shape(grid)
-    if H == 0 or W == 0:
+    """Shift grid by (dy, dx). Robust to numpy/list input. Returns list-of-lists."""
+    import numpy as _np
+
+    arr = _np.asarray(grid, dtype=int)
+    if arr.ndim != 2:
         return grid
-    out = [[fill] * W for _ in range(H)]
-    for i in range(H):
-        for j in range(W):
-            ni, nj = i + dy, j + dx
-            if 0 <= ni < H and 0 <= nj < W:
-                out[ni][nj] = grid[i][j]
-    return out
+    H, W = arr.shape
+    out = _np.full((H, W), int(fill), dtype=int)
+
+    # Compute overlapping slice boxes
+    y_src_start = max(0, 0 - dy)
+    y_src_end = min(H, H - dy)
+    x_src_start = max(0, 0 - dx)
+    x_src_end = min(W, W - dx)
+
+    y_dst_start = y_src_start + dy
+    y_dst_end = y_src_end + dy
+    x_dst_start = x_src_start + dx
+    x_dst_end = x_src_end + dx
+
+    if (y_src_start < y_src_end) and (x_src_start < x_src_end):
+        out[y_dst_start:y_dst_end, x_dst_start:x_dst_end] = arr[y_src_start:y_src_end, x_src_start:x_src_end]
+    return out.tolist()
 
 
 def _rot180(grid):
-    return [row[::-1] for row in grid[::-1]] if grid else grid
+    import numpy as _np
+
+    arr, H, W = _as_array2(grid)
+    if H == 0 or W == 0:
+        return _as_list2(arr)
+    return _np.flip(_np.flip(arr, axis=0), axis=1).tolist()
 
 
 def _mirror_lr(grid):
-    return [row[::-1] for row in grid] if grid else grid
+    import numpy as _np
+
+    arr, H, W = _as_array2(grid)
+    if H == 0 or W == 0:
+        return _as_list2(arr)
+    return _np.flip(arr, axis=1).tolist()
+
+
+def _mirror_ud(grid):
+    import numpy as _np
+
+    arr, H, W = _as_array2(grid)
+    if H == 0 or W == 0:
+        return _as_list2(arr)
+    return _np.flip(arr, axis=0).tolist()
 
 
 def _largest_component_only(grid, bg=0):
@@ -1366,8 +1677,9 @@ def _build_belief(meta, train_pairs=None, phi=None, palette_safe=None, learned_m
 
 
 def _alternates_from_belief(att1, test_x, belief, train_pairs):
+    att1 = _as_list2(att1)
     alts = []
-    dy, dx = (0, 0)
+    dy, dx = 0, 0
     if belief.get("align_dy_dx") and len(belief["align_dy_dx"]) == 2:
         dy, dx = belief["align_dy_dx"]
     alts.append({"tag": "align_shift", "grid": _shift_grid(att1, dy, dx, fill=belief.get("bg", 0))})
@@ -1917,16 +2229,16 @@ class _RunningStats:
 
 
 def _adjust_abort_windows(settings, seconds, have_shape_match):
-    stall = seconds / 3.0
-    abort_after = seconds / 3.0
+    stall = max(seconds / 3.0, 2.0)
+    abort_after = max(seconds / 3.0, 2.0)
     rho_s = getattr(settings, "_hfp_rho_smoothed", None)
     ready = bool(getattr(settings, "_hfp_ready", False))
     if rho_s is not None and rho_s >= 0.95:
         stall = max(stall, 0.80 * seconds)
         abort_after = max(abort_after, 0.80 * seconds)
     if ready and rho_s is not None and rho_s < 0.70:
-        stall = min(stall, 0.20 * seconds)
-        abort_after = min(abort_after, 0.20 * seconds)
+        stall = max(min(stall, 0.20 * seconds), 2.0)
+        abort_after = max(min(abort_after, 0.20 * seconds), 2.0)
     return stall, abort_after
 
 
@@ -2145,7 +2457,7 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
                 logger.log_kv("octo_z", float(octo_z_val))
                 logger.log_kv("block_identity", bool(getattr(base_settings, "block_identity", True)))
                 logger.log_kv("rails_scale_hard", bool(getattr(base_settings, "rails_scale_hard", True)))
-                logger.log_kv("scale_hard_thresh", float(getattr(base_settings, "scale_hard_thresh", 1.0)))
+                logger.log_kv("scale_hard_thresh", float(getattr(base_settings, "scale_hard_thresh", 0.60)))
                 logger.log_kv("scale_hard_steps", int(getattr(base_settings, "scale_hard_steps", 3)))
                 logger.log_kv(
                     "early_palette_block_steps",
@@ -2169,7 +2481,7 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
             lowdiv_skim=lowdiv_value,
             block_identity=bool(getattr(base_settings, "block_identity", True)),
             rails_scale_hard=bool(getattr(base_settings, "rails_scale_hard", True)),
-            scale_hard_thresh=float(getattr(base_settings, "scale_hard_thresh", 1.0)),
+            scale_hard_thresh=float(getattr(base_settings, "scale_hard_thresh", 0.60)),
             scale_hard_steps=int(getattr(base_settings, "scale_hard_steps", 3)),
             early_palette_block_steps=int(getattr(base_settings, "early_palette_block_steps", 3)),
         )
@@ -2255,6 +2567,10 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             palette_info = None
             choice = None
             forced_alternate = False
+            target = None
+            if isinstance(test_in, dict):
+                target = test_in.get("output")
+            i12 = None
             if _is_masked_tiling(meta_dict):
                 att2 = _masked_tiling_alternate(base, meta)
                 policy_tag = "masked_raw"
@@ -2271,7 +2587,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         attempt_policy=policy_tag,
                         block_identity=bool(getattr(settings, "block_identity", True)) if settings else True,
                         rails_scale_hard=bool(getattr(settings, "rails_scale_hard", True)) if settings else True,
-                        scale_hard_thresh=float(getattr(settings, "scale_hard_thresh", 1.0)) if settings else 1.0,
+                        scale_hard_thresh=float(getattr(settings, "scale_hard_thresh", 0.60)) if settings else 0.60,
                         scale_hard_steps=int(getattr(settings, "scale_hard_steps", 3)) if settings else 3,
                         early_palette_block_steps=int(getattr(settings, "early_palette_block_steps", 3)) if settings else 3,
                     )
@@ -2286,6 +2602,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         forced_alternate = True
                     except Exception:
                         pass
+                base = _as_list2(base)
                 candidates.extend(_alternates_from_belief(base, test_in, belief, pairs))
                 ops_tokens = (meta_dict.get("_telemetry", {}) or {}).get("ops_tokens", [])
                 candidates, family_tag = _apply_diversity_guard_candidates(base, candidates, belief, settings, ops_tokens)
@@ -2338,24 +2655,39 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     except Exception:
                         pass
 
+                forced_div_tag = "as_is"
                 try:
-                    cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
-                    base_ll = base.tolist() if hasattr(base, "tolist") else base
-                    att2_ll = att2.tolist() if hasattr(att2, "tolist") else att2
-                    if _pixel_iou(base_ll, att2_ll) >= cap:
-                        try:
-                            regenerated = _regenerate_alt_from_different_bucket(base_ll, belief, pairs)
-                            att2 = regenerated
-                            forced_alternate = True
-                        except Exception:
-                            att2 = np.rot90(np.asarray(base_ll), 2).tolist()
-                            forced_alternate = True
-                except Exception:
-                    try:
-                        att2 = np.rot90(np.asarray(base), 2).tolist()
-                    except Exception:
-                        att2 = base
+                    att2_variant, i12_forced, forced_div_tag = _force_diversity_B(
+                        base,
+                        att2,
+                        belief,
+                        pairs,
+                        settings,
+                        ops_tokens,
+                    )
+                    att2 = att2_variant
+                    i12 = i12_forced
                     forced_alternate = True
+                except Exception:
+                    forced_div_tag = "error"
+                    try:
+                        att2 = _mirror_lr(att2)
+                        i12 = _pixel_iou(base, att2)
+                        forced_alternate = True
+                        forced_div_tag = "mirror"
+                    except Exception:
+                        i12 = i12 if i12 is not None else None
+                telemetry_kwargs["b_forced"] = forced_div_tag
+
+                cap_default_env = float(getattr(settings, "iou_cap", 0.95)) if settings else 0.95
+                cap_env = float(os.getenv("ARC_IOU_CAP", str(cap_default_env)))
+                telemetry_kwargs["ab_diversity_cap"] = cap_env
+                if i12 is None:
+                    try:
+                        i12 = _pixel_iou(base, att2)
+                    except Exception:
+                        i12 = 1.0
+                telemetry_kwargs["ab_iou12"] = float(i12)
 
                 cand_list: List[Dict[str, Any]] = []
                 for tag_name, grid_val in (("attemptA", base), ("attemptB", att2)):
@@ -2368,9 +2700,11 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         }
                     )
 
-                lam_final = float(getattr(settings, "div_lambda", 0.50)) if settings else 0.50
+                lam_default = float(getattr(settings, "div_lambda", 0.50)) if settings else 0.50
+                lam_final = _envfloat("ARC_DIV_LAMBDA", lam_default)
                 lam_final *= float(getattr(settings, "attemptB_beam_scale", 1.0) if settings else 1.0)
-                cap_final = float(getattr(settings, "iou_cap", 0.97)) if settings else 0.97
+                cap_default = float(getattr(settings, "iou_cap", 0.97)) if settings else 0.97
+                cap_final = _envfloat("ARC_IOU_CAP", cap_default)
                 seed_val = int(getattr(settings, "seed", 1337)) if settings and hasattr(settings, "seed") else 1337
                 first_sel, second_sel, i12 = _pick_two_attempts(
                     cand_list,
@@ -2423,7 +2757,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     {
                         "block_identity": bool(getattr(settings, "block_identity", True)) if settings else True,
                         "rails_scale_hard": bool(getattr(settings, "rails_scale_hard", True)) if settings else True,
-                        "scale_hard_thresh": float(getattr(settings, "scale_hard_thresh", 1.0)) if settings else 1.0,
+                        "scale_hard_thresh": float(getattr(settings, "scale_hard_thresh", 0.60)) if settings else 0.60,
                         "scale_hard_steps": int(getattr(settings, "scale_hard_steps", 3)) if settings else 3,
                         "early_palette_block_steps": int(getattr(settings, "early_palette_block_steps", 3)) if settings else 3,
                     }
@@ -2449,16 +2783,162 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             att2_entry = {"grid": att2_np.tolist(), "_telemetry": telemetry, "meta": meta_dict}
             att2_entry = _enforce_diversity(att1_entry, att2_entry)
             _cap_telemetry(telemetry)
+
+            telemetry["b_forced"] = telemetry_kwargs.get("b_forced", "as_is")
+
+            gA, keepA = _keep1_guard(att1_entry["grid"], pairs, belief)
+            gB, keepB = _keep1_guard(att2_entry["grid"], pairs, belief)
+            att1_entry["grid"] = gA
+            att2_entry["grid"] = gB
+            telemetry["keep1_A"] = bool(keepA)
+            telemetry["keep1_B"] = bool(keepB)
+            telemetry["keep1_applied"] = bool(keepA or keepB)
+
+            cap_default_env = float(getattr(settings, "iou_cap", 0.95)) if settings else 0.95
+            cap_env = float(os.getenv("ARC_IOU_CAP", str(cap_default_env)))
+            try:
+                i12 = _pixel_iou(att1_entry["grid"], att2_entry["grid"])
+            except Exception:
+                if i12 is None:
+                    i12 = 1.0
+            i12_float = float(i12 if i12 is not None else 0.0)
+            telemetry["ab_diversity_cap"] = cap_env
+            telemetry["ab_cap"] = cap_env
+            telemetry["ab_iou12"] = float(i12_float)
+
+            if settings and getattr(settings, "attemptB_auto_boost", False):
+                stuck = int(getattr(settings, "_ab_stuck", 0))
+                if float(i12_float) >= float(cap_env) - 1e-9:
+                    stuck += 1
+                    if stuck >= 2:
+                        try:
+                            boost_beam = float(getattr(settings, "attemptB_boost_beam", 1.5))
+                            boost_time = float(getattr(settings, "attemptB_boost_time", 1.3))
+                            settings.attemptB_beam_scale = max(
+                                float(getattr(settings, "attemptB_beam_scale", 1.0)), boost_beam
+                            )
+                            settings.attemptB_time_scale = max(
+                                float(getattr(settings, "attemptB_time_scale", 1.0)), boost_time
+                            )
+                        except Exception:
+                            pass
+                else:
+                    stuck = 0
+                setattr(settings, "_ab_stuck", stuck)
+
+            conf1 = (choice or {}).get("conf1") if isinstance(choice, dict) else None
+            conf2 = (choice or {}).get("conf2") if isinstance(choice, dict) else None
+            try:
+                conf1 = float(conf1) if conf1 is not None else _surrogate_conf(att1_entry["grid"], belief)
+            except Exception:
+                conf1 = _surrogate_conf(att1_entry["grid"], belief)
+            try:
+                conf2 = float(conf2) if conf2 is not None else _surrogate_conf(att2_entry["grid"], belief)
+            except Exception:
+                conf2 = _surrogate_conf(att2_entry["grid"], belief)
+
+            diversity = 1.0 - float(i12_float)
+            lam_default = float(getattr(settings, "div_lambda", 0.30)) if settings else 0.30
+            try:
+                div_lambda = float(os.getenv("ARC_DIV_LAMBDA", str(lam_default)))
+            except Exception:
+                div_lambda = lam_default
+
+            def _calib(x):
+                try:
+                    return 1.0 / (1.0 + math.exp(-3.0 * (float(x) - 0.5)))
+                except Exception:
+                    try:
+                        return float(x)
+                    except Exception:
+                        return 0.0
+
+            cA = _calib(conf1)
+            cB = _calib(conf2)
+
+            mmrA = cA + div_lambda * diversity
+            mmrB = cB + div_lambda * diversity
+            pickB = mmrB > mmrA
+
+            gap = abs(mmrA - mmrB)
+            strong_div = diversity >= 0.55
+            if (not pickB) and strong_div and (gap <= 0.05):
+                pickB = True
+
+            telemetry.update(
+                {
+                    "diversity": float(diversity),
+                    "div_lambda": float(div_lambda),
+                    "keep1_applied": bool(telemetry.get("keep1_applied", False)),
+                    "keep1_A": bool(telemetry.get("keep1_A", False)),
+                    "keep1_B": bool(telemetry.get("keep1_B", False)),
+                    "b_forced": telemetry.get("b_forced", "as_is"),
+                    "conf1": float(conf1),
+                    "conf2": float(conf2),
+                    "conf1_cal": float(cA),
+                    "conf2_cal": float(cB),
+                    "mmrA": float(mmrA),
+                    "mmrB": float(mmrB),
+                    "gap": float(gap),
+                }
+            )
+
+            telemetry["chosen_attempt"] = "B" if pickB else "A"
+
+            final_grid = gB if pickB else gA
+
             entry = {
-                "attempt_1": att1_entry["grid"],
-                "attempt_2": att2_entry["grid"],
-                "grid": att1_entry["grid"],
-                "_telemetry": telemetry,
-                "iou12": i12,
+                "attempt_1": gA,
+                "attempt_2": gB,
+                "grid": final_grid,
+                "_telemetry": {
+                    **telemetry,
+                    "chosen_attempt": "B" if pickB else "A",
+                    "ab_diversity_cap": float(telemetry.get("ab_diversity_cap", cap_final)),
+                    "ab_iou12": float(telemetry.get("ab_iou12", i12_float)),
+                },
+                "iou12": i12 if i12 is not None else i12_float,
             }
+
+            lam_val = entry["_telemetry"].get("div_lambda")
+            lam_str = f"{lam_val:.3f}" if isinstance(lam_val, (int, float)) else str(lam_val)
+            div_val = entry["_telemetry"].get("diversity", 0.0)
+            iou_val = entry["_telemetry"].get("ab_iou12", -1.0)
+            keepA = entry["_telemetry"].get("keep1_A", False)
+            keepB = entry["_telemetry"].get("keep1_B", False)
+            chosen = entry["_telemetry"].get("chosen_attempt", "?")
+            gap_val = entry["_telemetry"].get("gap", 0.0)
+            forced_tag = entry["_telemetry"].get("b_forced", "as_is")
+            print(
+                f"[A/B] iou12={float(iou_val):.3f} div={float(div_val):.3f} λ={lam_str} "
+                f"chosen={chosen} gap={float(gap_val):.3f} keepA={keepA} keepB={keepB} forced={forced_tag}"
+            )
+
+            try:
+                _telemetry_note(
+                    entry,
+                    chosen="B" if pickB else "A",
+                    conf1=float(conf1),
+                    conf2=float(conf2),
+                    dis=float(diversity),
+                    lam=float(div_lambda),
+                )
+            except Exception:
+                pass
+
+            telemetry = entry["_telemetry"]
+            _cap_telemetry(telemetry)
+            att1_entry["_telemetry"] = telemetry
+            att2_entry["_telemetry"] = telemetry
+
             _telemetry_note(
                 entry,
                 seconds_after_schedule=float(getattr(settings, "max_seconds", 0.0) if settings else 0.0),
+            )
+            _telemetry_note(
+                entry,
+                mmrA=float(mmrA),
+                mmrB=float(mmrB),
             )
             cli_args = globals().get("_CLI_ARGS")
             if getattr(cli_args, "octo_stats_csv", None):
@@ -3993,19 +4473,19 @@ class SelfMonitor:
         self.conflict_spike = float(getattr(settings, "monitor_conflict_spike", 0.03))
         self.novelty_bonus = float(getattr(settings, "monitor_novelty_bonus", 0.1))
         self.face_enabled = bool(getattr(settings, "monitor_face_log", True))
+        try:
+            dwell_default = int(os.getenv("ARC_FACE_DWELL_STEPS", "6"))
+        except Exception:
+            dwell_default = 6
+        self._face_dwell = 0
+        self._face_dwell_max = max(0, int(getattr(settings, "face_dwell_steps", dwell_default)))
 
         # HFP integration
         self.hfp_on = bool(getattr(settings, "hfp_enable", True))
         self.hfp_alpha = float(getattr(settings, "hfp_alpha", 0.5))
         self.hfp_rho_hi = float(getattr(settings, "hfp_rho_hi", 0.8))
         self.hfp_rho_lo = float(getattr(settings, "hfp_rho_lo", 0.55))
-        self.hfp_break_R_min = float(
-            getattr(
-                settings,
-                "hfp_break_R_min",
-                getattr(settings, "hfp_break_R", 0.010),
-            )
-        )
+        self.hfp_break_R_min = float(getattr(settings, "hfp_break_R_min", 0.010))
         self.hfp_gate = bool(getattr(settings, "hfp_gate_by_health", True))
         self.hfp_gate_keep = bool(getattr(settings, "hfp_gate_keep", True))
         self.hfp_dbg = bool(getattr(settings, "hfp_debug_telemetry", True))
@@ -4143,19 +4623,34 @@ class SelfMonitor:
 
     def determine_face(self, C_mod: float) -> str:
         try:
-            hi, lo = self.hfp_rho_hi, self.hfp_rho_lo
+            lo = self.hfp_rho_lo
+            candidate = self.face
+
             if self.rho_sm < lo:
-                return "Explorer" if C_mod >= 50.0 else "Navigator"
-            sustained = False
-            if len(self.rho_hist) >= 3:
-                sustained = (self.rho_hist[-1] > 1.0 and self.rho_hist[-2] > 1.0)
-            if sustained:
-                return "Navigator" if C_mod >= 50.0 else "Observer"
-            if C_mod < 50.0:
-                return "Observer"
-            if C_mod < 150.0:
-                return "Navigator"
-            return "Explorer"
+                candidate = "Explorer" if C_mod >= 50.0 else "Navigator"
+            else:
+                sustained = False
+                if hasattr(self, "rho_hist") and len(self.rho_hist) >= 3:
+                    sustained = self.rho_hist[-1] > 1.0 and self.rho_hist[-2] > 1.0
+                if sustained:
+                    candidate = "Navigator" if C_mod >= 50.0 else "Observer"
+                else:
+                    if C_mod < 50.0:
+                        candidate = "Observer"
+                    elif C_mod < 150.0:
+                        candidate = "Navigator"
+                    else:
+                        candidate = "Explorer"
+
+            if candidate != self.face and self._face_dwell > 0:
+                self._face_dwell -= 1
+                return self.face
+
+            if candidate != self.face:
+                self.face = candidate
+                self._face_dwell = self._face_dwell_max
+
+            return self.face
         except Exception:
             return self.face
 
@@ -4369,8 +4864,6 @@ def _gof_shield_resize_args_enum(op_obj):
         depth = 0
         if prog is not None:
             depth = _gof_prog_depth(prog)
-        if depth < K_NO_SIZEOPS_AT_START:
-            return iter(())
         s = 0.0
         if prog is not None:
             s = getattr(prog, "_rails_s", None)
@@ -4384,6 +4877,15 @@ def _gof_shield_resize_args_enum(op_obj):
             ia = int(ctx["in_shape"][0]) * int(ctx["in_shape"][1])
             oa = int(ctx["out_shape"][0]) * int(ctx["out_shape"][1])
             s = -1.0 if oa < 0.9 * ia else (+1.0 if oa > 1.1 * ia else 0.0)
+        hard = 1.0
+        env_val = os.getenv("ARC_SCALE_HARD_THRESH")
+        if env_val is not None:
+            try:
+                hard = float(env_val)
+            except Exception:
+                pass
+        if depth < K_NO_SIZEOPS_AT_START and abs(s) < hard:
+            return iter(())
         for args in old(*aa, **kk):
             try:
                 h, w = int(args[0]), int(args[1])
@@ -4722,12 +5224,21 @@ def _gate_allowed_ops(
         names -= (PALETTE_OPS & names)
 
     if depth < K_NO_SIZEOPS_AT_START:
-        names = {n for n in names if n not in _RESIZE_OPS and n not in _TILING_OPS}
+        try:
+            s = float(phi[0]) if (phi is not None and len(phi) > 0) else 0.0
+        except Exception:
+            s = 0.0
+        try:
+            hard = float(getattr(settings, "scale_hard_thresh", 0.60))
+        except Exception:
+            hard = 0.60
+        if abs(s) < hard:
+            names = {n for n in names if n not in _RESIZE_OPS and n not in _TILING_OPS}
 
     if getattr(settings, "rails_scale_hard", True) and phi is not None and len(phi) > 0:
         try:
             s = float(phi[0])
-            thr = float(getattr(settings, "scale_hard_thresh", 1.0))
+            thr = float(getattr(settings, "scale_hard_thresh", 0.60))
             k_rail = int(getattr(settings, "scale_hard_steps", 3))
         except Exception:
             s, thr, k_rail = 0.0, 1.0, 3
@@ -4920,9 +5431,10 @@ def task_features(train_pairs: List[Tuple[np.ndarray, np.ndarray]]) -> Dict[str,
 
 def compute_phi(features: Dict[str, Any]) -> np.ndarray:
     """
-    Compute 8D octonion embedding φ from task features.
-    
+    Compute 8D feature embedding φ from task features.
+
     φ = [scale, objectness, palette, geometry, alignment, topology, pattern, composition]
+    (We no longer lean on octonion algebra; this is a compact feature vector.)
     """
     n = features["n_examples"]
     size_stable = features["size_stable"]
@@ -5131,8 +5643,8 @@ class _InternalSearchSettings:
     allow_finishers_on_masked: bool = False
     no_polish: bool = False
     stop_if_diversity: float = 0.20
-    div_lambda: float = 0.50
-    iou_cap: float = 0.97
+    div_lambda: float = 0.70
+    iou_cap: float = 0.92
     max_bounces: int = 8
     _hfp_prevC: Optional[float] = None
     _hfp_rho: Optional[float] = None
@@ -5153,7 +5665,7 @@ class _InternalSearchSettings:
     # GOF-9000 constraint pack
     block_identity: bool = True
     rails_scale_hard: bool = True
-    scale_hard_thresh: float = 1.0
+    scale_hard_thresh: float = 0.60
     scale_hard_steps: int = 3
     early_palette_block_steps: int = 3
     # GOF-9000 SelfMonitor defaults
@@ -5174,6 +5686,16 @@ class _InternalSearchSettings:
     diversity_b_force_first: bool = False   # force different first op for B when align-first
     attemptB_beam_scale: float = 1.0        # heuristic scaling for diversity alt
     attemptB_time_scale: float = 1.0        # heuristic scaling for debate/time
+    attemptB_auto_boost: bool = True        # auto-boost B when IoU cap keeps triggering
+    attemptB_boost_beam: float = 1.5
+    attemptB_boost_time: float = 1.3
+    shaped_cost: bool = True
+    explore_fraction: float = 0.35
+    allow_uphill: bool = True
+    uphill_keep_fraction: float = 0.15
+    ephemeral_macros: bool = False
+    macro_max_depth_start: int = 2
+    macro_candidates_limit: int = 6
     hfp_enable: bool = True
     hfp_alpha: float = 0.50
     hfp_rho_hi: float = 0.80
@@ -5182,6 +5704,127 @@ class _InternalSearchSettings:
     hfp_gate_by_health: bool = True
     hfp_gate_keep: bool = True
     hfp_debug_telemetry: bool = True
+
+    def __post_init__(self):
+        env_val = os.getenv("ARC_SCALE_HARD_THRESH")
+        if env_val is not None:
+            try:
+                self.scale_hard_thresh = float(env_val)
+            except Exception:
+                pass
+        self.shaped_cost = _envbool("ARC_SHAPED_COST", self.shaped_cost)
+        self.explore_fraction = _envfloat("ARC_EXPLORE_FRAC", self.explore_fraction)
+        self.allow_uphill = _envbool("ARC_ALLOW_UPHILL", self.allow_uphill)
+        self.uphill_keep_fraction = _envfloat("ARC_UPHILL_KEEP", self.uphill_keep_fraction)
+        self.attemptB_auto_boost = _envbool("ARC_ATTEMPTB_AUTO_BOOST", self.attemptB_auto_boost)
+        self.attemptB_boost_beam = _envfloat("ARC_ATTEMPTB_BOOST_BEAM", self.attemptB_boost_beam)
+        self.attemptB_boost_time = _envfloat("ARC_ATTEMPTB_BOOST_TIME", self.attemptB_boost_time)
+        self.ephemeral_macros = _envbool("ARC_EPHEMERAL_MACROS", self.ephemeral_macros)
+        self.macro_max_depth_start = _envint("ARC_MACRO_MAX_DEPTH_START", self.macro_max_depth_start)
+        self.macro_candidates_limit = _envint("ARC_MACRO_LIMIT", self.macro_candidates_limit)
+
+
+def _infer_bg_color(arr: np.ndarray) -> int:
+    hist = np.bincount(arr.ravel().astype(int), minlength=10)
+    return int(hist.argmax())
+
+
+def _binary_mask(arr: np.ndarray, bg: Optional[int] = None) -> np.ndarray:
+    if bg is None:
+        bg = _infer_bg_color(arr)
+    return (arr != bg).astype(np.uint8)
+
+
+def _pool2x(mask: np.ndarray, iters: int = 1) -> np.ndarray:
+    m = mask
+    for _ in range(max(0, iters)):
+        h, w = m.shape
+        if h < 2 or w < 2:
+            break
+        hh, ww = (h // 2) * 2, (w // 2) * 2
+        if hh == 0 or ww == 0:
+            break
+        m = m[:hh, :ww].reshape(hh // 2, 2, ww // 2, 2).max(axis=(1, 3))
+    return m
+
+
+def _pad_to_shape(arr: np.ndarray, shape: Tuple[int, int], fill: int) -> np.ndarray:
+    h, w = arr.shape
+    H, W = shape
+    out = np.full((H, W), int(fill), dtype=int)
+    out[:h, :w] = arr[:H, :W]
+    return out
+
+
+def _soft_iou(a: np.ndarray, b: np.ndarray) -> float:
+    if a.ndim != 2 or b.ndim != 2:
+        return 0.0
+    H = max(a.shape[0], b.shape[0])
+    W = max(a.shape[1], b.shape[1])
+    if H == 0 or W == 0:
+        return 1.0
+    bg_a = _infer_bg_color(a)
+    bg_b = _infer_bg_color(b)
+    a_pad = _pad_to_shape(a, (H, W), bg_a)
+    b_pad = _pad_to_shape(b, (H, W), bg_b)
+    ma = _pool2x(_binary_mask(a_pad, bg_a))
+    mb = _pool2x(_binary_mask(b_pad, bg_b))
+    inter = np.logical_and(ma, mb).sum(dtype=float)
+    union = np.logical_or(ma, mb).sum(dtype=float)
+    return float(inter / union) if union > 0 else 1.0
+
+
+def _hist_l1(a: np.ndarray, b: np.ndarray) -> float:
+    ha = np.bincount(a.ravel().astype(int), minlength=10).astype(float)
+    hb = np.bincount(b.ravel().astype(int), minlength=10).astype(float)
+    ha /= max(1.0, ha.sum())
+    hb /= max(1.0, hb.sum())
+    return float(np.abs(ha - hb).sum()) * 0.5
+
+
+def _center_error(a: np.ndarray, b: np.ndarray) -> float:
+    ma = _binary_mask(a)
+    mb = _binary_mask(b)
+    if ma.sum() == 0 or mb.sum() == 0:
+        return 1.0
+    ya, xa = np.nonzero(ma)
+    yb, xb = np.nonzero(mb)
+    cy_a, cx_a = ya.mean(), xa.mean()
+    cy_b, cx_b = yb.mean(), xb.mean()
+    H = max(a.shape[0], b.shape[0])
+    W = max(a.shape[1], b.shape[1])
+    if H <= 1 and W <= 1:
+        return 0.0
+    return (abs(cy_a - cy_b) / max(1.0, H - 1) + abs(cx_a - cx_b) / max(1.0, W - 1)) * 0.5
+
+
+def _compute_shaped_cost(curr_grid: np.ndarray, target_grid: np.ndarray, phi: np.ndarray) -> Dict[str, float]:
+    try:
+        curr = np.asarray(curr_grid)
+        tgt = np.asarray(target_grid)
+    except Exception:
+        return {"shaped": 1.0, "soft_iou": 0.0, "com_err": 1.0, "hist_l1": 1.0}
+    if curr.ndim != 2 or tgt.ndim != 2:
+        return {"shaped": 1.0, "soft_iou": 0.0, "com_err": 1.0, "hist_l1": 1.0}
+    s_iou = _soft_iou(curr, tgt)
+    com_err = _center_error(curr, tgt)
+    hist = _hist_l1(curr, tgt)
+    scale_sig = float(abs(phi[0])) if phi is not None and len(phi) > 0 else 0.0
+    palette_sig = float(abs(phi[2])) if phi is not None and len(phi) > 2 else 0.0
+    w_shape = 0.6 + 0.3 * min(1.0, scale_sig)
+    w_com = 0.25
+    w_hist = 0.15 + 0.2 * min(1.0, palette_sig)
+    total = w_shape + w_com + w_hist
+    w_shape /= total
+    w_com /= total
+    w_hist /= total
+    shaped = w_shape * (1.0 - s_iou) + w_com * com_err + w_hist * hist
+    return {
+        "shaped": float(shaped),
+        "soft_iou": float(s_iou),
+        "com_err": float(com_err),
+        "hist_l1": float(hist),
+    }
 
 
 def compute_cost(
@@ -5208,16 +5851,29 @@ def compute_cost(
     try:
         pred = interpret_program(prog, input_grid)
     except Exception:
+        setattr(
+            prog,
+            "_cost_stats",
+            {
+                "error": True,
+                "binary_cost": 1.0,
+                "shaped_cost": 1.0,
+                "soft_iou": 0.0,
+                "com_err": 1.0,
+                "hist_l1": 1.0,
+            },
+        )
         return 1e9
 
-    # Match cost
-    if pred.shape != target_grid.shape:
-        c_match = 1.0
+    pred_arr = np.asarray(pred)
+    tgt_arr = np.asarray(target_grid)
+    shape_same = pred_arr.shape == tgt_arr.shape
+    if shape_same:
+        diff = np.sum(pred_arr != tgt_arr)
+        c_match = diff / max(tgt_arr.size, 1)
     else:
-        diff = np.sum(pred != target_grid)
-        c_match = diff / max(target_grid.size, 1)
+        c_match = 1.0
 
-    shape_same = (pred.shape == target_grid.shape)
     acc = (1.0 - c_match) if shape_same else 0.0
 
     # Keep original lambda1, lambda2 first
@@ -5241,13 +5897,29 @@ def compute_cost(
 
     c_oco = lam1 * t_prog + lam2 * t_slice
 
-    total = c_match + c_len + c_oco - beta * acc
+    shaped_stats = _compute_shaped_cost(pred_arr, tgt_arr, phi)
+    px_term = c_match
+    if getattr(settings, "shaped_cost", False):
+        px_term = float(shaped_stats.get("shaped", c_match))
+
+    total = px_term + c_len + c_oco - beta * acc
 
     # shape-stage: tiny prior for topology selection ops (mirrors tile_masked prior)
-    if pred.shape == target_grid.shape and len(prog) > 0:
+    if shape_same and len(prog) > 0:
         last = prog.steps[-1].op
         if last in ("keep_rings", "fill_holes"):
             total -= 0.01
+
+    prog_stats = {
+        "binary_cost": float(c_match),
+        "shaped_cost": float(px_term),
+        "soft_iou": float(shaped_stats.get("soft_iou", 0.0)),
+        "com_err": float(shaped_stats.get("com_err", 1.0)),
+        "hist_l1": float(shaped_stats.get("hist_l1", 1.0)),
+        "program_len": int(len(prog)),
+        "cost": float(total),
+    }
+    setattr(prog, "_cost_stats", prog_stats)
 
     return float(total)
 
@@ -5262,9 +5934,87 @@ class Candidate:
     program: Program
     cost: float
     depth: int = 0
+    telemetry: Dict[str, Any] = field(default_factory=dict)
+    cost_delta: float = 0.0
 
     def __lt__(self, other):
         return self.cost < other.cost
+
+
+def _two_lane_prune(beam: List[Candidate], beam_width: int, best_cost: float, settings) -> List[Candidate]:
+    if not beam:
+        return []
+    K = max(1, int(beam_width))
+    explore_frac = float(getattr(settings, "explore_fraction", 0.0))
+    explore_frac = max(0.0, min(1.0, explore_frac))
+    k_explore = int(round(explore_frac * K))
+    k_explore = min(max(0, k_explore), K)
+    k_exploit = max(0, K - k_explore)
+
+    sorted_by_cost = sorted(beam, key=lambda c: c.cost)
+    exploit_lane = sorted_by_cost[:k_exploit] if k_exploit > 0 else []
+
+    allow_uphill = bool(getattr(settings, "allow_uphill", True))
+    uphill_keep = float(getattr(settings, "uphill_keep_fraction", 0.15))
+    uphill_cap = int(round(max(0.0, min(1.0, uphill_keep)) * K))
+
+    def _progress_key(c: Candidate):
+        telem = getattr(c, "telemetry", {}) or {}
+        soft_iou = float(telem.get("soft_iou", 0.0))
+        com_err = float(telem.get("com_err", 1.0))
+        delta = float(getattr(c, "cost_delta", 0.0))
+        prog_len = len(getattr(c.program, "steps", [])) if getattr(c, "program", None) else 0
+        return (-soft_iou, com_err, delta, c.cost, prog_len)
+
+    explore_pool: List[Candidate] = []
+    exploit_set = set(id(c) for c in exploit_lane)
+    for cand in beam:
+        if id(cand) in exploit_set:
+            continue
+        if not allow_uphill and cand.cost > best_cost + 1e-9:
+            continue
+        explore_pool.append(cand)
+
+    explore_pool.sort(key=_progress_key)
+    explore_lane = explore_pool[:k_explore] if k_explore > 0 else []
+
+    if allow_uphill and explore_lane:
+        uphill = [c for c in explore_lane if c.cost > best_cost + 1e-9]
+        if uphill_cap >= 0 and len(uphill) > uphill_cap:
+            uphill = uphill[:uphill_cap]
+            explore_lane = [c for c in explore_lane if c.cost <= best_cost + 1e-9] + uphill
+
+    def _sig(c: Candidate):
+        prog = getattr(c, "program", None)
+        if prog is not None:
+            try:
+                return prog.to_tuple()
+            except Exception:
+                return id(c)
+        return id(c)
+
+    merged: List[Candidate] = []
+    seen: Set[Any] = set()
+    for cand in exploit_lane + explore_lane:
+        key = _sig(cand)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(cand)
+        if len(merged) >= K:
+            break
+
+    if len(merged) < K:
+        for cand in sorted_by_cost:
+            key = _sig(cand)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(cand)
+            if len(merged) >= K:
+                break
+
+    return merged
 
 
 def _centroid_nonzero(a):
@@ -5708,20 +6458,39 @@ def beam_search_one_pair(
         if sig in sig_seen:
             continue
         sig_seen.add(sig)
-        beam.append(Candidate(prog, _seed_cost(prog), depth=len(prog)))
+        cost_val = _seed_cost(prog)
+        stats = getattr(prog, "_cost_stats", {}) or {}
+        beam.append(
+            Candidate(
+                prog,
+                cost_val,
+                depth=len(prog),
+                telemetry=dict(stats),
+                cost_delta=0.0,
+            )
+        )
         visited.add(sig)
 
     # always include empty program fallback
     empty_sig = Program([]).to_tuple()
     if empty_sig not in sig_seen:
-        beam.append(Candidate(Program([]), cost=1e9, depth=0))
+        beam.append(Candidate(Program([]), cost=1e9, depth=0, telemetry={}, cost_delta=0.0))
         visited.add(empty_sig)
 
     # if early-latch found a strong seed, bias its cost so it's explored first
     if best_so_far is not None:
         sig = best_so_far.to_tuple()
         if sig not in sig_seen:
-            beam.append(Candidate(best_so_far, best_cost, depth=len(best_so_far)))
+            stats = getattr(best_so_far, "_cost_stats", {}) or {}
+            beam.append(
+                Candidate(
+                    best_so_far,
+                    best_cost,
+                    depth=len(best_so_far),
+                    telemetry=dict(stats),
+                    cost_delta=0.0,
+                )
+            )
             visited.add(sig)
 
     # prune to beam width right away
@@ -5865,7 +6634,16 @@ def beam_search_one_pair(
                 sig = ring_prog.to_tuple()
                 if sig not in visited:
                     cost_ring = compute_cost(ring_prog, input_grid, target_grid, phi, settings)
-                    beam.append(Candidate(ring_prog, cost_ring, current.depth + 1))
+                    stats_ring = getattr(ring_prog, "_cost_stats", {}) or {}
+                    beam.append(
+                        Candidate(
+                            ring_prog,
+                            cost_ring,
+                            current.depth + 1,
+                            telemetry=dict(stats_ring),
+                            cost_delta=cost_ring - current.cost,
+                        )
+                    )
                     visited.add(sig)
             except Exception:
                 pass
@@ -5884,7 +6662,16 @@ def beam_search_one_pair(
                 sig = fill_prog.to_tuple()
                 if sig not in visited:
                     cost_fill = compute_cost(fill_prog, input_grid, target_grid, phi, settings)
-                    beam.append(Candidate(fill_prog, cost_fill, current.depth + 1))
+                    stats_fill = getattr(fill_prog, "_cost_stats", {}) or {}
+                    beam.append(
+                        Candidate(
+                            fill_prog,
+                            cost_fill,
+                            current.depth + 1,
+                            telemetry=dict(stats_fill),
+                            cost_delta=cost_fill - current.cost,
+                        )
+                    )
                     visited.add(sig)
             except Exception:
                 pass
@@ -5907,7 +6694,16 @@ def beam_search_one_pair(
                             sig = prog_shift.to_tuple()
                             if sig not in visited:
                                 cost = compute_cost(prog_shift, input_grid, target_grid, phi, settings)
-                                beam.append(Candidate(prog_shift, cost, current.depth + 1))
+                                stats_shift = getattr(prog_shift, "_cost_stats", {}) or {}
+                                beam.append(
+                                    Candidate(
+                                        prog_shift,
+                                        cost,
+                                        current.depth + 1,
+                                        telemetry=dict(stats_shift),
+                                        cost_delta=cost - current.cost,
+                                    )
+                                )
                                 visited.add(sig)
 
                     # 2) alternate tile_masked mode (swap cross/border once)
@@ -5920,7 +6716,16 @@ def beam_search_one_pair(
                             sig = prog_alt.to_tuple()
                             if sig not in visited:
                                 cost = compute_cost(prog_alt, input_grid, target_grid, phi, settings)
-                                beam.append(Candidate(prog_alt, cost, current.depth + 1))
+                                stats_alt = getattr(prog_alt, "_cost_stats", {}) or {}
+                                beam.append(
+                                    Candidate(
+                                        prog_alt,
+                                        cost,
+                                        current.depth + 1,
+                                        telemetry=dict(stats_alt),
+                                        cost_delta=cost - current.cost,
+                                    )
+                                )
                                 visited.add(sig)
 
                     # 3) optional mirror when fairly close
@@ -5931,7 +6736,16 @@ def beam_search_one_pair(
                         sig = prog_m.to_tuple()
                         if sig not in visited:
                             cost = compute_cost(prog_m, input_grid, target_grid, phi, settings)
-                            beam.append(Candidate(prog_m, cost, current.depth + 1))
+                            stats_m = getattr(prog_m, "_cost_stats", {}) or {}
+                            beam.append(
+                                Candidate(
+                                    prog_m,
+                                    cost,
+                                    current.depth + 1,
+                                    telemetry=dict(stats_m),
+                                    cost_delta=cost - current.cost,
+                                )
+                            )
                             visited.add(sig)
 
                     # NOTE: we rely on beam pruning to cap to beam_width; refiners add ≤3 branches
@@ -6258,14 +7072,20 @@ def beam_search_one_pair(
                 trace_buffer.append((op_name, delta_cost))
 
             # Add to beam
-            new_cand = Candidate(succ_prog, cost, current.depth + 1)
+            stats_succ = getattr(succ_prog, "_cost_stats", {}) or {}
+            new_cand = Candidate(
+                succ_prog,
+                cost,
+                current.depth + 1,
+                telemetry=dict(stats_succ),
+                cost_delta=cost - current.cost,
+            )
             beam.append(new_cand)
 
-        # Sort beam by cost
-        beam.sort()
-
-        # Prune to beam width
-        beam = beam[:settings.beam_width]
+        parent_best_cost = min((cand.cost for cand in beam), default=current.cost)
+        ref_cost = min(best_cost, parent_best_cost)
+        beam = _two_lane_prune(beam, settings.beam_width, ref_cost, settings)
+        beam.sort(key=lambda c: c.cost)
 
         if monitor is not None:
             try:
@@ -6397,6 +7217,18 @@ def enumerate_args(op_name: str, param_types: List[str], ctx) -> List[Tuple[Any,
             if not (len(args) >= 2 and tuple(args[:2]) == (1, 1))
         ]
 
+    if op_name == "tile_masked" and depth_val == 0:
+        filtered = []
+        for args in combos:
+            if len(args) >= 2:
+                try:
+                    if int(args[0]) == 1 and int(args[1]) == 1:
+                        continue
+                except Exception:
+                    pass
+            filtered.append(args)
+        combos = filtered
+
     if op_name == "shift":
         filtered = []
         for args in combos:
@@ -6412,11 +7244,20 @@ def enumerate_args(op_name: str, param_types: List[str], ctx) -> List[Tuple[Any,
         combos = filtered
 
     if op_name == "stack":
-        combos = [
-            args
-            for args in combos
-            if args and args[0] in (0, 1)
-        ]
+        # --- stack enumeration fix & optional debug ---
+        combos = [args for args in combos if len(args) >= 2 and int(args[1]) in (0, 1)]
+
+        try:
+            _dbg = os.getenv("ARC_DEBUG_STACK", "0") == "1"
+        except Exception:
+            _dbg = False
+
+        if _dbg and not globals().get("_DEBUG_STACK_ONCE_FLAG__", False):
+            globals()["_DEBUG_STACK_ONCE_FLAG__"] = True
+            try:
+                print("[debug] enumerate_args('stack') combos (sample):", combos[:8])
+            except Exception:
+                pass
 
     return combos
 
@@ -6959,7 +7800,7 @@ def _solve_task_internal(
 
     # Meta-controller (opt-in)
     meta = None
-    if settings.use_meta_controller:
+    if getattr(settings, "use_meta_controller", False):
         meta = getattr(_solve_task_internal, "_META", None)
         if meta is None:
             meta = MetaControllerUCB()
@@ -7270,6 +8111,48 @@ def _solve_task_internal(
             monitor.update_hfp_from_tension(rho_override=rho_composite)
         except Exception:
             pass
+
+    R_break = float(getattr(settings, "hfp_break_R_min", 0.010)) if settings else 0.010
+    R_good = float(getattr(settings, "_hfp_R_good", 0.080)) if settings else 0.080
+    R_val = None
+    if monitor is not None:
+        R_val = getattr(monitor, "R_last", None)
+    if R_val is None and rho_composite is not None:
+        try:
+            R_val = rvd_R(rho_composite)
+        except Exception:
+            R_val = None
+    if R_val is not None:
+        if settings is not None:
+            setattr(settings, "_hfp_R_last", float(R_val))
+        if monitor is not None:
+            monitor.R_last = float(R_val)
+            if R_val < R_break:
+                monitor.health = "low_R"
+        if R_val < R_break:
+            if settings is not None:
+                setattr(settings, "_hfp_should_break", True)
+                setattr(settings, "_hfp_break_reason", "low_R")
+        elif R_val >= R_good:
+            stretched = False
+            if settings is not None:
+                stretched = bool(getattr(settings, "_hfp_stretched", False))
+            if not stretched:
+                try:
+                    current_budget = float(getattr(settings, "max_seconds", 0.0)) if settings else 0.0
+                except Exception:
+                    current_budget = 0.0
+                new_budget = float(int(round(current_budget * 1.25))) if current_budget > 0 else current_budget
+                if settings is not None and new_budget > current_budget:
+                    settings.max_seconds = new_budget
+                    setattr(settings, "_hfp_stretched", True)
+                if settings is not None and new_budget > current_budget:
+                    try:
+                        deadline.t_end = t0 + new_budget
+                    except Exception:
+                        pass
+                if monitor is not None:
+                    setattr(monitor, "_stretched", True)
 
     # Check if we should generate two attempts using truncated shape-base
     # Truncate program at last tile_masked to get pure shape transformation
@@ -8201,6 +9084,43 @@ Examples:
         hfp_gate_keep=(not args.no_hfp_gate_keep),
         hfp_debug_telemetry=(not args.no_hfp_debug_telemetry),
     )
+
+    settings.iou_cap = _envfloat("ARC_IOU_CAP", getattr(settings, "iou_cap", 0.97))
+    settings.div_lambda = _envfloat("ARC_DIV_LAMBDA", getattr(settings, "div_lambda", 0.30))
+    plateau_val = _envint("ARC_PLATEAU_N", getattr(settings, "monitor_plateau_N", 8))
+    settings.monitor_plateau_N = max(10, plateau_val)
+    visited_val = _envint("ARC_VISITED_CAP", getattr(settings, "monitor_visited_cap", 4096))
+    settings.monitor_visited_cap = max(8192, visited_val)
+    settings.attemptB_beam_scale = _envfloat(
+        "ARC_ATTEMPTB_BEAM_SCALE", getattr(settings, "attemptB_beam_scale", 1.0)
+    )
+    settings.attemptB_time_scale = _envfloat(
+        "ARC_ATTEMPTB_TIME_SCALE", getattr(settings, "attemptB_time_scale", 1.0)
+    )
+    try:
+        _boost = float(os.getenv("ARC_ATTEMPTB_BOOST", "1.0"))
+        if _boost > 1.0:
+            settings.attemptB_beam_scale = getattr(settings, "attemptB_beam_scale", 1.0) * _boost
+            settings.attemptB_time_scale = getattr(settings, "attemptB_time_scale", 1.0) * _boost
+            print(f"[A/B] AttemptB boosted ×{_boost:.2f}")
+    except Exception:
+        pass
+    R_MAX = 1.0 / (7.0 * math.e)
+    if "ARC_R_GOOD" in os.environ:
+        try:
+            settings._hfp_R_good = float(os.getenv("ARC_R_GOOD"))
+        except Exception:
+            settings._hfp_R_good = 0.60 * R_MAX
+    else:
+        settings._hfp_R_good = 0.60 * R_MAX
+
+    if "ARC_R_BREAK" in os.environ:
+        try:
+            settings.hfp_break_R_min = float(os.getenv("ARC_R_BREAK"))
+        except Exception:
+            settings.hfp_break_R_min = 0.15 * R_MAX
+    else:
+        settings.hfp_break_R_min = 0.15 * R_MAX
     
     # Apply ablation if specified
     if args.ablation:
@@ -8275,7 +9195,7 @@ class SearchSettings:
     # GOF-9000 policy knobs (default ON; modules may ignore)
     block_identity: bool = True
     rails_scale_hard: bool = True
-    scale_hard_thresh: float = 1.0
+    scale_hard_thresh: float = _envfloat("ARC_SCALE_HARD_THRESH", 0.60)
     scale_hard_steps: int = 3
     early_palette_block_steps: int = 3
     # Palette test policy (optional)
@@ -8304,11 +9224,26 @@ class SearchSettings:
     priors_alpha: float = 1.0
     motif_topk: int = 1
     diversity_guard: bool = True
+    use_meta_controller: bool = _envbool("ARC_USE_META", False)
     diversity_b_force_first: bool = False
     attemptB_beam_scale: float = 1.0
     attemptB_time_scale: float = 1.0
-    div_lambda: float = 0.50
-    iou_cap: float = 0.97
+    div_lambda: float = _envfloat("ARC_DIV_LAMBDA", 0.70)
+    iou_cap: float = _envfloat("ARC_IOU_CAP", 0.92)
+    attemptB_auto_boost: bool = _envbool("ARC_ATTEMPTB_AUTO_BOOST", True)
+    attemptB_boost_beam: float = _envfloat("ARC_ATTEMPTB_BOOST_BEAM", 1.5)
+    attemptB_boost_time: float = _envfloat("ARC_ATTEMPTB_BOOST_TIME", 1.3)
+    shaped_cost: bool = _envbool("ARC_SHAPED_COST", True)
+    explore_fraction: float = _envfloat("ARC_EXPLORE_FRAC", 0.35)
+    allow_uphill: bool = _envbool("ARC_ALLOW_UPHILL", True)
+    uphill_keep_fraction: float = _envfloat("ARC_UPHILL_KEEP", 0.15)
+    ephemeral_macros: bool = _envbool("ARC_EPHEMERAL_MACROS", False)
+    macro_max_depth_start: int = _envint("ARC_MACRO_MAX_DEPTH_START", 2)
+    macro_candidates_limit: int = _envint("ARC_MACRO_LIMIT", 6)
+    # cost weights (align with internal solver defaults)
+    lambda_len: float = _envfloat("ARC_LAMBDA_LEN", 0.20)
+    lambda1: float = _envfloat("ARC_LAMBDA1", 0.30)
+    lambda2: float = _envfloat("ARC_LAMBDA2", 0.20)
     max_bounces: int = 8
 
 _INTERNAL_SETTINGS_CLS = globals().get("_InternalSearchSettings")
@@ -8338,8 +9273,18 @@ _SETTINGS_SYNC_ATTRS = (
     "diversity_b_force_first",
     "attemptB_beam_scale",
     "attemptB_time_scale",
+    "attemptB_auto_boost",
+    "attemptB_boost_beam",
+    "attemptB_boost_time",
     "div_lambda",
     "iou_cap",
+    "shaped_cost",
+    "explore_fraction",
+    "allow_uphill",
+    "uphill_keep_fraction",
+    "ephemeral_macros",
+    "macro_max_depth_start",
+    "macro_candidates_limit",
     "max_bounces",
     "hfp_enable",
     "hfp_alpha",
