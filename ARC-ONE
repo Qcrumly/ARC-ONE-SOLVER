@@ -78,6 +78,7 @@ from collections import deque, defaultdict
 import itertools
 import math
 import time
+import csv
 import statistics as _stats
 import json
 import os
@@ -88,7 +89,324 @@ import tempfile
 import shutil
 import hashlib
 import re
-from scipy.ndimage import label as _cc_label
+try:
+    from scipy.ndimage import label as _cc_label
+except Exception:  # pragma: no cover - optional SciPy dependency
+
+    def _cc_label(arr, structure=None):
+        data = np.asarray(arr)
+        labels = np.zeros_like(data, dtype=int)
+        visited = np.zeros_like(data, dtype=bool)
+        current = 0
+        H, W = data.shape[:2]
+
+        for y in range(H):
+            for x in range(W):
+                if visited[y, x] or not data[y, x]:
+                    continue
+                current += 1
+                stack = [(y, x)]
+                visited[y, x] = True
+                labels[y, x] = current
+                while stack:
+                    cy, cx = stack.pop()
+                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                        if 0 <= ny < H and 0 <= nx < W and not visited[ny, nx] and data[ny, nx]:
+                            visited[ny, nx] = True
+                            labels[ny, nx] = current
+                            stack.append((ny, nx))
+        return labels, current
+
+
+# === Determinism & banner ===
+import random
+try:  # Prefer real numpy but fall back to the shim if unavailable
+    import numpy as _np
+except ModuleNotFoundError:  # pragma: no cover - aligns with optional numpy install
+    _np = np  # type: ignore
+
+try:  # Memory helpers are optional
+    import arc_memory as MEM
+except Exception:  # pragma: no cover - memory module optional
+    MEM = None
+
+
+DIVERSITY_MIN_THRESHOLD = 0.15
+SHAPE_MATCH_BONUS = 0.02
+RHO_HEALTHY = 0.80
+MAX_TELEMETRY_ITEMS = 50
+
+_CLI_ARGS: Optional[Any] = None
+
+
+# ---- Memory motif token parsing & safe telemetry --------------------------------
+_OP_TOKEN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$")
+
+
+def _cap_telemetry_dict(telemetry: Optional[Dict[str, Any]]) -> None:
+    if isinstance(telemetry, dict) and len(telemetry) > MAX_TELEMETRY_ITEMS:
+        for key in list(telemetry.keys())[MAX_TELEMETRY_ITEMS:]:
+            telemetry.pop(key, None)
+
+
+def _telemetry_note_safe(carrier, **kv):
+    """Silently attach telemetry if helper is available."""
+    try:
+        _telemetry_note  # type: ignore[name-defined]
+    except Exception:
+        return
+    try:
+        _telemetry_note(carrier, **kv)  # type: ignore[name-defined]
+    except Exception:
+        pass
+    target = None
+    try:
+        if isinstance(carrier, dict):
+            target = carrier.get("_telemetry") if "_telemetry" in carrier else carrier
+        else:
+            target = getattr(carrier, "_telemetry", None)
+    except Exception:
+        target = None
+    _cap_telemetry_dict(target)
+
+
+def _parse_seed_tokens_to_program(
+    tokens: Optional[List[str]],
+    StepCls: Optional[Any] = None,
+    ProgramCls: Optional[Any] = None,
+):
+    """Return (Program or None, number_of_steps) for a motif token list."""
+    if not tokens:
+        return None, 0
+
+    try:
+        import arc_memory as MEM  # type: ignore
+
+        if hasattr(MEM, "parse_op_tokens"):
+            steps = MEM.parse_op_tokens(list(tokens))  # type: ignore[arg-type]
+            ProgTypeFast = ProgramCls or globals().get("Program")
+            if steps and ProgTypeFast is not None:
+                return ProgTypeFast(list(steps)), len(steps)  # type: ignore[arg-type]
+    except Exception:
+        pass
+
+    StepType = StepCls or globals().get("Step")
+    ProgType = ProgramCls or globals().get("Program")
+    if StepType is None or ProgType is None:
+        return None, 0
+
+    steps = []
+    regex_primary = globals().get("_OP_RE")
+    for raw in tokens:
+        tok = (raw or "").strip()
+        if not tok:
+            continue
+        match = None
+        if regex_primary is not None:
+            try:
+                match = regex_primary.match(tok)
+            except Exception:
+                match = None
+        if match is None:
+            match = _OP_TOKEN_RE.match(tok)
+        if not match:
+            # allow bare op name by appending ()
+            match = _OP_TOKEN_RE.match(f"{tok}()")
+            if not match:
+                continue
+        name, arg_str = match.group(1), match.group(2).strip()
+        args: List[int] = []
+        if arg_str:
+            for part in arg_str.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    args.append(int(part))
+                except Exception:
+                    # Ignore non-integer args for v1.0; extend as needed.
+                    continue
+        try:
+            steps.append(StepType(name, tuple(args)))
+        except Exception:
+            return None, 0
+
+    if not steps:
+        return None, 0
+
+    try:
+        program = ProgType(steps)
+    except Exception:
+        return None, 0
+    return program, len(steps)
+
+
+def _enqueue_seed_programs(
+    frontier: List[Any],
+    input_grid: Any,
+    target_grid: Any,
+    seed_tokens_list: Optional[List[List[str]]],
+    interpret_program_fn,
+    compute_cost_fn,
+    step_cls: Optional[Any] = None,
+    prog_cls: Optional[Any] = None,
+    telem_carrier: Optional[Any] = None,
+) -> int:
+    """Append parsed motif programs to the frontier. Returns count appended."""
+    if not seed_tokens_list:
+        return 0
+
+    pushed = 0
+    for toks in seed_tokens_list:
+        prog, nops = _parse_seed_tokens_to_program(toks, StepCls=step_cls, ProgramCls=prog_cls)
+        if prog is None or not getattr(prog, "steps", None):
+            continue
+        try:
+            pred = interpret_program_fn(prog, input_grid)
+            cost = compute_cost_fn(prog, input_grid, target_grid)
+        except Exception:
+            continue
+
+        try:
+            if "BeamEntry" in globals():
+                entry = BeamEntry(program=prog, pred=pred, cost=cost)  # type: ignore[name-defined]
+            else:
+                entry = {"program": prog, "pred": pred, "cost": float(cost)}
+            frontier.append(entry)
+            _telemetry_note_safe(
+                entry,
+                memory_seeded_motif=list(toks or []),
+                memory_seed_ops=int(nops),
+                memory_seed_cost=float(cost),
+            )
+            if telem_carrier is not None:
+                _telemetry_note_safe(
+                    telem_carrier,
+                    memory_seeded_motif=list(toks or []),
+                    memory_seed_ops=int(nops),
+                    memory_seed_cost=float(cost),
+                )
+            pushed += 1
+        except Exception:
+            continue
+
+    return pushed
+
+
+def _parse_tokens_to_program(tokens: List[str]):
+    """Compat shim for callers expecting the older helper name."""
+    prog, _ = _parse_seed_tokens_to_program(tokens)
+    if prog is not None:
+        return prog
+    ProgramCls = globals().get("Program")
+    return ProgramCls([]) if ProgramCls is not None else []
+
+
+# === Exact win attribution & octonion telemetry ==============================
+_EXACT_WINS: List[Dict[str, Any]] = []
+
+
+def _log_exact_win(event: Dict[str, Any]) -> None:
+    event["ts"] = time.time()
+    _EXACT_WINS.append(event)
+
+
+def _flush_exact_wins(path: Optional[str]) -> None:
+    if not path or not _EXACT_WINS:
+        return
+    keys = sorted({k for e in _EXACT_WINS for k in e.keys()})
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(_EXACT_WINS)
+
+
+_OCTO_ROWS: List[Dict[str, Any]] = []
+
+
+def _collect_octo_row(
+    *,
+    task_id,
+    attempt_tag,
+    phi_family,
+    input_grid,
+    pred_grid,
+    target_grid,
+    x_oct,
+    rho,
+    depth,
+    elapsed_s,
+):
+    import numpy as _np
+
+    def _ensure_array(val):
+        if val is None:
+            return _np.zeros((0, 0), dtype=int)
+        arr = _np.asarray(val)
+        if arr.ndim == 0:
+            return arr.reshape(1, 1)
+        return arr
+
+    A = _ensure_array(input_grid)
+    P = _ensure_array(pred_grid)
+    T = _ensure_array(target_grid)
+    exact = int(P.shape == T.shape and T.size > 0 and _np.array_equal(P, T))
+    mean_err = None
+    if P.shape == T.shape and T.size:
+        mean_err = float((P != T).mean())
+
+    def _palette_delta(a, b):
+        pa, pb = set(_np.unique(a)), set(_np.unique(b))
+        if not pa and not pb:
+            return 0.0
+        return float(len(pa.symmetric_difference(pb))) / float(max(1, len(pa.union(pb))))
+
+    palette_delta = _palette_delta(P, T) if T.size else None
+    size_change = None
+    if T.size:
+        size_change = abs(A.size - T.size) / float(max(1, T.size))
+
+    row = {
+        "task_id": task_id,
+        "attempt_tag": attempt_tag,
+        "phi_family": phi_family,
+        "x_oct": None if x_oct is None else float(x_oct),
+        "exact": exact,
+        "mean_pix_err": mean_err,
+        "shape_mismatch": int(T.size and P.shape != T.shape) if T.size else None,
+        "size_change": size_change,
+        "palette_delta": palette_delta,
+        "components_delta": None,
+        "holes_delta": None,
+        "rho": float(rho) if rho is not None else None,
+        "depth": int(depth) if depth is not None else None,
+        "elapsed_s": float(elapsed_s) if elapsed_s is not None else None,
+    }
+    _OCTO_ROWS.append(row)
+
+
+def _flush_octo_csv(path: Optional[str]) -> None:
+    if not path or not _OCTO_ROWS:
+        return
+    keys = sorted({k for r in _OCTO_ROWS for k in r.keys()})
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(_OCTO_ROWS)
+
+
+def _set_determinism(seed=0):
+    random.seed(seed)
+    try:
+        _np.random.seed(seed)
+    except Exception:
+        pass
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+
+_set_determinism(0)
+
+print(f"[ARC-ONE] seed=0  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
 
 
 # === Determinism & banner ===
@@ -636,39 +954,38 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
 
 
 def _pixel_iou(a, b):
-    """Micro-averaged IoU across colors. Returns 0.0 if shapes differ or empty."""
-    if a is None or b is None:
+    A, B = np.asarray(a), np.asarray(b)
+    if A.shape != B.shape:
         return 0.0
-    if len(a) == 0 or len(b) == 0:
+    if A.size == 0:
         return 0.0
-    H1, W1 = len(a), len(a[0]) if a[0] else 0
-    H2, W2 = len(b), len(b[0]) if b[0] else 0
-    if H1 != H2 or W1 != W2:
-        return 0.0
-    colors = set()
-    for i in range(H1):
-        for j in range(W1):
-            colors.add(a[i][j])
-            colors.add(b[i][j])
-    if not colors:
-        return 0.0
-    inter_sum = 0
-    union_sum = 0
-    for c in colors:
-        inter = 0
-        union = 0
-        for i in range(H1):
-            for j in range(W1):
-                in_a = a[i][j] == c
-                in_b = b[i][j] == c
-                if in_a and in_b:
-                    inter += 1
-                if in_a or in_b:
-                    union += 1
-        if union > 0:
-            inter_sum += inter
-            union_sum += union
-    return (inter_sum / union_sum) if union_sum > 0 else 0.0
+    return float((A == B).sum()) / float(A.size)
+
+
+def _pick_two_attempts(cands, lambda_div=0.5, iou_cap=0.97, seed=1337):
+    """Return (first, second, IoU) given candidate predictions."""
+    if not cands:
+        return None, None, 0.0
+
+    first = max(cands, key=lambda c: c.get("conf", 0.0))
+    rng = random.Random(seed)
+    best = None
+    best_score = float("-inf")
+    for cand in cands:
+        if cand is first:
+            continue
+        iou = _pixel_iou(first.get("grid"), cand.get("grid"))
+        if iou >= iou_cap:
+            continue
+        score = float(cand.get("conf", 0.0)) - float(lambda_div) * float(iou)
+        # tie-break deterministically with seed to avoid oscillations
+        if score > best_score or (math.isclose(score, best_score) and rng.random() < 0.5):
+            best = cand
+            best_score = score
+
+    second = best if best is not None else first
+    i12 = _pixel_iou(first.get("grid"), second.get("grid"))
+    return first, second, i12
 
 
 def _normalize_two_attempts(out):
@@ -740,9 +1057,6 @@ def _grid_dissimilarity(a, b):
     return 1.0 - (inter / max(1, union))
 
 
-DIVERSITY_MIN = 0.15  # require at least this much difference
-
-
 def _mmr_dissim(opsA, opsB, gridA, gridB):
     """Conservative disagreement score combining tokens + grid dissimilarity."""
     tok_div = _token_jaccard(opsA, opsB)
@@ -755,7 +1069,7 @@ def _enforce_diversity(att1, att2):
     ops2 = (att2.get("_telemetry", {}) or {}).get("ops_tokens", []) if isinstance(att2, dict) else []
     g1 = att1.get("grid") if isinstance(att1, dict) else None
     g2 = att2.get("grid") if isinstance(att2, dict) else None
-    if _mmr_dissim(ops1, ops2, g1, g2) < DIVERSITY_MIN and isinstance(att2, dict):
+    if _mmr_dissim(ops1, ops2, g1, g2) < DIVERSITY_MIN_THRESHOLD and isinstance(att2, dict):
         att2.setdefault("_telemetry", {})["diversity_nudge"] = True
     return att2
 
@@ -1403,7 +1717,7 @@ def _rho_from(pred, truth, t_prog=None):
     acc = float((P == T).mean())
     try:
         if t_prog is not None and float(t_prog) < 1.0:
-            acc = min(1.0, acc + 0.02)
+            acc = min(1.0, acc + SHAPE_MATCH_BONUS)
     except Exception:
         pass
     return acc
@@ -1736,6 +2050,7 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
 
         train_pairs = task_json.get("train") or task_json.get("data") or []
         octo_z_val = _octo_z_for_task(train_pairs)
+        setattr(base_settings, "_octo_z_for_task", octo_z_val)
 
         stage_times = {"skim": 0.0, "main": 0.0, "polish": 0.0}
         ran_polish = False
@@ -1780,6 +2095,7 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
             for attr in ("_truths_provider", "_policy_prior", "_trace_ops"):
                 if hasattr(base_settings, attr):
                     setattr(stage_settings, attr, getattr(base_settings, attr))
+            setattr(stage_settings, "_octo_z_for_task", getattr(base_settings, "_octo_z_for_task", None))
 
             start = time.perf_counter()
             try:
@@ -1966,7 +2282,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                 candidates.extend(_alternates_from_belief(base, test_in, belief, pairs))
                 ops_tokens = (meta_dict.get("_telemetry", {}) or {}).get("ops_tokens", [])
                 candidates, family_tag = _apply_diversity_guard_candidates(base, candidates, belief, settings, ops_tokens)
-                lambda_div = getattr(settings, "div_lambda", 0.20) if settings else 0.20
+                lambda_div = getattr(settings, "div_lambda", 0.50) if settings else 0.50
                 lambda_div *= float(getattr(settings, "attemptB_beam_scale", 1.0) if settings else 1.0)
                 iou_cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
                 att1_sel, att2_sel, choice = _select_best_pair(base, candidates, belief, lambda_div=lambda_div, iou_cap=iou_cap)
@@ -2011,13 +2327,53 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         try:
                             regenerated = _regenerate_alt_from_different_bucket(base, belief, pairs)
                             att2 = regenerated
-                        except Exception:
-                            att2 = np.rot90(np.asarray(base), 2).tolist()
+                    except Exception:
+                        att2 = np.rot90(np.asarray(base), 2).tolist()
                 except Exception:
                     try:
                         att2 = np.rot90(np.asarray(base), 2).tolist()
                     except Exception:
                         att2 = base
+
+                cand_list: List[Dict[str, Any]] = []
+                for tag_name, grid_val in (("attemptA", base), ("attemptB", att2)):
+                    grid_list = grid_val.tolist() if hasattr(grid_val, "tolist") else grid_val
+                    cand_list.append(
+                        {
+                            "tag": tag_name,
+                            "grid": grid_list,
+                            "conf": float(_surrogate_conf(grid_list, belief)),
+                        }
+                    )
+
+                lam_final = float(getattr(settings, "div_lambda", 0.50)) if settings else 0.50
+                lam_final *= float(getattr(settings, "attemptB_beam_scale", 1.0) if settings else 1.0)
+                cap_final = float(getattr(settings, "iou_cap", 0.97)) if settings else 0.97
+                seed_val = int(getattr(settings, "seed", 1337)) if settings and hasattr(settings, "seed") else 1337
+                first_sel, second_sel, i12 = _pick_two_attempts(
+                    cand_list,
+                    lambda_div=lam_final,
+                    iou_cap=cap_final,
+                    seed=seed_val,
+                )
+                if first_sel is None and cand_list:
+                    first_sel = cand_list[0]
+                if second_sel is None:
+                    second_sel = first_sel
+                if first_sel is None:
+                    first_sel = {"grid": base, "conf": _surrogate_conf(base, belief), "tag": "attemptA"}
+                if second_sel is None:
+                    second_sel = first_sel
+
+                choice = {
+                    "tag": second_sel.get("tag") if isinstance(second_sel, dict) else None,
+                    "conf1": first_sel.get("conf") if isinstance(first_sel, dict) else None,
+                    "conf2": second_sel.get("conf") if isinstance(second_sel, dict) else None,
+                    "iou": i12,
+                }
+
+                base = first_sel.get("grid") if isinstance(first_sel, dict) else first_sel
+                att2 = second_sel.get("grid") if isinstance(second_sel, dict) else second_sel
 
                 gof_payload = dict(telemetry_kwargs)
                 gof_payload.update(
@@ -2034,6 +2390,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     _telemetry_note(
                         meta_dict,
                         iou=_pixel_iou(base, att2),
+                        iou12=i12,
                         **gof_payload,
                     )
                 except Exception:
@@ -2052,11 +2409,50 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                 "attempt_2": att2_entry["grid"],
                 "grid": att1_entry["grid"],
                 "_telemetry": telemetry,
+                "iou12": i12,
             }
             _telemetry_note(
                 entry,
                 seconds_after_schedule=float(getattr(settings, "max_seconds", 0.0) if settings else 0.0),
             )
+            cli_args = globals().get("_CLI_ARGS")
+            if getattr(cli_args, "octo_stats_csv", None):
+                try:
+                    input_grid = None
+                    target_grid = None
+                    if isinstance(test_in, dict):
+                        input_grid = test_in.get("input")
+                        target_grid = test_in.get("output")
+                    if input_grid is None and pairs:
+                        input_grid = pairs[0][0]
+                    if target_grid is None and pairs:
+                        target_grid = pairs[0][1]
+                    _collect_octo_row(
+                        task_id=tid,
+                        attempt_tag="A",
+                        phi_family=str(getattr(settings, "_phi_family", None)),
+                        input_grid=input_grid,
+                        pred_grid=entry["attempt_1"],
+                        target_grid=target_grid,
+                        x_oct=getattr(settings, "_octo_z_for_task", None),
+                        rho=getattr(settings, "_hfp_rho_smoothed", None),
+                        depth=None,
+                        elapsed_s=getattr(settings, "max_seconds", None),
+                    )
+                    _collect_octo_row(
+                        task_id=tid,
+                        attempt_tag="B",
+                        phi_family=str(getattr(settings, "_phi_family", None)),
+                        input_grid=input_grid,
+                        pred_grid=entry["attempt_2"],
+                        target_grid=target_grid,
+                        x_oct=getattr(settings, "_octo_z_for_task", None),
+                        rho=getattr(settings, "_hfp_rho_smoothed", None),
+                        depth=None,
+                        elapsed_s=getattr(settings, "max_seconds", None),
+                    )
+                except Exception:
+                    pass
             out_two.append(entry)
         out[tid] = out_two
     return out
@@ -4681,9 +5077,9 @@ class _InternalSearchSettings:
     allow_finishers_on_masked: bool = False
     no_polish: bool = False
     stop_if_diversity: float = 0.20
-    div_lambda: float = 0.20
+    div_lambda: float = 0.50
     iou_cap: float = 0.97
-    max_bounces: int = -1
+    max_bounces: int = 8
     _hfp_prevC: Optional[float] = None
     _hfp_rho: Optional[float] = None
     _hfp_rho_smoothed: Optional[float] = None
@@ -4699,7 +5095,7 @@ class _InternalSearchSettings:
     bounce_if_lowdiv: bool = True
     lowdiv_thr: float = 0.05
     octo_z_min_for_bounce: float = 1.20
-    bounce_max: int = 1
+    bounce_max: int = 8
     # GOF-9000 constraint pack
     block_identity: bool = True
     rails_scale_hard: bool = True
@@ -5623,13 +6019,32 @@ def beam_search_one_pair(
                     no_shape_seen = False
 
                 # Tiny tie-break for tile_masked when shape matches
-                if pred.shape == target_grid.shape:
-                    last = succ_prog.steps[-1].op if succ_prog.steps else None
-                    if last == "tile_masked":
-                        cost -= 0.02
+                    if pred.shape == target_grid.shape:
+                        last = succ_prog.steps[-1].op if succ_prog.steps else None
+                        if last == "tile_masked":
+                            cost -= SHAPE_MATCH_BONUS
 
                     # Early exit if exact match
                     if np.array_equal(pred, target_grid):
+                        attempt_tag = getattr(settings, "_attempt_tag", "A") if settings is not None else "A"
+                        last_op = succ_prog.steps[-1].op if getattr(succ_prog, "steps", None) else None
+                        pre_err = None
+                        try:
+                            parent_pred = interpret_program(current.program, input_grid)
+                            if parent_pred.shape == target_grid.shape:
+                                pre_err = float((parent_pred != target_grid).mean())
+                        except Exception:
+                            pass
+                        _log_exact_win(
+                            {
+                                "task_id": task_id,
+                                "win_attributed_to": last_op,
+                                "pre_win_err": pre_err,
+                                "depth_at_win": getattr(current, "depth", 0) + 1,
+                                "rho_at_win": getattr(settings, "_hfp_rho_smoothed", None) if settings else None,
+                                "attempt_tag": attempt_tag,
+                            }
+                        )
                         return succ_prog
             except Exception:
                 pass
@@ -7198,12 +7613,12 @@ Examples:
                        help="Program tension weight (default: 0.30)")
     parser.add_argument("--lambda2", type=float, default=0.20,
                        help="Slice tension weight (default: 0.20)")
-    parser.add_argument("--div_lambda", type=float, default=0.20,
-                        help="Diversity bonus weight for two-attempt selection (default: 0.20)")
+    parser.add_argument("--div_lambda", type=float, default=0.50,
+                        help="Diversity penalty λ for Attempt-B selection (default: 0.50)")
     parser.add_argument("--iou_cap", type=float, default=0.97,
                         help="Maximum IoU allowed before alternates are rejected (default: 0.97)")
-    parser.add_argument("--max_bounces", type=int, default=-1,
-                        help="Hard cap on debate bounces (default: -1 for rho-driven)")
+    parser.add_argument("--max_bounces", type=int, default=8,
+                        help="Hard cap on debate bounces (default: 8)")
     parser.add_argument("--no_octo_prior", action="store_true",
                         help="Disable palette8 octonion distance–based time scaling (training stage).")
     parser.add_argument("--octo_alpha", type=float, default=0.25,
@@ -7220,8 +7635,7 @@ Examples:
                         help="Skim diversity threshold to trigger bounce (default 0.05).")
     parser.add_argument("--octo_z_min_for_bounce", type=float, default=1.20,
                         help="Minimum octonion z to consider a task 'hard' (default 1.20).")
-    parser.add_argument("--bounce_max", type=int, default=1,
-                        help="Maximum bounces to force when the trigger fires (default 1).")
+    parser.add_argument("--bounce_max", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--no_block_identity", action="store_true",
                         help="Disable identity ejection (tile(1,1), scale(1), resize to same size).")
     parser.add_argument(
@@ -7312,12 +7726,26 @@ Examples:
                        help="Log every N iterations (default: 200)")
     parser.add_argument("--jsonl", type=str, default=None,
                        help="Path for JSONL telemetry log")
+    parser.add_argument("--exact_wins_csv", type=str, default=None,
+                       help="Optional CSV path for exact-win attribution events")
+    parser.add_argument("--octo_stats_csv", type=str, default=None,
+                       help="Optional CSV path for octonion/confounds telemetry")
     
     # Determinism
     parser.add_argument("--seed", type=int, default=1337,
                        help="Random seed for determinism (default: 1337)")
     
     args = parser.parse_args()
+
+    if getattr(args, "bounce_max", None) is not None:
+        try:
+            args.max_bounces = int(args.bounce_max)
+        except Exception:
+            pass
+    args.bounce_max = args.max_bounces
+
+    global _CLI_ARGS
+    _CLI_ARGS = args
 
     if not _NUMPY_AVAILABLE:
         print(f"ERROR: {_NUMPY_IMPORT_ERROR}", file=sys.stderr)
@@ -7472,7 +7900,14 @@ Examples:
     
     # Write submission (function dumps whatever dict we pass)
     write_submission_json(args.out, predictions)
-    
+
+    _flush_exact_wins(args.exact_wins_csv)
+    _flush_octo_csv(args.octo_stats_csv)
+    if args.exact_wins_csv:
+        print(f"  [LOG] exact-win events → {args.exact_wins_csv}")
+    if args.octo_stats_csv:
+        print(f"  [LOG] octonion telemetry → {args.octo_stats_csv}")
+
     # Summary
     print("\n" + "=" * 80)
     print(f"✅ COMPLETE!")
@@ -7544,6 +7979,9 @@ class SearchSettings:
     diversity_b_force_first: bool = False
     attemptB_beam_scale: float = 1.0
     attemptB_time_scale: float = 1.0
+    div_lambda: float = 0.50
+    iou_cap: float = 0.97
+    max_bounces: int = 8
 
 _INTERNAL_SETTINGS_CLS = globals().get("_InternalSearchSettings")
 _SETTINGS_SYNC_ATTRS = (
@@ -7572,6 +8010,9 @@ _SETTINGS_SYNC_ATTRS = (
     "diversity_b_force_first",
     "attemptB_beam_scale",
     "attemptB_time_scale",
+    "div_lambda",
+    "iou_cap",
+    "max_bounces",
     "hfp_enable",
     "hfp_alpha",
     "hfp_rho_hi",
