@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
-from typing import Any, Dict, List, Optional
+import re  # FIX: needed by _OP_TOKEN_RE
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -60,22 +60,59 @@ def _periodicity(grid: np.ndarray) -> List[int]:
     return [period1d(grid), period1d(grid.T)]
 
 
+def _layout_fp_from_train(train: List[dict]) -> Dict[str, Any]:
+    if not train:
+        return {"sym": {"H": 0, "V": 0, "R180": 0}, "period": [0, 0], "div": [0, 0]}
+
+    Hs, Ws = set(), set()
+    symH = symV = symR = 0
+    perR = perC = 0
+
+    for ex in train:
+        if not isinstance(ex, dict):
+            continue
+        grid = ex.get("output") or ex.get("input")
+        if grid is None:
+            continue
+        arr = np.array(grid)
+        if arr.ndim != 2:
+            continue
+        Hs.add(arr.shape[0])
+        Ws.add(arr.shape[1])
+        s = _symmetry_flags_np(arr)
+        symH |= int(s.get("H", 0))
+        symV |= int(s.get("V", 0))
+        symR |= int(s.get("R180", 0))
+        pr, pc = _periodicity(arr)
+        perR = max(perR, int(pr))
+        perC = max(perC, int(pc))
+
+    if not Hs or not Ws:
+        return {"sym": {"H": symH, "V": symV, "R180": symR}, "period": [perR, perC], "div": [0, 0]}
+
+    div = [0, 0]
+    minH = min(Hs)
+    minW = min(Ws)
+    if perR and minH % perR == 0:
+        div[0] = int(perR)
+    if perC and minW % perC == 0:
+        div[1] = int(perC)
+
+    return {
+        "sym": {"H": int(symH), "V": int(symV), "R180": int(symR)},
+        "period": [int(perR), int(perC)],
+        "div": div,
+    }
+
+
 def fingerprint_layout(task_json: Dict[str, Any]) -> Dict[str, Any]:
     train = task_json.get("train") or []
-    grid = None
-    if train and isinstance(train[0], dict):
-        grid = train[0].get("output") or train[0].get("input")
-    if grid is None:
+    if not isinstance(train, list):
         return {"sym": {"H": 0, "V": 0, "R180": 0}, "period": [0, 0], "div": [0, 0]}
-    arr = np.array(grid)
-    sym = _symmetry_flags_np(arr)
-    period = _periodicity(arr)
-    div = [0, 0]
-    if period[0] > 0 and arr.shape[0] % period[0] == 0:
-        div[0] = int(period[0])
-    if period[1] > 0 and arr.shape[1] % period[1] == 0:
-        div[1] = int(period[1])
-    return {"sym": sym, "period": period, "div": div}
+    try:
+        return _layout_fp_from_train(train)
+    except Exception:
+        return {"sym": {"H": 0, "V": 0, "R180": 0}, "period": [0, 0], "div": [0, 0]}
 
 
 def detect_family(layout_fp: Dict[str, Any]) -> str:
@@ -107,22 +144,54 @@ def op_prior_for_task(phi_family: str, priors: Dict[str, Any], alpha: float = 1.
     return out
 
 
+def _flatten_motif_bucket(bucket: Any) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    if isinstance(bucket, dict):
+        items.append(bucket)
+    elif isinstance(bucket, (list, tuple)):
+        for item in bucket:
+            if isinstance(item, dict):
+                items.append(item)
+    return items
+
+
 def choose_motifs(layout_fp: Dict[str, Any], motifs: Any, topk: int = 1) -> List[List[str]]:
     fam = detect_family(layout_fp)
+
     if isinstance(motifs, dict):
-        bucket = motifs.get(fam, [])
+        primary_bucket = _flatten_motif_bucket(motifs.get(fam, []))
+        alternate_buckets: List[Dict[str, Any]] = []
+        for key, bucket in motifs.items():
+            if key == fam:
+                continue
+            alternate_buckets.extend(_flatten_motif_bucket(bucket))
     else:
-        bucket = [m for m in (motifs or []) if m.get("family") == fam]
+        flat = _flatten_motif_bucket(motifs or [])
+        primary_bucket = [m for m in flat if m.get("family") == fam]
+        alternate_buckets = [m for m in flat if m.get("family") != fam]
+
     try:
-        scored = sorted(bucket, key=lambda m: -int(m.get("hit", 1)))
+        k = max(1, int(topk))
     except Exception:
-        scored = []
+        k = 1
+
+    primary = sorted(primary_bucket, key=lambda m: -int(m.get("hit", 1)))
+    alternates = sorted(alternate_buckets, key=lambda m: -int(m.get("hit", 1)))
+
+    bag = primary[:k] + alternates[: max(0, k - 1)]
     chosen: List[List[str]] = []
-    for motif in scored[: max(0, int(topk))]:
+    seen: set[Tuple[str, ...]] = set()
+    for motif in bag:
         ops = motif.get("ops", [])
-        if isinstance(ops, list) and 1 <= len(ops) <= 6:
-            chosen.append(list(ops))
-    return chosen
+        if not isinstance(ops, list) or not ops:
+            continue
+        ops_tuple = tuple(str(t) for t in ops if isinstance(t, str))
+        if not ops_tuple or ops_tuple in seen:
+            continue
+        seen.add(ops_tuple)
+        chosen.append(list(ops_tuple))
+
+    return chosen[:k] if chosen else []
 
 
 # ---- token parsing ----------------------------------------------------------
@@ -130,7 +199,14 @@ def choose_motifs(layout_fp: Dict[str, Any], motifs: Any, topk: int = 1) -> List
 _OP_TOKEN_RE = re.compile(r"^\s*([a-zA-Z_]\w*)\s*\((.*)\)\s*$")
 
 
-def parse_op_tokens(tokens: List[str]):
+def parse_op_tokens(tokens: List[str]) -> List[Any]:
+    """Parse serialized motif tokens into Step objects.
+
+    The solver now always falls back to its local parser, so even if a memory
+    shard returns an empty program we still hand back a syntactically valid
+    sequence of `Step` instances to seed the beam.
+    """
+
     from arc_one import Step  # type: ignore
 
     steps: List[Step] = []
