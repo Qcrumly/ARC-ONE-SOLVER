@@ -61,9 +61,8 @@ def _periodicity(grid: np.ndarray) -> List[int]:
 
 
 def _layout_fp_from_train(train: List[dict]) -> Dict[str, Any]:
-    default = {"sym": {"H": 0, "V": 0, "R180": 0}, "period": [0, 0], "div": [0, 0]}
     if not train:
-        return default
+        return {"sym": {"H": 0, "V": 0, "R180": 0}, "period": [0, 0], "div": [0, 0]}
 
     Hs, Ws = set(), set()
     symH = symV = symR = 0
@@ -75,29 +74,35 @@ def _layout_fp_from_train(train: List[dict]) -> Dict[str, Any]:
         grid = ex.get("output") or ex.get("input")
         if grid is None:
             continue
-        arr = np.asarray(grid)
+        arr = np.array(grid)
         if arr.ndim != 2:
             continue
-        Hs.add(int(arr.shape[0]))
-        Ws.add(int(arr.shape[1]))
-        flags = _symmetry_flags_np(arr)
-        symH |= int(flags.get("H", 0))
-        symV |= int(flags.get("V", 0))
-        symR |= int(flags.get("R180", 0))
-        per_r, per_c = _periodicity(arr)
-        perR = max(perR, int(per_r))
-        perC = max(perC, int(per_c))
+        Hs.add(arr.shape[0])
+        Ws.add(arr.shape[1])
+        s = _symmetry_flags_np(arr)
+        symH |= int(s.get("H", 0))
+        symV |= int(s.get("V", 0))
+        symR |= int(s.get("R180", 0))
+        pr, pc = _periodicity(arr)
+        perR = max(perR, int(pr))
+        perC = max(perC, int(pc))
 
     if not Hs or not Ws:
-        return default
+        return {"sym": {"H": symH, "V": symV, "R180": symR}, "period": [perR, perC], "div": [0, 0]}
 
     div = [0, 0]
-    if perR and (min(Hs) % perR == 0):
+    minH = min(Hs)
+    minW = min(Ws)
+    if perR and minH % perR == 0:
         div[0] = int(perR)
-    if perC and (min(Ws) % perC == 0):
+    if perC and minW % perC == 0:
         div[1] = int(perC)
 
-    return {"sym": {"H": symH, "V": symV, "R180": symR}, "period": [int(perR), int(perC)], "div": div}
+    return {
+        "sym": {"H": int(symH), "V": int(symV), "R180": int(symR)},
+        "period": [int(perR), int(perC)],
+        "div": div,
+    }
 
 
 def fingerprint_layout(task_json: Dict[str, Any]) -> Dict[str, Any]:
@@ -139,50 +144,48 @@ def op_prior_for_task(phi_family: str, priors: Dict[str, Any], alpha: float = 1.
     return out
 
 
+def _flatten_motif_bucket(bucket: Any) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    if isinstance(bucket, dict):
+        items.append(bucket)
+    elif isinstance(bucket, (list, tuple)):
+        for item in bucket:
+            if isinstance(item, dict):
+                items.append(item)
+    return items
+
+
 def choose_motifs(layout_fp: Dict[str, Any], motifs: Any, topk: int = 1) -> List[List[str]]:
     fam = detect_family(layout_fp)
 
-    def _iter_bucket(bucket: Any):
-        if isinstance(bucket, dict):
-            yield bucket
-        elif isinstance(bucket, (list, tuple)):
-            for item in bucket:
-                if isinstance(item, dict):
-                    yield item
-
-    def _safe_int(value: Any, default: int = 1) -> int:
-        try:
-            iv = int(value)
-        except Exception:
-            iv = default
-        return iv if iv > 0 else default
-
-    k = _safe_int(topk, 1)
-
-    primary: List[Dict[str, Any]] = []
-    alternates: List[Dict[str, Any]] = []
-
     if isinstance(motifs, dict):
-        primary = [m for m in _iter_bucket(motifs.get(fam, [])) if isinstance(m, dict)]
+        primary_bucket = _flatten_motif_bucket(motifs.get(fam, []))
+        alternate_buckets: List[Dict[str, Any]] = []
         for key, bucket in motifs.items():
             if key == fam:
                 continue
-            alternates.extend([m for m in _iter_bucket(bucket) if isinstance(m, dict)])
+            alternate_buckets.extend(_flatten_motif_bucket(bucket))
     else:
-        all_motifs = [m for m in _iter_bucket(motifs or []) if isinstance(m, dict)]
-        primary = [m for m in all_motifs if m.get("family") == fam]
-        alternates = [m for m in all_motifs if m.get("family") != fam]
+        flat = _flatten_motif_bucket(motifs or [])
+        primary_bucket = [m for m in flat if m.get("family") == fam]
+        alternate_buckets = [m for m in flat if m.get("family") != fam]
 
-    primary.sort(key=lambda m: -int(m.get("hit", 1)))
-    alternates.sort(key=lambda m: -int(m.get("hit", 1)))
+    try:
+        k = max(1, int(topk))
+    except Exception:
+        k = 1
 
-    bag = primary[: max(1, k)] + alternates[: max(0, k - 1)]
+    primary = sorted(primary_bucket, key=lambda m: -int(m.get("hit", 1)))
+    alternates = sorted(alternate_buckets, key=lambda m: -int(m.get("hit", 1)))
+
+    bag = primary[:k] + alternates[: max(0, k - 1)]
     chosen: List[List[str]] = []
     for motif in bag:
         ops = motif.get("ops", [])
         if isinstance(ops, list) and ops:
             chosen.append([str(t) for t in ops if isinstance(t, str)])
-    return chosen[: max(1, k)]
+
+    return chosen[:k] if chosen else []
 
 
 # ---- token parsing ----------------------------------------------------------

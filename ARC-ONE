@@ -2554,9 +2554,23 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     "conf2": float(conf2),
                     "mmrA": float(mmrA),
                     "mmrB": float(mmrB),
+                    "diversity": float(dis),
+                    "div_lambda": float(lam),
                 },
                 "iou12": i12 if i12 is not None else i12_float,
             }
+
+            try:
+                _telemetry_note(
+                    entry,
+                    chosen="B" if pickB else "A",
+                    conf1=float(conf1),
+                    conf2=float(conf2),
+                    dis=float(dis),
+                    lam=float(lam),
+                )
+            except Exception:
+                pass
 
             telemetry = entry["_telemetry"]
             _cap_telemetry(telemetry)
@@ -2569,14 +2583,6 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             )
             _telemetry_note(
                 entry,
-                dis=float(dis),
-                lam=float(lam),
-            )
-            _telemetry_note(
-                entry,
-                chosen=("B" if pickB else "A"),
-                conf1=float(conf1),
-                conf2=float(conf2),
                 mmrA=float(mmrA),
                 mmrB=float(mmrB),
             )
