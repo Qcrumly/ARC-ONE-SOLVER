@@ -144,11 +144,13 @@ except Exception:  # pragma: no cover - optional SciPy dependency
 
 def _keep_n_largest_ll(grid_ll, n=1):
     g = np.asarray(grid_ll)
-    bg = 0
-    mask = g != bg
-    if not mask.any():
+    if g.size == 0:
         return g.tolist()
-    labels, k = _cc_label(mask.astype(np.uint8))
+    bg = 0
+    mask = (g != bg).astype(np.uint8)
+    labels, k = _cc_label(mask)
+    if k <= n:
+        return g.tolist()
     areas = [(i, int((labels == i).sum())) for i in range(1, k + 1)]
     areas.sort(key=lambda t: t[1], reverse=True)
     keep = {i for i, _ in areas[: max(1, n)]}
@@ -195,16 +197,8 @@ def _cap_telemetry(telemetry: Optional[Dict[str, Any]]) -> None:
 
 
 def rvd_R(rho: float, eps: float = 1e-12) -> float:
-    """
-    Canonical Recursive Vantage Dynamics measure:
-      R(rho) = rho^7 * |ln(rho)|,  rho in (0,1]
-    Low R indicates stall/decay; use as break predicate.
-    """
-    rho = float(max(rho, eps))
-    if rho > 1.0:
-        # (optional) symmetric variant; comment out if not desired:
-        # rho = 1.0 / rho
-        rho = min(rho, 1.0)  # conservative: clamp to 1
+    """Anti-friction metric R(ρ)=ρ⁷·|ln ρ| for ρ∈(0,1]."""
+    rho = max(eps, min(1.0, float(rho)))
     return (rho ** 7) * abs(math.log(rho))
 
 
@@ -2554,6 +2548,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     "conf2": float(conf2),
                     "mmrA": float(mmrA),
                     "mmrB": float(mmrB),
+                    "keep1_applied": bool(single_object),
                     "diversity": float(dis),
                     "div_lambda": float(lam),
                 },
@@ -4125,13 +4120,7 @@ class SelfMonitor:
         self.hfp_alpha = float(getattr(settings, "hfp_alpha", 0.5))
         self.hfp_rho_hi = float(getattr(settings, "hfp_rho_hi", 0.8))
         self.hfp_rho_lo = float(getattr(settings, "hfp_rho_lo", 0.55))
-        self.hfp_break_R_min = float(
-            getattr(
-                settings,
-                "hfp_break_R_min",
-                getattr(settings, "hfp_break_R", 0.010),
-            )
-        )
+        self.hfp_break_R_min = float(getattr(settings, "hfp_break_R_min", 0.010))
         self.hfp_gate = bool(getattr(settings, "hfp_gate_by_health", True))
         self.hfp_gate_keep = bool(getattr(settings, "hfp_gate_keep", True))
         self.hfp_dbg = bool(getattr(settings, "hfp_debug_telemetry", True))
@@ -7397,6 +7386,48 @@ def _solve_task_internal(
         except Exception:
             pass
 
+    R_break = float(getattr(settings, "hfp_break_R_min", 0.010)) if settings else 0.010
+    R_good = float(getattr(settings, "_hfp_R_good", 0.080)) if settings else 0.080
+    R_val = None
+    if monitor is not None:
+        R_val = getattr(monitor, "R_last", None)
+    if R_val is None and rho_composite is not None:
+        try:
+            R_val = rvd_R(rho_composite)
+        except Exception:
+            R_val = None
+    if R_val is not None:
+        if settings is not None:
+            setattr(settings, "_hfp_R_last", float(R_val))
+        if monitor is not None:
+            monitor.R_last = float(R_val)
+            if R_val < R_break:
+                monitor.health = "low_R"
+        if R_val < R_break:
+            if settings is not None:
+                setattr(settings, "_hfp_should_break", True)
+                setattr(settings, "_hfp_break_reason", "low_R")
+        elif R_val >= R_good:
+            stretched = False
+            if settings is not None:
+                stretched = bool(getattr(settings, "_hfp_stretched", False))
+            if not stretched:
+                try:
+                    current_budget = float(getattr(settings, "max_seconds", 0.0)) if settings else 0.0
+                except Exception:
+                    current_budget = 0.0
+                new_budget = float(int(round(current_budget * 1.25))) if current_budget > 0 else current_budget
+                if settings is not None and new_budget > current_budget:
+                    settings.max_seconds = new_budget
+                    setattr(settings, "_hfp_stretched", True)
+                if settings is not None and new_budget > current_budget:
+                    try:
+                        deadline.t_end = t0 + new_budget
+                    except Exception:
+                        pass
+                if monitor is not None:
+                    setattr(monitor, "_stretched", True)
+
     # Check if we should generate two attempts using truncated shape-base
     # Truncate program at last tile_masked to get pure shape transformation
     base_steps, ky, kx, m = _truncate_at_last_tile_masked(best_program)
@@ -8338,6 +8369,10 @@ Examples:
     settings.attemptB_time_scale = _envfloat(
         "ARC_ATTEMPTB_TIME_SCALE", getattr(settings, "attemptB_time_scale", 1.0)
     )
+    settings.hfp_break_R_min = _envfloat(
+        "ARC_R_BREAK", getattr(settings, "hfp_break_R_min", 0.010)
+    )
+    settings._hfp_R_good = _envfloat("ARC_R_GOOD", getattr(settings, "_hfp_R_good", 0.080))
     
     # Apply ablation if specified
     if args.ablation:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
-import re  # needed by _OP_TOKEN_RE
+import re  # FIX: needed by _OP_TOKEN_RE
 from typing import Any, Dict, List, Optional
 
 import numpy as np
