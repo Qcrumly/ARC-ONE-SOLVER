@@ -106,24 +106,27 @@ try:
 except Exception:  # pragma: no cover - optional SciPy dependency
 
     def _cc_label(arr, structure=None):
-        # 4-connected labeling fallback
-        arr = np.asarray(arr).astype(bool)
-        H, W = arr.shape
+        import numpy as np  # local import keeps fallback self-contained
+
+        arr = (np.asarray(arr) != 0).astype(np.uint8)
+        h, w = arr.shape
         labels = np.zeros_like(arr, dtype=np.int32)
-        cur = 0
-        for i in range(H):
-            for j in range(W):
-                if arr[i, j] and labels[i, j] == 0:
-                    cur += 1
-                    stack = [(i, j)]
-                    labels[i, j] = cur
+        current = 0
+        stack = []
+        for y in range(h):
+            for x in range(w):
+                if arr[y, x] and labels[y, x] == 0:
+                    current += 1
+                    labels[y, x] = current
+                    stack.append((y, x))
                     while stack:
-                        x, y = stack.pop()
-                        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
-                            if 0 <= nx < H and 0 <= ny < W and arr[nx, ny] and labels[nx, ny] == 0:
-                                labels[nx, ny] = cur
-                                stack.append((nx, ny))
-        return labels, cur
+                        yy, xx = stack.pop()
+                        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                            ny, nx = yy + dy, xx + dx
+                            if 0 <= ny < h and 0 <= nx < w and arr[ny, nx] and labels[ny, nx] == 0:
+                                labels[ny, nx] = current
+                                stack.append((ny, nx))
+        return labels, int(current)
 
 
 # === Determinism & banner ===
@@ -2693,9 +2696,8 @@ def _holes_count(grid: np.ndarray) -> int:
 
 def _component_count(grid: np.ndarray) -> int:
     """Return number of connected non-zero components (4-conn)."""
-    from scipy.ndimage import label
-
-    return int(label(grid != 0)[1])
+    labels, num = _cc_label(grid != 0)
+    return int(num)
 
 
 def _pixel_acc(pred_item, truth_np: np.ndarray) -> float:
@@ -5219,8 +5221,9 @@ def _int_space_for_base(op_name, idx, ctx):
         triples = []
         if Hin and Win and Hout % Hin == 0 and Wout % Win == 0:
             ky, kx = Hout // Hin, Wout // Win
-            # Try all three modes
-            triples.extend([(ky, kx, 0), (ky, kx, 1), (ky, kx, 2)])
+            if not (ky == 1 and kx == 1):
+                # Try all three modes
+                triples.extend([(ky, kx, 0), (ky, kx, 1), (ky, kx, 2)])
         if not triples:
             # Fallback
             triples = [(2, 2, 0), (3, 3, 0)]
@@ -5341,9 +5344,7 @@ def _int_space_for_cached(op_name, idx, ctx_sig):
     if op_name == "stack":
         return (0, 1)
     if op_name == "scale":
-        allow_ident = not ctx_sig[1]
-        base = [2, 3] + ([1] if allow_ident else [])
-        return tuple(base)
+        return (2, 3)
     ctx = _ctx_from_sig(ctx_sig)
     return tuple(_int_space_for_base(op_name, idx, ctx))
 
@@ -6152,6 +6153,56 @@ def enumerate_args(op_name: str, param_types: List[str], ctx) -> List[Tuple[Any,
     combos = [()]
     for space in spaces:
         combos = [c + (v,) for c in combos for v in space]
+
+    depth_val = None
+    if isinstance(ctx, dict):
+        depth_val = ctx.get("depth", depth_val)
+    else:
+        depth_val = getattr(ctx, "depth", depth_val)
+
+    if op_name == "scale":
+        if depth_val == 0:
+            return []
+        filtered = []
+        for args in combos:
+            if not args:
+                continue
+            try:
+                val = int(args[0])
+            except Exception:
+                continue
+            if val in (2, 3):
+                filtered.append(args)
+        combos = filtered
+
+    if op_name in {"tile", "phase_tile", "phase_tile_row", "phase_tile_col"}:
+        combos = [
+            args
+            for args in combos
+            if not (len(args) >= 2 and tuple(args[:2]) == (1, 1))
+        ]
+
+    if op_name == "shift":
+        filtered = []
+        for args in combos:
+            if len(args) >= 2:
+                try:
+                    dy, dx = int(args[0]), int(args[1])
+                except Exception:
+                    filtered.append(args)
+                    continue
+                if dy == 0 and dx == 0:
+                    continue
+            filtered.append(args)
+        combos = filtered
+
+    if op_name == "stack":
+        combos = [
+            args
+            for args in combos
+            if args and args[0] in (0, 1)
+        ]
+
     return combos
 
 
