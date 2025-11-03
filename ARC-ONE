@@ -85,8 +85,8 @@ except ModuleNotFoundError:  # pragma: no cover - depends on environment
 
     np = _MissingNumpy()  # type: ignore
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Tuple, Optional, Any, Set, Iterable
-from collections import deque, defaultdict
+from typing import Dict, List, Tuple, Optional, Any, Set, Iterable, Sequence
+from collections import Counter, deque, defaultdict
 from functools import lru_cache
 import csv, time, random
 import itertools
@@ -163,6 +163,30 @@ def _structure_tuple(arr):
     a = np.asarray(arr)
     h, w = a.shape
     return (h, w, int((a != 0).sum()))
+
+
+def _structure_area(arr, bg=0):
+    a = np.asarray(arr)
+    if a.ndim != 2:
+        return 0
+    return int((a != bg).sum())
+
+
+def _fill_holes_ll(grid_ll):
+    arr = np.asarray(grid_ll)
+    if arr.ndim != 2:
+        return arr.tolist() if hasattr(arr, "tolist") else grid_ll
+    try:
+        filled = _op_fill_holes(arr)
+    except Exception:
+        return arr.tolist()
+    filled_arr = np.asarray(filled)
+    return filled_arr.tolist() if hasattr(filled_arr, "tolist") else filled
+
+
+def _apply_morph_pivot(grid_ll):
+    pivot = _keep_n_largest_ll(grid_ll, 1)
+    return _fill_holes_ll(pivot)
 
 
 # === Determinism & banner ===
@@ -1077,6 +1101,77 @@ def _candidate_family_from_tag(tag: str) -> str:
     if any(key in tag_l for key in ("tile", "phase")):
         return "tiling_first"
     return "unknown"
+
+
+def _distinct_families_cycle(ops_tokens: Sequence[str], exclude: Optional[Sequence[str]] = None) -> List[str]:
+    used = _detect_strategy_family(list(ops_tokens) if ops_tokens is not None else [])
+    ordered = ["align_first", "object_first", "color_first", "tiling_first"]
+    if used in ordered:
+        ordered.remove(used)
+    if exclude:
+        exclude_set = {str(x) for x in exclude}
+        ordered = [fam for fam in ordered if fam not in exclude_set]
+    return ordered
+
+
+def _first_candidate_by_family(candidates: Sequence[Dict[str, Any]], family: str) -> Optional[Dict[str, Any]]:
+    for cand in candidates or []:
+        try:
+            tag = cand.get("tag")
+        except Exception:
+            tag = None
+        if _candidate_family_from_tag(str(tag)) == family:
+            return cand
+    return None
+
+
+def _force_attempt_b_diversity(
+    base_grid,
+    att2_grid,
+    candidates,
+    belief,
+    settings,
+    ops_tokens,
+):
+    cap_default = float(getattr(settings, "iou_cap", 0.95)) if settings else 0.95
+    cap = _envfloat("ARC_IOU_CAP", cap_default)
+    base_ll = base_grid.tolist() if hasattr(base_grid, "tolist") else base_grid
+    att2_ll = att2_grid.tolist() if hasattr(att2_grid, "tolist") else att2_grid
+    try:
+        current_iou = _pixel_iou(base_ll, att2_ll)
+    except Exception:
+        current_iou = 1.0
+    if current_iou < cap:
+        return att2_ll, current_iou, False
+
+    families = _distinct_families_cycle(ops_tokens or [])[:3]
+    for fam in families:
+        candidate = _first_candidate_by_family(candidates, fam)
+        if candidate is None:
+            try:
+                alt_options = _build_family_alternates(base_ll, belief, fam)
+            except Exception:
+                alt_options = []
+            candidate = alt_options[0] if alt_options else None
+        if candidate is None:
+            continue
+        grid_val = candidate.get("grid") if isinstance(candidate, dict) else candidate
+        cand_ll = grid_val.tolist() if hasattr(grid_val, "tolist") else grid_val
+        cand_ll = _apply_morph_pivot(cand_ll)
+        try:
+            cand_iou = _pixel_iou(base_ll, cand_ll)
+        except Exception:
+            cand_iou = 1.0
+        if cand_iou < cap:
+            return cand_ll, cand_iou, True
+
+    try:
+        mirrored = _mirror_lr(att2_ll)
+        mirror_iou = _pixel_iou(base_ll, mirrored)
+    except Exception:
+        mirrored = att2_ll
+        mirror_iou = current_iou
+    return mirrored, mirror_iou, True
 
 
 def _build_family_alternates(base_grid, belief, family: str) -> List[Dict[str, Any]]:
@@ -2425,34 +2520,23 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         pass
 
                 try:
-                    cap_default = float(getattr(settings, "iou_cap", 0.97)) if settings else 0.97
-                    cap = _envfloat("ARC_IOU_CAP", cap_default)
-                    base_ll = base.tolist() if hasattr(base, "tolist") else base
-                    att2_ll = att2.tolist() if hasattr(att2, "tolist") else att2
-                    if _pixel_iou(base_ll, att2_ll) >= cap:
-                        try:
-                            regenerated = _regenerate_alt_from_different_bucket(base_ll, belief, pairs)
-                            att2 = regenerated
-                            forced_alternate = True
-                        except Exception:
-                            att2 = np.rot90(np.asarray(base_ll), 2).tolist()
-                            forced_alternate = True
-                    # ensure post-regeneration diversity if still over cap
-                    att2_ll = att2.tolist() if hasattr(att2, "tolist") else att2
-                    if _pixel_iou(base_ll, att2_ll) >= cap:
-                        try:
-                            att2_np = np.asarray(att2_ll)
-                            if att2_np.ndim == 2:
-                                att2 = np.fliplr(att2_np).tolist()
-                                att2_ll = att2
-                        except Exception:
-                            pass
+                    att2_ll, _diversity_iou, replaced = _force_attempt_b_diversity(
+                        base,
+                        att2,
+                        candidates,
+                        belief,
+                        settings,
+                        ops_tokens,
+                    )
+                    if replaced:
+                        att2 = att2_ll
+                        forced_alternate = True
                 except Exception:
                     try:
-                        att2 = np.rot90(np.asarray(base), 2).tolist()
+                        att2 = _mirror_lr(att2)
+                        forced_alternate = True
                     except Exception:
-                        att2 = base
-                    forced_alternate = True
+                        pass
 
                 cand_list: List[Dict[str, Any]] = []
                 for tag_name, grid_val in (("attemptA", base), ("attemptB", att2)):
@@ -2555,29 +2639,37 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                 except Exception:
                     i12 = 0.0
 
+            keep_applied = False
             try:
                 train_pairs = pairs if pairs else []
-                comp_counts = []
+                comp_counts: List[int] = []
                 for (_x, y) in train_pairs:
                     yy = np.asarray(y)
                     labels, k = _cc_label((yy != 0).astype(np.uint8))
                     comp_counts.append(int(k))
-                single_object = (
-                    len(comp_counts) > 0
-                    and (sum(c == 1 for c in comp_counts) / len(comp_counts)) >= 0.6
-                )
+                if comp_counts:
+                    modal_components = Counter(comp_counts).most_common(1)[0][0]
+                    single_object = modal_components == 1
+                else:
+                    single_object = False
             except Exception:
                 single_object = False
 
             gA = att1_entry["grid"]
             gB = att2_entry["grid"]
             tgt = target
+            bg_val = belief.get("bg", 0)
             if single_object and tgt is not None:
                 try:
-                    if _structure_tuple(gA) >= _structure_tuple(tgt):
-                        gA = _keep_n_largest_ll(gA, 1)
-                    if _structure_tuple(gB) >= _structure_tuple(tgt):
-                        gB = _keep_n_largest_ll(gB, 1)
+                    tgt_area = _structure_area(tgt, bg=bg_val)
+                    if _structure_area(gA, bg=bg_val) >= tgt_area:
+                        new_gA = _keep_n_largest_ll(gA, 1)
+                        keep_applied = keep_applied or (new_gA != gA)
+                        gA = new_gA
+                    if _structure_area(gB, bg=bg_val) >= tgt_area:
+                        new_gB = _keep_n_largest_ll(gB, 1)
+                        keep_applied = keep_applied or (new_gB != gB)
+                        gB = new_gB
                 except Exception:
                     pass
 
@@ -2616,7 +2708,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     "conf2": float(conf2),
                     "mmrA": float(mmrA),
                     "mmrB": float(mmrB),
-                    "keep1_applied": bool(single_object),
+                    "keep1_applied": bool(keep_applied),
                     "diversity": float(dis),
                     "div_lambda": float(lam),
                 },
