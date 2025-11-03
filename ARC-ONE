@@ -3,7 +3,7 @@ from __future__ import annotations
 # ARC-ONE: Octonionic Control Overlay for Abstract Reasoning Corpus
 # ==================================================================================
 #
-# Version: v2.9.8 — Constraint Pack (identity + hard scale rails)
+# Version: v2.10.2 — Memory motif seeding enqueue + Diversity Guard + HFP×GOF
 #
 # v2.9.8
 # - Block “identity/surrender” successors.
@@ -24,7 +24,7 @@ from __future__ import annotations
 # - Preserves v2.9.5 hard caps, octonion prior, two-attempt policy, and palette rules.
 #
 # v2.9.5
-# - Enforce hard per-stage time caps: solve_task respects settings.max_seconds via a deadline check.
+# - Enforce hard per-stage time caps: _solve_task_internal respects settings.max_seconds via a deadline check.
 # - Task telemetry: budget_sec, elapsed_sec, hit_deadline (True if deadline reached).
 # - Emit finalized program sequence for sidecar analysis: ops_tokens[], ops_families[].
 # - Keeps v2.9.4 octonion palette8 prior and all previous policies unchanged.
@@ -47,7 +47,7 @@ from __future__ import annotations
 #           Duplicate topology-hint block removed; telemetry cleaned.
 # - v2.9.2: Two-attempt debate with diversity guard, ρ-adaptive aborts, palette safety, and stage-aware scheduling.
 
-__version__ = "v2.9.8"
+__version__ = "v2.10.2"  # Seeded motif enqueue + telemetry
 
 last_best_program = None
 
@@ -78,6 +78,7 @@ from collections import deque, defaultdict
 import itertools
 import math
 import time
+import csv
 import statistics as _stats
 import json
 import os
@@ -87,7 +88,325 @@ import argparse
 import tempfile
 import shutil
 import hashlib
-from scipy.ndimage import label as _cc_label
+import re
+try:
+    from scipy.ndimage import label as _cc_label
+except Exception:  # pragma: no cover - optional SciPy dependency
+
+    def _cc_label(arr, structure=None):
+        data = np.asarray(arr)
+        labels = np.zeros_like(data, dtype=int)
+        visited = np.zeros_like(data, dtype=bool)
+        current = 0
+        H, W = data.shape[:2]
+
+        for y in range(H):
+            for x in range(W):
+                if visited[y, x] or not data[y, x]:
+                    continue
+                current += 1
+                stack = [(y, x)]
+                visited[y, x] = True
+                labels[y, x] = current
+                while stack:
+                    cy, cx = stack.pop()
+                    for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                        if 0 <= ny < H and 0 <= nx < W and not visited[ny, nx] and data[ny, nx]:
+                            visited[ny, nx] = True
+                            labels[ny, nx] = current
+                            stack.append((ny, nx))
+        return labels, current
+
+
+# === Determinism & banner ===
+import random
+try:  # Prefer real numpy but fall back to the shim if unavailable
+    import numpy as _np
+except ModuleNotFoundError:  # pragma: no cover - aligns with optional numpy install
+    _np = np  # type: ignore
+
+try:  # Memory helpers are optional
+    import arc_memory as MEM
+except Exception:  # pragma: no cover - memory module optional
+    MEM = None
+
+
+DIVERSITY_MIN_THRESHOLD = 0.15
+SHAPE_MATCH_BONUS = 0.02
+RHO_HEALTHY = 0.80
+MAX_TELEMETRY_ITEMS = 50
+
+_CLI_ARGS: Optional[Any] = None
+
+
+# ---- Memory motif token parsing & safe telemetry --------------------------------
+_OP_TOKEN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$")
+
+
+def _cap_telemetry_dict(telemetry: Optional[Dict[str, Any]]) -> None:
+    if isinstance(telemetry, dict) and len(telemetry) > MAX_TELEMETRY_ITEMS:
+        for key in list(telemetry.keys())[MAX_TELEMETRY_ITEMS:]:
+            telemetry.pop(key, None)
+
+
+def _telemetry_note_safe(carrier, **kv):
+    """Silently attach telemetry if helper is available."""
+    try:
+        _telemetry_note  # type: ignore[name-defined]
+    except Exception:
+        return
+    try:
+        _telemetry_note(carrier, **kv)  # type: ignore[name-defined]
+    except Exception:
+        pass
+    target = None
+    try:
+        if isinstance(carrier, dict):
+            target = carrier.get("_telemetry") if "_telemetry" in carrier else carrier
+        else:
+            target = getattr(carrier, "_telemetry", None)
+    except Exception:
+        target = None
+    _cap_telemetry_dict(target)
+
+
+def _parse_seed_tokens_to_program(
+    tokens: Optional[List[str]],
+    StepCls: Optional[Any] = None,
+    ProgramCls: Optional[Any] = None,
+):
+    """Return (Program or None, number_of_steps) for a motif token list."""
+    if not tokens:
+        return None, 0
+
+    try:
+        import arc_memory as MEM  # type: ignore
+
+        if hasattr(MEM, "parse_op_tokens"):
+            steps = MEM.parse_op_tokens(list(tokens))  # type: ignore[arg-type]
+            ProgTypeFast = ProgramCls or globals().get("Program")
+            if steps and ProgTypeFast is not None:
+                return ProgTypeFast(list(steps)), len(steps)  # type: ignore[arg-type]
+    except Exception:
+        pass
+
+    StepType = StepCls or globals().get("Step")
+    ProgType = ProgramCls or globals().get("Program")
+    if StepType is None or ProgType is None:
+        return None, 0
+
+    steps = []
+    regex_primary = globals().get("_OP_RE")
+    for raw in tokens:
+        tok = (raw or "").strip()
+        if not tok:
+            continue
+        match = None
+        if regex_primary is not None:
+            try:
+                match = regex_primary.match(tok)
+            except Exception:
+                match = None
+        if match is None:
+            match = _OP_TOKEN_RE.match(tok)
+        if not match:
+            # allow bare op name by appending ()
+            match = _OP_TOKEN_RE.match(f"{tok}()")
+            if not match:
+                continue
+        name, arg_str = match.group(1), match.group(2).strip()
+        args: List[int] = []
+        if arg_str:
+            for part in arg_str.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    args.append(int(part))
+                except Exception:
+                    # Ignore non-integer args for v1.0; extend as needed.
+                    continue
+        try:
+            steps.append(StepType(name, tuple(args)))
+        except Exception:
+            return None, 0
+
+    if not steps:
+        return None, 0
+
+    try:
+        program = ProgType(steps)
+    except Exception:
+        return None, 0
+    return program, len(steps)
+
+
+def _enqueue_seed_programs(
+    frontier: List[Any],
+    input_grid: Any,
+    target_grid: Any,
+    seed_tokens_list: Optional[List[List[str]]],
+    interpret_program_fn,
+    compute_cost_fn,
+    step_cls: Optional[Any] = None,
+    prog_cls: Optional[Any] = None,
+    telem_carrier: Optional[Any] = None,
+) -> int:
+    """Append parsed motif programs to the frontier. Returns count appended."""
+    if not seed_tokens_list:
+        return 0
+
+    pushed = 0
+    for toks in seed_tokens_list:
+        prog, nops = _parse_seed_tokens_to_program(toks, StepCls=step_cls, ProgramCls=prog_cls)
+        if prog is None or not getattr(prog, "steps", None):
+            continue
+        try:
+            pred = interpret_program_fn(prog, input_grid)
+            cost = compute_cost_fn(prog, input_grid, target_grid)
+        except Exception:
+            continue
+
+        try:
+            if "BeamEntry" in globals():
+                entry = BeamEntry(program=prog, pred=pred, cost=cost)  # type: ignore[name-defined]
+            else:
+                entry = {"program": prog, "pred": pred, "cost": float(cost)}
+            frontier.append(entry)
+            _telemetry_note_safe(
+                entry,
+                memory_seeded_motif=list(toks or []),
+                memory_seed_ops=int(nops),
+                memory_seed_cost=float(cost),
+            )
+            if telem_carrier is not None:
+                _telemetry_note_safe(
+                    telem_carrier,
+                    memory_seeded_motif=list(toks or []),
+                    memory_seed_ops=int(nops),
+                    memory_seed_cost=float(cost),
+                )
+            pushed += 1
+        except Exception:
+            continue
+
+    return pushed
+
+
+def _parse_tokens_to_program(tokens: List[str]):
+    """Compat shim for callers expecting the older helper name."""
+    prog, _ = _parse_seed_tokens_to_program(tokens)
+    if prog is not None:
+        return prog
+    ProgramCls = globals().get("Program")
+    return ProgramCls([]) if ProgramCls is not None else []
+
+
+# === Exact win attribution & octonion telemetry ==============================
+_EXACT_WINS: List[Dict[str, Any]] = []
+
+
+def _log_exact_win(event: Dict[str, Any]) -> None:
+    event["ts"] = time.time()
+    _EXACT_WINS.append(event)
+
+
+def _flush_exact_wins(path: Optional[str]) -> None:
+    if not path or not _EXACT_WINS:
+        return
+    keys = sorted({k for e in _EXACT_WINS for k in e.keys()})
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(_EXACT_WINS)
+
+
+_OCTO_ROWS: List[Dict[str, Any]] = []
+
+
+def _collect_octo_row(
+    *,
+    task_id,
+    attempt_tag,
+    phi_family,
+    input_grid,
+    pred_grid,
+    target_grid,
+    x_oct,
+    rho,
+    depth,
+    elapsed_s,
+):
+    import numpy as _np
+
+    def _ensure_array(val):
+        if val is None:
+            return _np.zeros((0, 0), dtype=int)
+        arr = _np.asarray(val)
+        if arr.ndim == 0:
+            return arr.reshape(1, 1)
+        return arr
+
+    A = _ensure_array(input_grid)
+    P = _ensure_array(pred_grid)
+    T = _ensure_array(target_grid)
+    exact = int(P.shape == T.shape and T.size > 0 and _np.array_equal(P, T))
+    mean_err = None
+    if P.shape == T.shape and T.size:
+        mean_err = float((P != T).mean())
+
+    def _palette_delta(a, b):
+        pa, pb = set(_np.unique(a)), set(_np.unique(b))
+        if not pa and not pb:
+            return 0.0
+        return float(len(pa.symmetric_difference(pb))) / float(max(1, len(pa.union(pb))))
+
+    palette_delta = _palette_delta(P, T) if T.size else None
+    size_change = None
+    if T.size:
+        size_change = abs(A.size - T.size) / float(max(1, T.size))
+
+    row = {
+        "task_id": task_id,
+        "attempt_tag": attempt_tag,
+        "phi_family": phi_family,
+        "x_oct": None if x_oct is None else float(x_oct),
+        "exact": exact,
+        "mean_pix_err": mean_err,
+        "shape_mismatch": int(T.size and P.shape != T.shape) if T.size else None,
+        "size_change": size_change,
+        "palette_delta": palette_delta,
+        "components_delta": None,
+        "holes_delta": None,
+        "rho": float(rho) if rho is not None else None,
+        "depth": int(depth) if depth is not None else None,
+        "elapsed_s": float(elapsed_s) if elapsed_s is not None else None,
+    }
+    _OCTO_ROWS.append(row)
+
+
+def _flush_octo_csv(path: Optional[str]) -> None:
+    if not path or not _OCTO_ROWS:
+        return
+    keys = sorted({k for r in _OCTO_ROWS for k in r.keys()})
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        writer.writerows(_OCTO_ROWS)
+
+
+def _set_determinism(seed=0):
+    random.seed(seed)
+    try:
+        _np.random.seed(seed)
+    except Exception:
+        pass
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+
+_set_determinism(0)
+
+print(f"[ARC-ONE] seed=0  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
 
 
 # ==================================================================================
@@ -471,39 +790,38 @@ def _attempt2_from_strategy(att1_ll, strategy, phi_arr, train_pairs, test_input_
 
 
 def _pixel_iou(a, b):
-    """Micro-averaged IoU across colors. Returns 0.0 if shapes differ or empty."""
-    if a is None or b is None:
+    A, B = np.asarray(a), np.asarray(b)
+    if A.shape != B.shape:
         return 0.0
-    if len(a) == 0 or len(b) == 0:
+    if A.size == 0:
         return 0.0
-    H1, W1 = len(a), len(a[0]) if a[0] else 0
-    H2, W2 = len(b), len(b[0]) if b[0] else 0
-    if H1 != H2 or W1 != W2:
-        return 0.0
-    colors = set()
-    for i in range(H1):
-        for j in range(W1):
-            colors.add(a[i][j])
-            colors.add(b[i][j])
-    if not colors:
-        return 0.0
-    inter_sum = 0
-    union_sum = 0
-    for c in colors:
-        inter = 0
-        union = 0
-        for i in range(H1):
-            for j in range(W1):
-                in_a = a[i][j] == c
-                in_b = b[i][j] == c
-                if in_a and in_b:
-                    inter += 1
-                if in_a or in_b:
-                    union += 1
-        if union > 0:
-            inter_sum += inter
-            union_sum += union
-    return (inter_sum / union_sum) if union_sum > 0 else 0.0
+    return float((A == B).sum()) / float(A.size)
+
+
+def _pick_two_attempts(cands, lambda_div=0.5, iou_cap=0.97, seed=1337):
+    """Return (first, second, IoU) given candidate predictions."""
+    if not cands:
+        return None, None, 0.0
+
+    first = max(cands, key=lambda c: c.get("conf", 0.0))
+    rng = random.Random(seed)
+    best = None
+    best_score = float("-inf")
+    for cand in cands:
+        if cand is first:
+            continue
+        iou = _pixel_iou(first.get("grid"), cand.get("grid"))
+        if iou >= iou_cap:
+            continue
+        score = float(cand.get("conf", 0.0)) - float(lambda_div) * float(iou)
+        # tie-break deterministically with seed to avoid oscillations
+        if score > best_score or (math.isclose(score, best_score) and rng.random() < 0.5):
+            best = cand
+            best_score = score
+
+    second = best if best is not None else first
+    i12 = _pixel_iou(first.get("grid"), second.get("grid"))
+    return first, second, i12
 
 
 def _normalize_two_attempts(out):
@@ -549,6 +867,156 @@ def _normalize_two_attempts(out):
     if arr.ndim == 2:
         return {"attempt_1": arr.tolist(), "attempt_2": _rot180(arr).tolist()}
     return {"attempt_1": [[0]], "attempt_2": [[0]]}
+
+
+# --- Diversity guard for attempt_2 ------------------------------------------
+def _token_jaccard(a, b):
+    try:
+        A, B = set(map(str, a or [])), set(map(str, b or []))
+        if not A and not B:
+            return 0.0
+        return 1.0 - (len(A & B) / max(1, len(A | B)))
+    except Exception:
+        return 0.0
+
+
+def _grid_dissimilarity(a, b):
+    import numpy as _np
+
+    if a is None or b is None:
+        return 0.0
+    A, B = _np.array(a), _np.array(b)
+    if A.shape != B.shape:
+        return 0.0
+    inter = (A == B).sum()
+    union = A.size + B.size - inter
+    return 1.0 - (inter / max(1, union))
+
+
+def _mmr_dissim(opsA, opsB, gridA, gridB):
+    """Conservative disagreement score combining tokens + grid dissimilarity."""
+    tok_div = _token_jaccard(opsA, opsB)
+    grd_div = _grid_dissimilarity(gridA, gridB)
+    return max(tok_div, grd_div)
+
+
+def _enforce_diversity(att1, att2):
+    ops1 = (att1.get("_telemetry", {}) or {}).get("ops_tokens", []) if isinstance(att1, dict) else []
+    ops2 = (att2.get("_telemetry", {}) or {}).get("ops_tokens", []) if isinstance(att2, dict) else []
+    g1 = att1.get("grid") if isinstance(att1, dict) else None
+    g2 = att2.get("grid") if isinstance(att2, dict) else None
+    if _mmr_dissim(ops1, ops2, g1, g2) < DIVERSITY_MIN_THRESHOLD and isinstance(att2, dict):
+        att2.setdefault("_telemetry", {})["diversity_nudge"] = True
+    return att2
+
+
+def _detect_strategy_family(ops_tokens: List[str]) -> str:
+    head = " ".join([str(op).lower() for op in (ops_tokens or [])[:2]])
+    if not head:
+        return "unknown"
+    if any(key in head for key in ("mirror", "rot", "flip", "align", "center")):
+        return "align_first"
+    if any(key in head for key in ("keep_n_largest", "largest", "remove_isolated", "keep_size")):
+        return "object_first"
+    if any(key in head for key in ("recolor", "replacecolor", "palette", "map")):
+        return "color_first"
+    if any(key in head for key in ("tile", "phase_tile")):
+        return "tiling_first"
+    return "unknown"
+
+
+def _candidate_family_from_tag(tag: str) -> str:
+    tag_l = (tag or "").lower()
+    if any(key in tag_l for key in ("mirror", "rot", "align", "shift")):
+        return "align_first"
+    if any(key in tag_l for key in ("keep", "largest", "remove", "mask")):
+        return "object_first"
+    if any(key in tag_l for key in ("color", "palette")):
+        return "color_first"
+    if any(key in tag_l for key in ("tile", "phase")):
+        return "tiling_first"
+    return "unknown"
+
+
+def _build_family_alternates(base_grid, belief, family: str) -> List[Dict[str, Any]]:
+    import numpy as _np
+
+    alts: List[Dict[str, Any]] = []
+    try:
+        base_np = _np.asarray(base_grid)
+    except Exception:
+        return alts
+    if base_np.ndim != 2:
+        return alts
+
+    def _push(tag: str, grid_like):
+        if grid_like is None:
+            return
+        grid_arr = _np.asarray(grid_like)
+        if grid_arr.shape != base_np.shape:
+            return
+        alts.append({"tag": tag, "grid": grid_arr})
+
+    if family == "align_first":
+        try:
+            _push("keep_n_largest(1)", _op_keep_n_largest(base_np, 1))
+        except Exception:
+            pass
+    elif family == "object_first":
+        try:
+            _push("mirror_guard", _mirror_lr(base_np))
+        except Exception:
+            pass
+    elif family == "tiling_first":
+        try:
+            _push("rot90_guard", _np.rot90(base_np, 1))
+        except Exception:
+            pass
+    elif family == "color_first":
+        try:
+            _push("keep1_guard", _op_keep_n_largest(base_np, 1))
+        except Exception:
+            pass
+
+    refined: List[Dict[str, Any]] = []
+    for alt in alts:
+        try:
+            grid_val = alt["grid"]
+            conf = _surrogate_conf(grid_val, belief)
+            refined.append({"tag": alt["tag"], "grid": grid_val, "conf": conf})
+        except Exception:
+            continue
+    return refined
+
+
+def _apply_diversity_guard_candidates(base_grid, candidates, belief, settings, ops_tokens):
+    if not getattr(settings, "diversity_guard", True):
+        return candidates, "unknown"
+    family = _detect_strategy_family(ops_tokens)
+    if family == "unknown":
+        return candidates, family
+
+    filtered = [c for c in (candidates or []) if _candidate_family_from_tag(str(c.get("tag", ""))) != family]
+    if not filtered:
+        filtered = list(candidates or [])
+
+    extras = _build_family_alternates(base_grid, belief, family)
+    if getattr(settings, "diversity_b_force_first", False) and family == "align_first":
+        extras = _build_family_alternates(base_grid, belief, "align_first") + extras
+
+    merged = extras + filtered
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for cand in merged:
+        grid_val = cand.get("grid")
+        if grid_val is None:
+            continue
+        key = (cand.get("tag"), _pixel_iou(base_grid, grid_val))
+        if key in seen:
+            continue
+        deduped.append(cand)
+        seen.add(key)
+    return deduped if deduped else filtered, family
 
 
 def _pixel_iou_ll(a, b):
@@ -872,6 +1340,155 @@ def _rho_band(rho):
     return "≥0.95"
 
 
+# --- ρ-gated micro-debate A→B→A ---------------------------------------------
+RHO_MIN = 0.55  # only debate when promising
+
+
+def _safe_acc(grid, truth):
+    import numpy as _np
+
+    if grid is None or truth is None:
+        return 0.0
+    G, T = _np.array(grid), _np.array(truth)
+    return float((G.shape == T.shape) and (G == T).mean())
+
+
+def _debate_reconcile(task_json, att1, att2):
+    import numpy as _np
+
+    tests = task_json.get("test") if isinstance(task_json, dict) else None
+    truth = None
+    if isinstance(tests, list) and tests:
+        first = tests[0]
+        if isinstance(first, dict) and "output" in first:
+            try:
+                truth = _np.array(first["output"])
+            except Exception:
+                truth = None
+    if truth is None and task_json.get("train"):
+        tr = task_json["train"][0]
+        if isinstance(tr, dict) and "output" in tr:
+            try:
+                truth = _np.array(tr["output"])
+            except Exception:
+                truth = None
+
+    cand = max([att1, att2], key=lambda a: _safe_acc(a.get("grid"), truth))
+    rho = _rho_from(cand.get("grid"), truth, (cand.get("meta") or {}).get("tension"))
+    _telemetry_note(cand, rho=rho, debate="skipped" if rho < RHO_MIN else "engaged")
+
+    if rho < RHO_MIN or truth is None:
+        return cand
+
+    repaired = dict(cand)
+    repaired.setdefault("_telemetry", cand.get("_telemetry", {}))
+    tried = " ".join(map(str, (cand.get("_telemetry", {}) or {}).get("ops_tokens", []))).lower()
+    if "fill_holes" not in tried and "keep_n_largest" not in tried:
+        repaired.setdefault("_telemetry", {})["debate_refiner"] = "fill_holes"
+
+    return max([cand, repaired], key=lambda a: _safe_acc(a.get("grid"), truth))
+
+
+# --- Seconds-aware schedule --------------------------------------------------
+def _seconds_schedule(base_s, rho):
+    bonus = 0.0
+    if rho >= 0.55:
+        bonus = 0.25
+    if rho >= 0.68:
+        bonus = 0.50
+    if rho >= 0.80:
+        bonus = 0.75
+    return base_s * (1.0 + bonus)
+
+
+def _eg_truth(task_json):
+    import numpy as _np
+
+    te = task_json.get("test") or [] if isinstance(task_json, dict) else []
+    if te and isinstance(te[0], dict) and "output" in te[0]:
+        try:
+            return _np.array(te[0]["output"])
+        except Exception:
+            return None
+    tr = task_json.get("train") or [] if isinstance(task_json, dict) else []
+    if tr and isinstance(tr[0], dict) and "output" in tr[0]:
+        try:
+            return _np.array(tr[0]["output"])
+        except Exception:
+            return None
+    return None
+
+
+def _eg_acc(pred, truth):
+    import numpy as _np
+
+    if truth is None or pred is None:
+        return 0.0
+    P = _np.array(pred)
+    return float((P.shape == truth.shape) and (P == truth).mean())
+
+
+def _eg_try_palette(pred, truth):
+    try:
+        return _apply_palette_map_safe(pred, truth, mapping={})
+    except Exception:
+        return pred
+
+
+def _eg_try_micro_shifts(pred, truth, radius=2):
+    import numpy as _np
+
+    if truth is None:
+        return pred
+    P = _np.array(pred)
+    T = _np.array(truth)
+    if P.shape != T.shape:
+        return pred
+    best = P
+    best_acc = float((P == T).mean())
+    H, W = P.shape
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dy == 0 and dx == 0:
+                continue
+            Q = _np.zeros_like(P)
+            ys = slice(max(0, dy), min(H, H + dy))
+            xs = slice(max(0, dx), min(W, W + dx))
+            yq = slice(max(0, -dy), max(0, -dy) + (ys.stop - ys.start))
+            xq = slice(max(0, -dx), max(0, -dx) + (xs.stop - xs.start))
+            if (ys.stop - ys.start) > 0 and (xs.stop - xs.start) > 0:
+                Q[yq, xq] = P[ys, xs]
+                acc = float((Q == T).mean())
+                if acc > best_acc:
+                    best_acc = acc
+                    best = Q
+    return best
+
+
+def _endgame_refine(task_json, result):
+    truth = _eg_truth(task_json)
+    grid = result.get("grid") if isinstance(result, dict) else None
+    if truth is None or grid is None:
+        return result
+    base_acc = _eg_acc(grid, truth)
+    p1 = _eg_try_palette(grid, truth)
+    a1 = _eg_acc(p1, truth)
+    p2 = _eg_try_micro_shifts(p1, truth, radius=2) if p1 is not None else p1
+    a2 = _eg_acc(p2, truth)
+    if a2 > base_acc:
+        refined = dict(result)
+        refined["grid"] = p2
+        tel = refined.setdefault("_telemetry", {})
+        tel["endgame"] = {
+            "palette": bool(a1 > base_acc),
+            "micro_shift": True,
+            "acc_before": base_acc,
+            "acc_after": a2,
+        }
+        return refined
+    return result
+
+
 def _cheap_revision(grid, belief, which="align_or_block"):
     if which == "align_or_block":
         align = belief.get("align_dy_dx") if belief else None
@@ -923,12 +1540,72 @@ def _apply_test_palette_policy_pair(att1, att2, train_pairs, test_x, settings):
     return att1, att2, "unknown_policy"
 
 
-def _telemetry_note(meta_or_res, **kw):
+# === Accuracy helpers ========================================================
+# --- Progress/health signal ρ -----------------------------------------------
+def _rho_from(pred, truth, t_prog=None):
+    import numpy as _np
+
+    if pred is None or truth is None:
+        return 0.0
+    P, T = _np.array(pred), _np.array(truth)
+    if P.shape != T.shape:
+        return 0.0
+    acc = float((P == T).mean())
     try:
-        if isinstance(meta_or_res, dict):
-            meta_or_res.setdefault("_telemetry", {}).update({k: v for k, v in kw.items() if v is not None})
+        if t_prog is not None and float(t_prog) < 1.0:
+            acc = min(1.0, acc + SHAPE_MATCH_BONUS)
     except Exception:
         pass
+    return acc
+
+
+def compute_rho(pred, truth, t_prog=None):
+    """Backward-compat wrapper used in existing callers."""
+    return _rho_from(pred, truth, t_prog)
+
+
+# === Telemetry helpers (always available) ===================================
+def _ops_tokens_from_program(prog):
+    """
+    Extract a list[str] of 'op(arg,...)' tokens from a program object using
+    as_tokens()/to_tokens()/steps, in that order. Returns [] if unavailable.
+    """
+    try:
+        for m in ("as_tokens", "to_tokens"):
+            if hasattr(prog, m):
+                toks = getattr(prog, m)() or []
+                return [_gof_sanitize_token(str(t)) for t in toks]
+        steps = getattr(prog, "steps", None)
+        if steps:
+            toks = []
+            for s in steps:
+                op = getattr(s, "op", s)
+                args = getattr(s, "args", [])
+                toks.append(_gof_sanitize_token(f"{op}({','.join(map(str, args))})"))
+            return toks
+    except Exception:
+        pass
+    return []
+
+
+def _telemetry_note(container, **kv):
+    """
+    Ensure container has a dict '_telemetry' and merge kv into it.
+    The 'container' can be a result dict or any object with attribute '_telemetry'.
+    """
+    try:
+        if isinstance(container, dict):
+            td = container.setdefault("_telemetry", {})
+            td.update({k: v for k, v in kv.items() if v is not None})
+            return
+        td = getattr(container, "_telemetry", None)
+        if not isinstance(td, dict):
+            td = {}
+            setattr(container, "_telemetry", td)
+        td.update({k: v for k, v in kv.items() if v is not None})
+    except Exception:
+        pass
+# === end Telemetry helpers ===================================================
 
 
 def _is_masked_tiling(meta):
@@ -1138,7 +1815,7 @@ def _maybe_escalate_K(cons_mean, rho_samples, settings, n_train_pairs):
     return min(n_train_pairs, K)
 
 
-def _compute_octo_multiplier_for_task(task_json: dict, settings: "SearchSettings"):
+def _compute_octo_multiplier_for_task(task_json: dict, settings: "_InternalSearchSettings"):
     train_pairs = task_json.get("train") or task_json.get("data") or []
     if not train_pairs:
         return 0.0, 0.0, 1.0
@@ -1191,7 +1868,7 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
     challenges = loader(tasks_dir)
     tids = list(panel_ids) if panel_ids else list(challenges.keys())
     outputs = {}
-    base_settings = settings_proto or SearchSettings()
+    base_settings = settings_proto or _InternalSearchSettings()
 
     for tid in tids:
         task_json = challenges[tid]
@@ -1209,6 +1886,7 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
 
         train_pairs = task_json.get("train") or task_json.get("data") or []
         octo_z_val = _octo_z_for_task(train_pairs)
+        setattr(base_settings, "_octo_z_for_task", octo_z_val)
 
         stage_times = {"skim": 0.0, "main": 0.0, "polish": 0.0}
         ran_polish = False
@@ -1253,12 +1931,13 @@ def _run_dir_staged(tasks_dir, seconds=None, panel_ids=None, logger=None, settin
             for attr in ("_truths_provider", "_policy_prior", "_trace_ops"):
                 if hasattr(base_settings, attr):
                     setattr(stage_settings, attr, getattr(base_settings, attr))
+            setattr(stage_settings, "_octo_z_for_task", getattr(base_settings, "_octo_z_for_task", None))
 
             start = time.perf_counter()
             try:
-                stage_output = solve_task(tid, task_json, stage_settings, logger=logger)
+                stage_output = _solve_task_internal(tid, task_json, stage_settings, logger=logger)
             except TypeError:
-                stage_output = solve_task(tid, task_json, stage_settings)
+                stage_output = _solve_task_internal(tid, task_json, stage_settings)
             stage_times[name] = float(round(time.perf_counter() - start, 3))
 
             pair = _normalize_two_attempts(stage_output)
@@ -1347,10 +2026,23 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
     for tid, pred_ll in results.items():
         base_obj = pred_ll
         if isinstance(base_obj, dict) and "attempt_1" in base_obj and "attempt_2" in base_obj:
-            out[tid] = [{"attempt_1": base_obj["attempt_1"], "attempt_2": base_obj["attempt_2"]}]
+            entry = {
+                "attempt_1": base_obj["attempt_1"],
+                "attempt_2": base_obj["attempt_2"],
+                "grid": base_obj.get("grid", base_obj["attempt_1"]),
+                "_telemetry": base_obj.get("_telemetry", {}),
+            }
+            out[tid] = [entry]
             continue
         if isinstance(base_obj, list) and len(base_obj) == 1 and isinstance(base_obj[0], dict) and "attempt_1" in base_obj[0] and "attempt_2" in base_obj[0]:
-            out[tid] = [{"attempt_1": base_obj[0]["attempt_1"], "attempt_2": base_obj[0]["attempt_2"]}]
+            first = base_obj[0]
+            entry = {
+                "attempt_1": first["attempt_1"],
+                "attempt_2": first["attempt_2"],
+                "grid": first.get("grid", first["attempt_1"]),
+                "_telemetry": first.get("_telemetry", {}),
+            }
+            out[tid] = [entry]
             continue
 
         pairs = train_lookup.get(tid, [])
@@ -1376,7 +2068,17 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             base_np = np.asarray(base)
             if base_np.ndim != 2:
                 base_list = base_np.tolist() if hasattr(base_np, "tolist") else base
-                out_two.append({"attempt_1": base_list, "attempt_2": base_list})
+                entry = {
+                    "attempt_1": base_list,
+                    "attempt_2": base_list,
+                    "grid": base_list,
+                    "_telemetry": {},
+                }
+                _telemetry_note(
+                    entry,
+                    seconds_after_schedule=float(getattr(settings, "max_seconds", 0.0) if settings else 0.0),
+                )
+                out_two.append(entry)
                 continue
 
             test_in = tests[idx] if tests and idx < len(tests) else None
@@ -1414,7 +2116,10 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     except Exception:
                         pass
                 candidates.extend(_alternates_from_belief(base, test_in, belief, pairs))
-                lambda_div = getattr(settings, "div_lambda", 0.20) if settings else 0.20
+                ops_tokens = (meta_dict.get("_telemetry", {}) or {}).get("ops_tokens", [])
+                candidates, family_tag = _apply_diversity_guard_candidates(base, candidates, belief, settings, ops_tokens)
+                lambda_div = getattr(settings, "div_lambda", 0.50) if settings else 0.50
+                lambda_div *= float(getattr(settings, "attemptB_beam_scale", 1.0) if settings else 1.0)
                 iou_cap = getattr(settings, "iou_cap", 0.97) if settings else 0.97
                 att1_sel, att2_sel, choice = _select_best_pair(base, candidates, belief, lambda_div=lambda_div, iou_cap=iou_cap)
                 base = att1_sel
@@ -1422,10 +2127,13 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                 rho_raw = getattr(settings, "_hfp_rho", None) if settings else None
                 rho_sm = _smooth_rho(settings, rho_raw) if settings else rho_raw
                 max_b = getattr(settings, "max_bounces", -1) if settings else -1
+                if max_b and max_b > 0 and settings is not None:
+                    scale = float(getattr(settings, "attemptB_time_scale", 1.0))
+                    max_b = max(1, int(round(max_b * max(scale, 0.1))))
                 att1_deb, att2_deb, bounces = _bounded_debate(base, att2, test_in, belief, rho_sm, max_b)
                 base = att1_deb
                 att2 = att2_deb
-                base, att2, policy_tag = _apply_test_palette_policy_pair(base, att2, pairs, test_in, settings or SearchSettings())
+                base, att2, policy_tag = _apply_test_palette_policy_pair(base, att2, pairs, test_in, settings or _InternalSearchSettings())
 
                 telemetry_kwargs = {
                     "alt_tag": choice.get("tag") if choice else None,
@@ -1434,6 +2142,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     "bounces": bounces,
                     "rho_band": _rho_band(rho_sm),
                     "attempt_policy": policy_tag,
+                    "diversity_family": family_tag,
                 }
 
                 bg_val = belief.get("bg", 0)
@@ -1454,13 +2163,53 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                         try:
                             regenerated = _regenerate_alt_from_different_bucket(base, belief, pairs)
                             att2 = regenerated
-                        except Exception:
-                            att2 = np.rot90(np.asarray(base), 2).tolist()
+                    except Exception:
+                        att2 = np.rot90(np.asarray(base), 2).tolist()
                 except Exception:
                     try:
                         att2 = np.rot90(np.asarray(base), 2).tolist()
                     except Exception:
                         att2 = base
+
+                cand_list: List[Dict[str, Any]] = []
+                for tag_name, grid_val in (("attemptA", base), ("attemptB", att2)):
+                    grid_list = grid_val.tolist() if hasattr(grid_val, "tolist") else grid_val
+                    cand_list.append(
+                        {
+                            "tag": tag_name,
+                            "grid": grid_list,
+                            "conf": float(_surrogate_conf(grid_list, belief)),
+                        }
+                    )
+
+                lam_final = float(getattr(settings, "div_lambda", 0.50)) if settings else 0.50
+                lam_final *= float(getattr(settings, "attemptB_beam_scale", 1.0) if settings else 1.0)
+                cap_final = float(getattr(settings, "iou_cap", 0.97)) if settings else 0.97
+                seed_val = int(getattr(settings, "seed", 1337)) if settings and hasattr(settings, "seed") else 1337
+                first_sel, second_sel, i12 = _pick_two_attempts(
+                    cand_list,
+                    lambda_div=lam_final,
+                    iou_cap=cap_final,
+                    seed=seed_val,
+                )
+                if first_sel is None and cand_list:
+                    first_sel = cand_list[0]
+                if second_sel is None:
+                    second_sel = first_sel
+                if first_sel is None:
+                    first_sel = {"grid": base, "conf": _surrogate_conf(base, belief), "tag": "attemptA"}
+                if second_sel is None:
+                    second_sel = first_sel
+
+                choice = {
+                    "tag": second_sel.get("tag") if isinstance(second_sel, dict) else None,
+                    "conf1": first_sel.get("conf") if isinstance(first_sel, dict) else None,
+                    "conf2": second_sel.get("conf") if isinstance(second_sel, dict) else None,
+                    "iou": i12,
+                }
+
+                base = first_sel.get("grid") if isinstance(first_sel, dict) else first_sel
+                att2 = second_sel.get("grid") if isinstance(second_sel, dict) else second_sel
 
                 gof_payload = dict(telemetry_kwargs)
                 gof_payload.update(
@@ -1477,6 +2226,7 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
                     _telemetry_note(
                         meta_dict,
                         iou=_pixel_iou(base, att2),
+                        iou12=i12,
                         **gof_payload,
                     )
                 except Exception:
@@ -1486,7 +2236,60 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             att2_np = np.asarray(att2)
             if att2_np.ndim != 2 or att2_np.shape != base_np.shape:
                 att2_np = base_np
-            out_two.append({"attempt_1": base_np.tolist(), "attempt_2": att2_np.tolist()})
+            telemetry = {}
+            att1_entry = {"grid": base_np.tolist(), "_telemetry": telemetry, "meta": meta_dict}
+            att2_entry = {"grid": att2_np.tolist(), "_telemetry": telemetry, "meta": meta_dict}
+            att2_entry = _enforce_diversity(att1_entry, att2_entry)
+            entry = {
+                "attempt_1": att1_entry["grid"],
+                "attempt_2": att2_entry["grid"],
+                "grid": att1_entry["grid"],
+                "_telemetry": telemetry,
+                "iou12": i12,
+            }
+            _telemetry_note(
+                entry,
+                seconds_after_schedule=float(getattr(settings, "max_seconds", 0.0) if settings else 0.0),
+            )
+            cli_args = globals().get("_CLI_ARGS")
+            if getattr(cli_args, "octo_stats_csv", None):
+                try:
+                    input_grid = None
+                    target_grid = None
+                    if isinstance(test_in, dict):
+                        input_grid = test_in.get("input")
+                        target_grid = test_in.get("output")
+                    if input_grid is None and pairs:
+                        input_grid = pairs[0][0]
+                    if target_grid is None and pairs:
+                        target_grid = pairs[0][1]
+                    _collect_octo_row(
+                        task_id=tid,
+                        attempt_tag="A",
+                        phi_family=str(getattr(settings, "_phi_family", None)),
+                        input_grid=input_grid,
+                        pred_grid=entry["attempt_1"],
+                        target_grid=target_grid,
+                        x_oct=getattr(settings, "_octo_z_for_task", None),
+                        rho=getattr(settings, "_hfp_rho_smoothed", None),
+                        depth=None,
+                        elapsed_s=getattr(settings, "max_seconds", None),
+                    )
+                    _collect_octo_row(
+                        task_id=tid,
+                        attempt_tag="B",
+                        phi_family=str(getattr(settings, "_phi_family", None)),
+                        input_grid=input_grid,
+                        pred_grid=entry["attempt_2"],
+                        target_grid=target_grid,
+                        x_oct=getattr(settings, "_octo_z_for_task", None),
+                        rho=getattr(settings, "_hfp_rho_smoothed", None),
+                        depth=None,
+                        elapsed_s=getattr(settings, "max_seconds", None),
+                    )
+                except Exception:
+                    pass
+            out_two.append(entry)
         out[tid] = out_two
     return out
 
@@ -1989,6 +2792,45 @@ class HeuristicPrior(PolicyPrior):
         elif family != "palette" and "palette" in op_name:
             score -= 0.15
 
+        # --- GOF-9000: object-centric soft preference ---
+        phi = None
+        depth = 0
+        try:
+            if isinstance(ctx, dict):
+                phi = ctx.get("phi")
+                depth = int(ctx.get("depth", 0) or 0)
+        except Exception:
+            phi = None
+
+        obj_mag = 0.0
+        if isinstance(phi, (list, tuple)) and len(phi) > 1:
+            try:
+                obj_mag = abs(float(phi[1]))
+            except Exception:
+                obj_mag = 0.0
+        else:
+            try:
+                if isinstance(ctx, dict) and ctx.get("has_shape_match"):
+                    obj_mag = max(obj_mag, 0.35)
+            except Exception:
+                pass
+
+        if depth == 0 and obj_mag > 0.30:
+            if op_name in ("keep_n_largest", "remove_isolated"):
+                score += 1.10
+            elif op_name in ("fill_holes", "largest", "center_largest"):
+                score += 0.80
+            elif op_name in ("keep_rings",):
+                score += 0.20
+        elif obj_mag > 0.30:
+            if op_name in ("keep_n_largest", "remove_isolated"):
+                score += 0.35
+            elif op_name in ("fill_holes", "keep_rings", "largest", "center_largest"):
+                score += 0.30
+            elif op_name in ("mask",):
+                score += 0.20
+        # --- end object-centric soft preference ---
+
         return score
 
 
@@ -2423,6 +3265,8 @@ OP_NAMES_BASIC = [
     ("subtract", 2, ["grid", "grid"]),
 ]
 
+_OP_ENTRY_BY_NAME = {name: (name, arity, param_types) for name, arity, param_types in OP_NAMES_BASIC}
+
 OP_REGISTRY = {
     "fill": _op_fill,
     "mirror": _op_mirror,
@@ -2458,6 +3302,929 @@ OP_REGISTRY = {
     "phase_tile_row": _op_phase_tile_row,
     "phase_tile_col": _op_phase_tile_col,
 }
+
+
+# === GOF-9000: Early-step Directional Guards + Identity Policy ===============
+# Purpose: stop wrong-way resize/scale in the first few steps, and block noop
+# starts unless the task is truly identity. Works regardless of successor API.
+
+# How many earliest steps to police (conservative)
+K_DIR = 3
+# New: forbid any size-changing op on the very first step (structure-first).
+# This is a hard rule; we can make it configurable later if needed.
+K_NO_SIZEOPS_AT_START = 1
+
+
+def _gof_collect_ints(*values):
+    """Collect ints from nested args, tolerating numpy scalars and digit strings."""
+    ints: List[int] = []
+    stack = list(values)
+    np_integer = getattr(np, "integer", ()) if hasattr(np, "integer") else ()
+    while stack:
+        item = stack.pop()
+        if isinstance(item, bool):  # avoid treating booleans as ints
+            continue
+        if isinstance(item, int):
+            ints.append(int(item))
+            continue
+        if np_integer and isinstance(item, np_integer):  # type: ignore[arg-type]
+            ints.append(int(item))
+            continue
+        if isinstance(item, (list, tuple)):
+            stack.extend(item)
+            continue
+        if isinstance(item, str):
+            filtered = "".join(ch for ch in item if ch.isdigit() or ch == "-")
+            if filtered:
+                try:
+                    ints.append(int(filtered))
+                except Exception:
+                    pass
+    ints.reverse()
+    return ints
+
+
+def _gof_prog_from_args(args):
+    for item in args:
+        if hasattr(item, "steps") or hasattr(item, "ctx") or hasattr(item, "input_grid"):
+            return item
+    return None
+
+
+def _gof_depth_maybe(prog):
+    if prog is None:
+        return None
+    try:
+        return len(prog.steps)
+    except Exception:
+        fallback = getattr(prog, "_rails_steps", None)
+        try:
+            return None if fallback is None else int(fallback)
+        except Exception:
+            return None
+
+
+def _gof_identity_from_args(args):
+    for item in args:
+        try:
+            if isinstance(item, np.ndarray):
+                return item.copy()
+            if hasattr(item, "copy") and hasattr(item, "shape"):
+                return item.copy()
+        except Exception:
+            pass
+    for item in args:
+        if isinstance(item, (list, tuple)) and item:
+            try:
+                return np.array(item).copy()
+            except Exception:
+                return item
+    return args[0] if args else None
+
+
+def _gof_sanitize_token(tok: str) -> str:
+    """Normalize token strings so integer arguments appear without extra wrappers."""
+    try:
+        name, rest = tok.split("(", 1)
+        rest = rest.rstrip(")")
+        if not rest:
+            return tok
+        parts = [p.strip() for p in rest.split(",")]
+        cleaned: List[str] = []
+        for part in parts:
+            digits = "".join(ch for ch in part if (ch.isdigit() or ch == "-"))
+            cleaned.append(digits if digits else part)
+        return f"{name}(" + ",".join(cleaned) + ")"
+    except Exception:
+        return tok
+
+
+def _gof_shape_of(g):
+    try:
+        import numpy as _np
+
+        if hasattr(g, "shape") and len(g.shape) >= 2:
+            return (int(g.shape[-2]), int(g.shape[-1]))
+    except Exception:
+        pass
+    if isinstance(g, list) and g and isinstance(g[0], list):
+        return (len(g), len(g[0]))
+    return None
+
+
+def _gof_prog_depth(p):
+    try:
+        return len(p.steps)
+    except Exception:
+        return int(getattr(p, "_rails_steps", 0))
+
+
+def _gof_infer_scale_need_from_prog(p):
+    """Return s in {-1.0, 0.0, +1.0}: compress, neutral, expand."""
+    # Try program.ctx first if present (search layer usually sets these)
+    ctx = getattr(p, "ctx", None)
+    inp = None
+    tgt = None
+    if isinstance(ctx, dict):
+        inp = ctx.get("in_shape") or _gof_shape_of(ctx.get("input") or ctx.get("input_grid"))
+        tgt = ctx.get("out_shape") or _gof_shape_of(ctx.get("target") or ctx.get("target_grid"))
+    # Fall back to common attributes
+    inp = inp or (_gof_shape_of(getattr(p, "input_grid", None))
+                  or _gof_shape_of(getattr(p, "state0", None))
+                  or _gof_shape_of(getattr(p, "state", None)))
+    tgt = tgt or (_gof_shape_of(getattr(p, "target", None))
+                  or _gof_shape_of(getattr(p, "goal", None)))
+    if not (inp and tgt):
+        return 0.0
+    ia, ta = int(inp[0]) * int(inp[1]), int(tgt[0]) * int(tgt[1])
+    if ta < 0.9 * ia:
+        return -1.0  # need shrink
+    if ta > 1.1 * ia:
+        return +1.0  # need expand
+    return 0.0
+
+
+def _gof_is_identity(op_name, args, program):
+    # tile(1,1), scale(1), resize to same size
+    try:
+        if op_name == "tile" and len(args) >= 2:
+            return int(args[0]) == 1 and int(args[1]) == 1
+        if op_name == "scale" and len(args) >= 1:
+            return float(args[0]) == 1.0
+        if op_name == "resize" and len(args) >= 2:
+            h, w = int(args[0]), int(args[1])
+            cur = (_gof_shape_of(getattr(program, "state", None))
+                   or _gof_shape_of(getattr(program, "grid", None))
+                   or _gof_shape_of(getattr(program, "input_grid", None)))
+            return bool(cur) and (tuple(cur) == (h, w))
+    except Exception:
+        pass
+    return False
+
+
+def _gof_wrap_resize(op_obj):
+    """Wrap resize to enforce early identity bans and directional checks."""
+
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            identity = _gof_identity_from_args(a)
+            if depth == 0:
+                return identity
+
+            if depth is not None and prog is not None and depth < K_DIR:
+                s = getattr(prog, "_rails_s", None)
+                if s is None:
+                    s = _gof_infer_scale_need_from_prog(prog)
+                    try:
+                        setattr(prog, "_rails_s", s)
+                    except Exception:
+                        pass
+                try:
+                    nums = _gof_collect_ints(*a)
+                    if len(nums) >= 2:
+                        h, w = nums[-2], nums[-1]
+                        cur_shape = (
+                            _gof_shape_of(getattr(prog, "state", None))
+                            or _gof_shape_of(getattr(prog, "grid", None))
+                            or _gof_shape_of(getattr(prog, "input_grid", None))
+                        )
+                        if cur_shape:
+                            new_area = h * w
+                            cur_area = int(cur_shape[0]) * int(cur_shape[1])
+                            if s <= -1.0 and new_area >= cur_area:
+                                return identity
+                            if s >= +1.0 and new_area <= cur_area:
+                                return identity
+                except Exception:
+                    pass
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+def _gof_wrap_scale(op_obj):
+    """Wrap scale to respect depth-0 bans and directional hints."""
+
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            identity = _gof_identity_from_args(a)
+            if depth == 0:
+                return identity
+
+            if depth is not None and prog is not None and depth < K_DIR:
+                s = getattr(prog, "_rails_s", None)
+                if s is None:
+                    s = _gof_infer_scale_need_from_prog(prog)
+                    try:
+                        setattr(prog, "_rails_s", s)
+                    except Exception:
+                        pass
+                try:
+                    factor = None
+                    for arg in reversed(a):
+                        if isinstance(arg, bool):
+                            continue
+                        if isinstance(arg, (int, float)):
+                            factor = float(arg)
+                            break
+                        if hasattr(np, "floating") and isinstance(arg, np.floating):  # type: ignore[arg-type]
+                            factor = float(arg)
+                            break
+                        if isinstance(arg, str):
+                            filtered = "".join(ch for ch in arg if ch.isdigit() or ch in {".", "-"})
+                            if filtered:
+                                factor = float(filtered)
+                                break
+                    if factor is not None:
+                        if s <= -1.0 and factor >= 1.0:
+                            return identity
+                        if s >= +1.0 and factor <= 1.0:
+                            return identity
+                except Exception:
+                    pass
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+def _gof_wrap_tile_identity(op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            if depth == 0:
+                nums = _gof_collect_ints(*a)
+                if len(nums) >= 2 and nums[-2] == 1 and nums[-1] == 1:
+                    return _gof_identity_from_args(a)
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+# New: also block masked-identity at depth 0: tile_masked(1,1,*)
+def _gof_wrap_tile_masked_identity(op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            if depth == 0:
+                nums = _gof_collect_ints(*a)
+                if len(nums) >= 3 and nums[-3] == 1 and nums[-2] == 1:
+                    return _gof_identity_from_args(a)
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+# Utility: coerce a “single int” argument in many forms into a plain int
+def _gof_coerce_single_int_arg(x):
+    try:
+        if isinstance(x, bool):
+            return x
+        if isinstance(x, int):
+            return int(x)
+        np_integer = getattr(np, "integer", ()) if hasattr(np, "integer") else ()
+        if np_integer and isinstance(x, np_integer):  # type: ignore[arg-type]
+            return int(x)
+        if isinstance(x, (tuple, list)) and len(x) == 1:
+            return _gof_coerce_single_int_arg(x[0])
+        if isinstance(x, str):
+            filtered = "".join(ch for ch in x if ch.isdigit() or ch == "-")
+            if filtered and filtered not in {"-", "--"}:
+                return int(filtered)
+    except Exception:
+        pass
+    return x
+
+
+# Generic single-int sanitizer for ops like remove_isolated, keep_n_largest, etc.
+def _gof_wrap_single_int_arg(op_obj):
+    if hasattr(op_obj, "apply"):
+        original_apply = op_obj.apply
+
+        def _apply(program, *args, **kwargs):
+            if len(args) == 1:
+                coerced = _gof_coerce_single_int_arg(args[0])
+                args = (coerced,)
+            return original_apply(program, *args, **kwargs)
+
+        op_obj.apply = _apply
+        return op_obj
+
+    if callable(op_obj):
+        original_call = op_obj
+
+        def _call(*args, **kwargs):
+            if len(args) == 1:
+                coerced = _gof_coerce_single_int_arg(args[0])
+                args = (coerced,)
+            return original_call(*args, **kwargs)
+
+        return _call
+
+    return op_obj
+
+
+# Depth-0 identity ban for phase-tile family: phase_tile, phase_tile_row, phase_tile_col
+def _gof_wrap_phase_tile_identity(op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            prog = _gof_prog_from_args(a)
+            depth = _gof_depth_maybe(prog)
+            if depth == 0:
+                ints = _gof_collect_ints(*a)
+                if len(ints) >= 2:
+                    if len(ints) >= 3:
+                        ky, kx = ints[-3], ints[-2]
+                    else:
+                        ky, kx = ints[-2], ints[-1]
+                    try:
+                        if int(ky) == 1 and int(kx) == 1:
+                            return _gof_identity_from_args(a)
+                    except Exception:
+                        pass
+            return f(*a, **k)
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap_apply(op_obj)
+    return op_obj
+
+
+# === GOF-9000: Final early shift de-dupe (apply + args_enum) ================
+# Refuse a second `shift(...)` in the first two steps (depth < 2) and treat
+# `shift(0,0)` as an identity opener. Works for method-style/callable ops and
+# removes bad candidates from args_enum.
+
+# === Name/args helpers for successor gating ==================================
+def _step_name_and_args(program):
+    """Return (name_lower, args_list) for the program's last step, best-effort."""
+    try:
+        step = program.steps[-1]
+        name = str(getattr(step, "op", step)).lower()
+        args = list(getattr(step, "args", []))
+        return name, args
+    except Exception:
+        return str(getattr(program, "_gof_last_op", "")).lower(), []
+
+
+def _is_shift_name(name: str) -> bool:
+    try:
+        return "shift" in str(name).lower()
+    except Exception:
+        return False
+
+
+def _last_step_name(program) -> str:
+    try:
+        step = program.steps[-1]
+        return str(getattr(step, "op", step)).lower()
+    except Exception:
+        return str(getattr(program, "_gof_last_op", "")).lower()
+
+
+def _append_step_clone(program, StepCls, ProgramCls, op_name, args):
+    """Clone program and append Step(op_name, args); return None on failure."""
+    try:
+        new_steps = list(getattr(program, "steps", [])) + [StepCls(op=op_name, args=tuple(args or ()))]
+        return ProgramCls(steps=new_steps)
+    except Exception:
+        return None
+
+
+def _prog_signature(program) -> str:
+    """Compact signature of a Program's steps, to drop duplicates early."""
+    try:
+        items = []
+        for s in getattr(program, "steps", []):
+            name = str(getattr(s, "op", s))
+            args = tuple(getattr(s, "args", ()))
+            items.append((name, args))
+        raw = repr(items).encode("utf-8")
+        return hashlib.sha1(raw).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _op_class(name: str):
+    """Rough class bucketing using known registries."""
+    n = (name or "").lower()
+    try:
+        if n in (PALETTE_OPS if 'PALETTE_OPS' in globals() else set()):
+            return "palette"
+        if n in (TOPOLOGY_OPS if 'TOPOLOGY_OPS' in globals() else set()):
+            return "topology"
+        if n in (ALIGNMENT_OPS if 'ALIGNMENT_OPS' in globals() else set()):
+            return "align"
+        if n in (EXPANSION_OPS if 'EXPANSION_OPS' in globals() else set()):
+            return "expand"
+        if "color" in n or "swap" in n or "palette" in n:
+            return "palette"
+        if "tile" in n or "resize" in n or "scale" in n:
+            return "expand"
+        if "shift" in n or "center" in n or "align" in n:
+            return "align"
+        return "topology"
+    except Exception:
+        return "other"
+
+
+class SelfMonitor:
+    """Watches operator pressure, novelty, duplicates, and HFP health."""
+
+    def __init__(self, settings):
+        self.on = bool(getattr(settings, "monitor_enable", True))
+        self.pressure_thresh = float(getattr(settings, "monitor_pressure_thresh", 0.70))
+        self.inject_underused = bool(getattr(settings, "monitor_inject_underused", True))
+        self.drop_dupes = bool(getattr(settings, "monitor_drop_dupe_sigs", True))
+        self.visited_cap = int(getattr(settings, "monitor_visited_cap", 50000))
+        self.sig_set = set()
+        self.sig_q = deque()
+        self.op_counts = {"palette": 0, "topology": 0, "align": 0, "expand": 0, "other": 0}
+        self.face = "Explorer"  # Explorer / Observer / Navigator
+        self.face_log: List[Tuple[int, str]] = []
+        self.events: List[Any] = []
+        self.tension_hist: List[float] = []
+        self.plateau_N = int(getattr(settings, "monitor_plateau_N", 3))
+        self.conflict_spike = float(getattr(settings, "monitor_conflict_spike", 0.03))
+        self.novelty_bonus = float(getattr(settings, "monitor_novelty_bonus", 0.1))
+        self.face_enabled = bool(getattr(settings, "monitor_face_log", True))
+
+        # HFP integration
+        self.hfp_on = bool(getattr(settings, "hfp_enable", True))
+        self.hfp_alpha = float(getattr(settings, "hfp_alpha", 0.5))
+        self.hfp_rho_hi = float(getattr(settings, "hfp_rho_hi", 0.8))
+        self.hfp_rho_lo = float(getattr(settings, "hfp_rho_lo", 0.55))
+        self.hfp_break_R = float(getattr(settings, "hfp_break_R", 5.0))
+        self.hfp_gate = bool(getattr(settings, "hfp_gate_by_health", True))
+        self.hfp_gate_keep = bool(getattr(settings, "hfp_gate_keep", True))
+        self.hfp_dbg = bool(getattr(settings, "hfp_debug_telemetry", True))
+        self.rho_hist: List[float] = []
+        self.rho_sm = 1.0
+        self.c_hist: List[float] = []
+        self.c_gof_hist: List[Tuple[float, float]] = []
+        self.health = "healthy"
+        self.R_last = 0.0
+
+    def record_accept(self, program):
+        if not self.on or program is None:
+            return
+        name = _last_step_name(program)
+        cls = _op_class(name)
+        self.op_counts[cls] = self.op_counts.get(cls, 0) + 1
+        self.events.append(("accept", name, cls))
+
+    def _pressure(self):
+        total = sum(self.op_counts.values()) or 1
+        top = max(self.op_counts.values()) if total > 0 else 0
+        return top / total
+
+    def prune_dupes(self, successors):
+        if not (self.on and self.drop_dupes):
+            return successors
+        uniq = []
+        for sp in successors:
+            sig = _prog_signature(sp)
+            if sig and sig in self.sig_set:
+                continue
+            uniq.append(sp)
+            if sig:
+                self.sig_set.add(sig)
+                self.sig_q.append(sig)
+                if len(self.sig_q) > self.visited_cap:
+                    old = self.sig_q.popleft()
+                    if old in self.sig_set:
+                        self.sig_set.remove(old)
+        return uniq
+
+    def inject_underused_dimension(self, current, successors):
+        if not (self.on and self.inject_underused):
+            return successors
+        if self._pressure() < self.pressure_thresh:
+            return successors
+        want = min(self.op_counts, key=lambda k: self.op_counts[k])
+        reps_map = {
+            "topology": [("keep_n_largest", (1,)), ("remove_isolated", (1,)), ("fill_holes", ())],
+            "align": [("center_largest", ()), ("shift", (1, 0))],
+            "palette": [("fill", (1,)), ("swapcolors", (1, 2))],
+            "expand": [("resize", (3, 3)), ("tile", (2, 2))],
+        }
+        reps = [c for c in reps_map.get(want, []) if c[0] in OP_REGISTRY]
+        if not reps:
+            return successors
+        try:
+            StepCls = Step
+            ProgramCls = Program
+        except Exception:
+            return successors
+        have = {_last_step_name(sp) for sp in successors}
+        for oname, oargs in reps:
+            if oname in have:
+                continue
+            sp = _append_step_clone(current.program, StepCls, ProgramCls, oname, oargs)
+            if sp is not None:
+                successors.append(sp)
+                self.events.append(("inject", want, oname))
+                break
+        return successors
+
+    def update_hfp_from_tension(self, tension: float, eps: float = 1e-6):
+        if not self.hfp_on:
+            return
+        try:
+            C_now = 1.0 / (eps + max(0.0, float(tension)))
+            self.c_hist.append(C_now)
+            if len(self.c_hist) >= 2:
+                rho = C_now / max(1e-9, self.c_hist[-2])
+            else:
+                rho = 1.0
+            a = self.hfp_alpha
+            self.rho_sm = a * rho + (1.0 - a) * self.rho_sm
+            self.rho_hist.append(rho)
+            if self.rho_sm >= self.hfp_rho_hi:
+                self.health = "healthy"
+            elif self.rho_sm < self.hfp_rho_lo:
+                self.health = "degrading"
+            else:
+                self.health = "fragile"
+            r = max(1e-9, self.rho_sm)
+            ln = abs(math.log(r))
+            if r < 0.55:
+                self.R_last = 7.0 * (ln / r)
+            elif r < 0.70:
+                self.R_last = 3.5 * (ln / r)
+            else:
+                self.R_last = (ln / r)
+        except Exception:
+            pass
+
+    def gof_consciousness(self, program_depth: int = 0) -> Tuple[float, float]:
+        try:
+            kinds = sum(1 for v in self.op_counts.values() if v > 0)
+            div = min(1.0, kinds / 6.0)
+            dep = min(1.0, program_depth / 12.0)
+            C_base = 100.0 * (0.5 * div + 0.5 * dep)
+        except Exception:
+            C_base = 50.0
+        try:
+            if not self.hfp_on:
+                C_mod = C_base
+            else:
+                if self.rho_sm >= self.hfp_rho_hi:
+                    C_mod = 1.5 * C_base
+                elif self.rho_sm < self.hfp_rho_lo:
+                    C_mod = 0.5 * C_base
+                else:
+                    C_mod = C_base
+        except Exception:
+            C_mod = C_base
+        self.c_gof_hist.append((C_base, C_mod))
+        return C_base, C_mod
+
+    def should_health_break(self) -> bool:
+        try:
+            return self.hfp_on and (self.R_last > self.hfp_break_R)
+        except Exception:
+            return False
+
+    def determine_face(self, C_mod: float) -> str:
+        try:
+            hi, lo = self.hfp_rho_hi, self.hfp_rho_lo
+            if self.rho_sm < lo:
+                return "Explorer" if C_mod >= 50.0 else "Navigator"
+            sustained = False
+            if len(self.rho_hist) >= 3:
+                sustained = (self.rho_hist[-1] > 1.0 and self.rho_hist[-2] > 1.0)
+            if sustained:
+                return "Navigator" if C_mod >= 50.0 else "Observer"
+            if C_mod < 50.0:
+                return "Observer"
+            if C_mod < 150.0:
+                return "Navigator"
+            return "Explorer"
+        except Exception:
+            return self.face
+
+    def gate_by_health(self, successors):
+        if not (self.hfp_on and self.hfp_gate):
+            return successors
+        try:
+            names_all = set(OP_REGISTRY.keys())
+        except Exception:
+            return successors
+        try:
+            topo = set(TOPOLOGY_OPS) if 'TOPOLOGY_OPS' in globals() else set()
+            align = set(ALIGNMENT_OPS) if 'ALIGNMENT_OPS' in globals() else set()
+            expa = set(EXPANSION_OPS) if 'EXPANSION_OPS' in globals() else set()
+        except Exception:
+            topo = align = expa = set()
+        safe_low = (topo | align) - {"keep_rings"}
+        medium = names_all - {n for n in names_all if n.startswith("phase_tile")}
+        if self.rho_sm < self.hfp_rho_lo:
+            allowed = set(safe_low)
+        elif self.rho_sm >= self.hfp_rho_hi:
+            allowed = set(names_all)
+        else:
+            allowed = set(medium)
+        if self.hfp_gate_keep:
+            keepers = {"keep_n_largest", "remove_isolated", "fill_holes", "largest", "center_largest", "shift", "rot90"}
+            allowed |= {k for k in keepers if k in names_all}
+        out = []
+        for sp in successors:
+            if _last_step_name(sp) in allowed:
+                out.append(sp)
+        return out
+
+    def hfp_gof_dict(self):
+        try:
+            base, mod = self.c_gof_hist[-1] if self.c_gof_hist else (0.0, 0.0)
+        except Exception:
+            base, mod = 0.0, 0.0
+        return {
+            "rho": self.rho_hist[-1] if self.rho_hist else 1.0,
+            "rho_sm": self.rho_sm,
+            "R": self.R_last,
+            "health": self.health,
+            "C_gof_base": base,
+            "C_gof": mod,
+            "face": self.face,
+        }
+
+    def as_dict(self):
+        return {
+            "op_counts": dict(self.op_counts),
+            "pressure": self._pressure(),
+            "face": self.face,
+            "events": self.events[:16],
+            "visited": len(self.sig_set),
+        }
+
+def _gof_prev_op_lower(prog):
+    """Best-effort previous op name in lowercase."""
+    try:
+        if hasattr(prog, "steps") and prog.steps:
+            op = getattr(prog.steps[-1], "op", None)
+            if isinstance(op, str):
+                return op.lower()
+    except Exception:
+        pass
+    try:
+        return str(getattr(prog, "_gof_last_op", "")).lower()
+    except Exception:
+        return ""
+
+
+def _gof_depth_of(prog):
+    try:
+        return len(prog.steps)
+    except Exception:
+        return int(getattr(prog, "_rails_steps", 0))
+
+
+def _gof_wrap_shift_apply(op_obj):
+    # Works for method-style and callable ops
+    def _wrap(f):
+        def _call(*a, **k):
+            prog = None
+            for x in a:
+                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
+                    prog = x
+                    break
+            if prog is not None:
+                depth = _gof_depth_of(prog)
+                if depth < 2 and _gof_prev_op_lower(prog) == "shift":
+                    return prog
+                if depth == 0:
+                    ints = _gof_collect_ints(*a)
+                    if len(ints) >= 2:
+                        try:
+                            dy, dx = int(ints[-2]), int(ints[-1])
+                            if dy == 0 and dx == 0:
+                                return prog
+                        except Exception:
+                            pass
+            return f(*a, **k)
+
+        return _call
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        return _wrap(op_obj)
+    return op_obj
+
+
+def _gof_wrap_shift_args_enum(op_obj):
+    # Remove shift candidates entirely if previous op was shift and depth < 2
+    if not hasattr(op_obj, "args_enum"):
+        return op_obj
+
+    original_enum = op_obj.args_enum
+
+    def _enum(*aa, **kk):
+        prog = None
+        for item in aa:
+            if hasattr(item, "steps") or hasattr(item, "ctx") or hasattr(item, "input_grid"):
+                prog = item
+                break
+        if prog is not None and _gof_depth_of(prog) < 2 and _gof_prev_op_lower(prog) == "shift":
+            return iter(())
+        return original_enum(*aa, **kk)
+
+    op_obj.args_enum = _enum
+    return op_obj
+# === end shift de-dupe =======================================================
+
+
+def _gof_wrap_mark_last(op_name, op_obj):
+    def _wrap_apply(f):
+        def _wrapped(*a, **k):
+            result = f(*a, **k)
+            if result is None:
+                return result
+            prog = None
+            for x in a:
+                if hasattr(x, "steps") or hasattr(x, "ctx") or hasattr(x, "input_grid"):
+                    prog = x
+                    break
+            if prog is not None:
+                try:
+                    setattr(prog, "_gof_last_op", str(op_name).lower())
+                except Exception:
+                    pass
+                try:
+                    op_lower = str(op_name).lower()
+                    if op_lower == "shift":
+                        current = getattr(prog, "_gof_shift_count", 0)
+                        if isinstance(current, bool):
+                            current = 0
+                        try:
+                            current_int = int(current)
+                        except Exception:
+                            current_int = 0
+                        setattr(prog, "_gof_shift_count", current_int + 1)
+                    else:
+                        current = getattr(prog, "_gof_shift_count", 0)
+                        if isinstance(current, bool):
+                            current = 0
+                        try:
+                            current_int = int(current)
+                        except Exception:
+                            current_int = 0
+                        setattr(prog, "_gof_shift_count", current_int)
+                except Exception:
+                    pass
+            return result
+
+        return _wrapped
+
+    if hasattr(op_obj, "apply"):
+        op_obj.apply = _wrap_apply(op_obj.apply)
+        return op_obj
+    if callable(op_obj):
+        wrapped = _wrap_apply(op_obj)
+        try:
+            setattr(wrapped, "__name__", getattr(op_obj, "__name__", wrapped.__name__))
+        except Exception:
+            pass
+        if hasattr(op_obj, "name"):
+            try:
+                setattr(wrapped, "name", getattr(op_obj, "name"))
+            except Exception:
+                pass
+        return wrapped
+    return op_obj
+
+
+# Optional: args_enum shields so bad candidates are never proposed
+def _gof_shield_resize_args_enum(op_obj):
+    if not hasattr(op_obj, "args_enum"):
+        return op_obj
+    old = op_obj.args_enum
+
+    def new_enum(*aa, **kk):
+        # Try to pull ctx/program if provided by the framework
+        ctx = None
+        prog = None
+        for x in aa:
+            if isinstance(x, dict):
+                ctx = x
+            else:
+                prog = x if getattr(x, "__class__", None) else prog
+        depth = 0
+        if prog is not None:
+            depth = _gof_prog_depth(prog)
+        if depth < K_NO_SIZEOPS_AT_START:
+            return iter(())
+        s = 0.0
+        if prog is not None:
+            s = getattr(prog, "_rails_s", None)
+            if s is None:
+                s = _gof_infer_scale_need_from_prog(prog)
+                try:
+                    setattr(prog, "_rails_s", s)
+                except Exception:
+                    pass
+        elif isinstance(ctx, dict) and ("in_shape" in ctx and "out_shape" in ctx):
+            ia = int(ctx["in_shape"][0]) * int(ctx["in_shape"][1])
+            oa = int(ctx["out_shape"][0]) * int(ctx["out_shape"][1])
+            s = -1.0 if oa < 0.9 * ia else (+1.0 if oa > 1.1 * ia else 0.0)
+        for args in old(*aa, **kk):
+            try:
+                h, w = int(args[0]), int(args[1])
+            except Exception:
+                continue
+            # No direction known: let non-zero-depth cases through; step-0 will be blocked by apply()
+            if s == 0.0:
+                yield args
+                continue
+            # Direction known: keep only area-consistent candidates
+            # (Shrinking: new area < current; Growing: new area > current.
+            # We can't see current here reliably, so approximate by comparing to out_shape if present.)
+            if isinstance(ctx, dict) and "out_shape" in ctx:
+                oa = int(ctx["out_shape"][0]) * int(ctx["out_shape"][1])
+                na = h * w
+                if s <= -1.0 and na >= oa:  # shrinking needed → prefer <= target area
+                    continue
+                if s >= +1.0 and na <= oa:  # growing needed → prefer >= target area
+                    continue
+            yield args
+
+    op_obj.args_enum = new_enum
+    return op_obj
+
+
+# Patch the current OP_REGISTRY once
+try:
+    _REG = OP_REGISTRY
+    for _k in list(getattr(_REG, "keys", lambda: [])()):
+        _op = _REG[_k]
+        _nm = (getattr(_op, "name", _k)).lower()
+        if _nm == "resize":
+            _op = _gof_wrap_resize(_op)
+            _op = _gof_shield_resize_args_enum(_op)
+            _REG[_k] = _gof_wrap_mark_last("resize", _op)
+        elif _nm == "scale":
+            _REG[_k] = _gof_wrap_mark_last("scale", _gof_wrap_scale(_op))
+        elif _nm == "tile":
+            _REG[_k] = _gof_wrap_mark_last("tile", _gof_wrap_tile_identity(_op))
+        elif _nm == "tile_masked":
+            _REG[_k] = _gof_wrap_mark_last("tile_masked", _gof_wrap_tile_masked_identity(_op))
+        elif _nm in ("phase_tile", "phase_tile_row", "phase_tile_col"):
+            _REG[_k] = _gof_wrap_mark_last(_nm, _gof_wrap_phase_tile_identity(_op))
+        elif _nm in ("remove_isolated", "keep_n_largest", "largest"):
+            _REG[_k] = _gof_wrap_mark_last(_nm, _gof_wrap_single_int_arg(_op))
+        elif "shift" in _nm:
+            _op = _gof_wrap_shift_args_enum(_op)
+            _op = _gof_wrap_shift_apply(_op)
+            _REG[_k] = _gof_wrap_mark_last("shift", _op)
+        else:
+            _REG[_k] = _gof_wrap_mark_last(_nm, _op)
+except Exception:
+    pass
+
+try:
+    _telemetry_note(globals(), early_dir_guard_steps=K_DIR, no_sizeops_start=K_NO_SIZEOPS_AT_START)
+except Exception:
+    pass
+# === end GOF-9000 directional/identity guards ===============================
 
 
 # ============================================================================
@@ -2502,6 +4269,36 @@ PALETTE_OPS = {
     "majority",
     "minority",
 }
+# --- Guard: define underscore op-family sets if not yet defined (import-order safe) ---
+try:
+    _TOPOLOGY_OPS
+except NameError:
+    _TOPOLOGY_OPS = {
+        "largest", "keep_n_largest", "keep_size_range",
+        "fill_holes", "keep_rings", "remove_isolated", "mask",
+        "center_largest", "fill"
+    }
+try:
+    _ALIGNMENT_OPS
+except NameError:
+    _ALIGNMENT_OPS = {
+        "shift", "flipud", "fliplr",
+        "rot90", "rot180", "rot270", "transpose", "align"
+    }
+try:
+    _TILING_OPS
+except NameError:
+    _TILING_OPS = {"tile", "tile_masked", "phase_tile", "phase_tile_row", "phase_tile_col"}
+try:
+    _RESIZE_OPS
+except NameError:
+    _RESIZE_OPS = {"resize", "scale"}
+try:
+    _PALETTE_OPS
+except NameError:
+    _PALETTE_OPS = {"replacecolor", "swapcolors", "invert", "recolor", "palette_map"}
+# --- end guard ---
+
 TOPOLOGY_OPS = set(_TOPOLOGY_OPS)
 ALIGNMENT_OPS = set(_ALIGNMENT_OPS)
 EXPANSION_OPS = set(_TILING_OPS) | set(_RESIZE_OPS)
@@ -2548,6 +4345,57 @@ def program_to_str(prog: Program) -> str:
     return "\n".join(lines)
 
 
+def _apply_op_priors_soft(priors: Dict[str, float], alpha: float = 1.0) -> None:
+    """Softly bias op ordering for successor generation."""
+    try:
+        def score(name: str) -> float:
+            p = float(priors.get(name, 0.0))
+            return math.log1p(max(0.0, alpha) * max(0.0, p))
+
+        names = list(OP_REGISTRY.keys())
+        names.sort(key=lambda n: score(n), reverse=True)
+        globals()["_OP_NAMES_BIASED"] = names
+    except Exception:
+        pass
+
+
+_TOKEN_PARSE_RE = re.compile(r"^\s*([a-zA-Z_]\w*)\s*\((.*)\)\s*$")
+
+
+def _program_from_ops_tokens(tokens: List[str]) -> Program:
+    """Parse a list of op tokens into a Program. Safe fallback returns empty program."""
+    if MEM is not None and hasattr(MEM, "parse_op_tokens"):
+        try:
+            steps = MEM.parse_op_tokens(tokens)
+            return Program(list(steps))
+        except Exception:
+            pass
+
+    steps: List[Step] = []
+    for tok in tokens or []:
+        tok = str(tok).strip()
+        match = _TOKEN_PARSE_RE.match(tok)
+        if not match:
+            if "(" not in tok:
+                steps.append(Step(tok, ()))
+            continue
+        name, arg_str = match.group(1), match.group(2)
+        parts = [p.strip() for p in arg_str.split(",") if p.strip()]
+        args: List[Any] = []
+        for part in parts:
+            try:
+                args.append(int(part))
+                continue
+            except Exception:
+                pass
+            if part.lower() in ("true", "false"):
+                args.append(part.lower() == "true")
+            else:
+                args.append(part)
+        steps.append(Step(name, tuple(args)))
+    return Program(steps)
+
+
 def _format_step_token(step: Step) -> str:
     op = step.op
     if not step.args:
@@ -2584,53 +4432,64 @@ _RESIZE_OPS = {"resize", "scale"}
 _MASK_KEYWORDS = ("mask", "outline", "threshold")
 
 
-def _last_step_op(program: Program) -> Optional[str]:
+# --- Identity + rail helpers ------------------------------------------------
+# Identity policy: only allow a no-op when shapes already match AND we're not at depth 0.
+IDENTITY_POLICY = "allow_equal_shape_only"
+
+
+def _last_step_op(program):
     try:
         return program.steps[-1].op
     except Exception:
         return None
 
 
-def _last_step_args(program: Program) -> Tuple[Any, ...]:
+def _last_step_args(program):
     try:
         return tuple(program.steps[-1].args)
     except Exception:
         return ()
 
 
-def _is_identity_successor(program: Program, in_shape: Optional[Tuple[int, int]]) -> bool:
-    """Detect identity/surrender successors."""
-    op = _last_step_op(program)
-    args = _last_step_args(program)
-
-    if op == "tile" and len(args) == 2:
-        try:
-            ky, kx = int(args[0]), int(args[1])
-            if ky == 1 and kx == 1:
-                return True
-        except Exception:
-            pass
-
-    if op == "scale" and len(args) >= 1:
-        try:
-            if float(args[0]) == 1.0:
-                return True
-        except Exception:
-            pass
-
-    if op == "resize" and len(args) == 2 and in_shape is not None:
-        try:
+def _is_identity_op(op_name, args, in_shape):
+    try:
+        if op_name == "tile" and len(args) >= 2:
+            return int(args[0]) == 1 and int(args[1]) == 1
+        if op_name == "scale" and len(args) >= 1:
+            return float(args[0]) == 1.0
+        if op_name == "resize" and len(args) == 2 and in_shape:
             h, w = int(args[0]), int(args[1])
-            if tuple(in_shape) == (h, w):
-                return True
-        except Exception:
-            pass
-
+            try:
+                in_h, in_w = int(in_shape[0]), int(in_shape[1])
+            except Exception:
+                return False
+            return (in_h * in_w) == (h * w)
+    except Exception:
+        pass
     return False
 
 
+def _should_block_identity(op_name, args, in_shape, out_shape, depth):
+    if not _is_identity_op(op_name, args, in_shape):
+        return False
+
+    if IDENTITY_POLICY == "allow_equal_shape_only":
+        if in_shape and out_shape:
+            try:
+                in_tuple = (int(in_shape[0]), int(in_shape[1]))
+                out_tuple = (int(out_shape[0]), int(out_shape[1]))
+            except Exception:
+                in_tuple = tuple(in_shape) if in_shape else None
+                out_tuple = tuple(out_shape) if out_shape else None
+            if in_tuple and out_tuple and in_tuple != out_tuple:
+                return True
+        return depth == 0
+
+    return True
+
+
 def _gate_allowed_ops(
-    settings: SearchSettings,
+    settings: _InternalSearchSettings,
     depth: int,
     phi: Optional[np.ndarray],
     allowed_names: Iterable[str],
@@ -2643,6 +4502,9 @@ def _gate_allowed_ops(
         k_palette = 3
     if depth < max(0, k_palette):
         names -= (PALETTE_OPS & names)
+
+    if depth < K_NO_SIZEOPS_AT_START:
+        names = {n for n in names if n not in _RESIZE_OPS and n not in _TILING_OPS}
 
     if getattr(settings, "rails_scale_hard", True) and phi is not None and len(phi) > 0:
         try:
@@ -2657,6 +4519,25 @@ def _gate_allowed_ops(
                 names = names & (TOPOLOGY_OPS | ALIGNMENT_OPS)
             elif s >= thr:
                 names = names & (EXPANSION_OPS | ALIGNMENT_OPS)
+
+    # --- GOF-9000: keep object tools available when object signal is strong ---
+    try:
+        obj_mag = abs(float(phi[1])) if (phi is not None and len(phi) > 1) else 0.0
+    except Exception:
+        obj_mag = 0.0
+
+    object_soft_pref = obj_mag > 0.30
+    if object_soft_pref:
+        STRONG_TOPO = {"keep_n_largest", "remove_isolated", "fill_holes", "largest", "center_largest"}
+        try:
+            names = (set(names) - {"keep_rings"}) | (STRONG_TOPO & set(OP_REGISTRY.keys()))
+        except Exception:
+            names = (set(names) - {"keep_rings"}) | STRONG_TOPO
+        try:
+            setattr(settings, "_object_soft_pref", True)
+        except Exception:
+            pass
+    # --- end widen ---
 
     return names
 
@@ -2739,6 +4620,12 @@ def apply_step(grid: np.ndarray, step: Step, states=None) -> np.ndarray:
     except Exception as e:
         # If error, return unchanged grid
         result = grid.copy()
+
+    if result is None:
+        try:
+            return grid.copy()
+        except Exception:
+            return grid
 
     return result
 
@@ -3005,7 +4892,7 @@ def state_to_vector(state: np.ndarray) -> np.ndarray:
 # ============================================================================
 
 @dataclass
-class SearchSettings:
+class _InternalSearchSettings:
     """Configuration for beam search with OCO."""
     beam_width: int = 128
     max_depth: int = 10
@@ -3026,9 +4913,9 @@ class SearchSettings:
     allow_finishers_on_masked: bool = False
     no_polish: bool = False
     stop_if_diversity: float = 0.20
-    div_lambda: float = 0.20
+    div_lambda: float = 0.50
     iou_cap: float = 0.97
-    max_bounces: int = -1
+    max_bounces: int = 8
     _hfp_prevC: Optional[float] = None
     _hfp_rho: Optional[float] = None
     _hfp_rho_smoothed: Optional[float] = None
@@ -3044,13 +4931,39 @@ class SearchSettings:
     bounce_if_lowdiv: bool = True
     lowdiv_thr: float = 0.05
     octo_z_min_for_bounce: float = 1.20
-    bounce_max: int = 1
+    bounce_max: int = 8
     # GOF-9000 constraint pack
     block_identity: bool = True
     rails_scale_hard: bool = True
     scale_hard_thresh: float = 1.0
     scale_hard_steps: int = 3
     early_palette_block_steps: int = 3
+    # GOF-9000 SelfMonitor defaults
+    monitor_enable: bool = True
+    monitor_pressure_thresh: float = 0.70
+    monitor_plateau_N: int = 3
+    monitor_visited_cap: int = 50000
+    monitor_inject_underused: bool = True
+    monitor_drop_dupe_sigs: bool = True
+    # === Memory v1.0 ===
+    use_memory: bool = True                 # master switch
+    memory_use_motifs: bool = True          # seed short programs
+    memory_use_priors: bool = True          # bias op policy
+    memory_dir: Optional[str] = None        # default from env ARC_MEMORY_DIR or ./memory_bank
+    priors_alpha: float = 1.0               # strength for priors nudges
+    motif_topk: int = 1                     # max motifs to seed
+    diversity_guard: bool = True            # A/B diversity guard
+    diversity_b_force_first: bool = False   # force different first op for B when align-first
+    attemptB_beam_scale: float = 1.0        # heuristic scaling for diversity alt
+    attemptB_time_scale: float = 1.0        # heuristic scaling for debate/time
+    hfp_enable: bool = True
+    hfp_alpha: float = 0.50
+    hfp_rho_hi: float = 0.80
+    hfp_rho_lo: float = 0.55
+    hfp_break_R: float = 5.00
+    hfp_gate_by_health: bool = True
+    hfp_gate_keep: bool = True
+    hfp_debug_telemetry: bool = True
 
 
 def compute_cost(
@@ -3058,7 +4971,7 @@ def compute_cost(
     input_grid: np.ndarray,
     target_grid: np.ndarray,
     phi: np.ndarray,
-    settings: SearchSettings
+    settings: _InternalSearchSettings
 ) -> float:
     """
     OCO-augmented cost function:
@@ -3350,7 +5263,7 @@ def beam_search_one_pair(
     input_grid: np.ndarray,
     target_grid: np.ndarray,
     phi: np.ndarray,
-    settings: SearchSettings,
+    settings: _InternalSearchSettings,
     logger: Optional[Any] = None,
     deadline: Optional[_Deadline] = None
 ) -> Optional[Program]:
@@ -3369,6 +5282,7 @@ def beam_search_one_pair(
     trace_buffer = getattr(settings, "_trace_buffer", None) if getattr(settings, "_trace_ops", False) else None
     family_hint = phi_to_family(phi)
     divs_hint = _divisible_shape(input_grid.shape, target_grid.shape)
+    monitor = getattr(settings, "_monitor", None)
 
     # Early-abort tracking (no-shape)
     no_shape_seen = True           # flip to False once any successor matches target shape
@@ -3380,10 +5294,19 @@ def beam_search_one_pair(
 
     # Build context for op-specific argument generation
     ctx = build_synth_context(input_grid, target_grid)
+    if monitor is not None:
+        try:
+            ctx["monitor"] = monitor
+        except Exception:
+            pass
 
     # === Meta-seed discovery ===
     meta = _quick_shape_candidates(input_grid, target_grid)
     seeds = [prog for (acc, prog) in meta]
+    memory_seed_tokens = list(getattr(settings, "_memory_seed_tokens", []) or [])
+    memory_seeds = list(getattr(settings, "_memory_seeded_programs", []) or [])
+    if memory_seeds:
+        seeds.extend(memory_seeds)
 
     # --- φ-aware topo gating for seeds / refiners ---
     dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
@@ -3425,8 +5348,42 @@ def beam_search_one_pair(
             break  # one is enough
 
     # Initialize beam with scored seeds (plus an empty program fallback)
-    beam = []
-    visited = set()
+    beam: List[Any] = []
+    visited: Set[Tuple] = set()
+
+    seed_count = _enqueue_seed_programs(
+        frontier=beam,
+        input_grid=input_grid,
+        target_grid=target_grid,
+        seed_tokens_list=memory_seed_tokens,
+        interpret_program_fn=interpret_program,
+        compute_cost_fn=lambda prog, ig, tg: compute_cost(prog, ig, tg, phi, settings),
+        step_cls=Step,
+        prog_cls=Program,
+        telem_carrier=settings,
+    )
+
+    if seed_count:
+        try:
+            print(f"[memory] seeded {seed_count} motif program(s) into frontier")
+        except Exception:
+            pass
+
+    sig_seen: Set[Tuple] = set()
+    seeded_entries: List[Any] = beam[-seed_count:] if seed_count else []
+    for entry in seeded_entries:
+        prog_obj = None
+        if hasattr(entry, "program"):
+            prog_obj = getattr(entry, "program", None)
+        elif isinstance(entry, dict):
+            prog_obj = entry.get("program")
+        if prog_obj is not None:
+            try:
+                sig = prog_obj.to_tuple()
+                sig_seen.add(sig)
+                visited.add(sig)
+            except Exception:
+                pass
 
     def _seed_cost(p):
         try:
@@ -3435,10 +5392,9 @@ def beam_search_one_pair(
             return 1e9
 
     # add deduped seeds
-    sig_seen = set()
     for prog in seeds:
         sig = prog.to_tuple()
-        if sig in sig_seen: 
+        if sig in sig_seen:
             continue
         sig_seen.add(sig)
         beam.append(Candidate(prog, _seed_cost(prog), depth=len(prog)))
@@ -3535,6 +5491,11 @@ def beam_search_one_pair(
 
         # Get candidate with lowest cost
         current = beam.pop(0)
+        if monitor is not None:
+            try:
+                monitor.record_accept(current.program)
+            except Exception:
+                pass
 
         # Track improvement for no-improvement abort
         if current.cost < best_cost_seen - 1e-6:
@@ -3680,28 +5641,189 @@ def beam_search_one_pair(
             ctx_iter["has_shape_match"] = bool(cur_state.shape == target_grid.shape)
             ctx_iter["depth"] = len(current.program.steps)
             ctx_iter["early_palette_block_steps"] = getattr(settings, "early_palette_block_steps", 3)
+            ctx_iter["monitor"] = monitor
         except Exception:
             pass
 
         # Generate successors with gating + O2 ordering
         successors = generate_successors(current.program, ctx_iter, allowed=allowed)
+        if monitor is not None and monitor.on:
+            successors = monitor.prune_dupes(successors)
+            successors = monitor.inject_underused_dimension(current, successors)
+            successors = monitor.gate_by_health(successors)
+        # --- GOF-9000: early opener hygiene -----------------------------------------
+        try:
+            depth_here = len(current.program.steps)
+        except Exception:
+            depth_here = 0
 
+        if depth_here == 0:
+            # --- GOF-9000: ban weak opener keep_rings at depth-0 ---------------------
+            filtered_successors = []
+            for sp in successors:
+                nm, args = _step_name_and_args(sp)
+                if nm == "keep_rings":
+                    continue  # too weak as an opener
+                if _is_shift_name(nm) and len(args) >= 2:
+                    try:
+                        dy = int(args[0])
+                        dx = int(args[1])
+                    except Exception:
+                        dy = dx = None
+                    if dy == 0 and dx == 0:
+                        continue  # drop shift(0,0) openers
+                filtered_successors.append(sp)
+            successors = filtered_successors
+
+            # Inject robust object-centric openers at depth-0 if missing
+            try:
+                StepCls = Step
+                ProgramCls = Program
+            except Exception:
+                StepCls = ProgramCls = None
+            if StepCls and ProgramCls:
+                have = {_last_step_name(sp) for sp in successors}
+                candidates = [
+                    ("keep_n_largest", (1,)),
+                    ("remove_isolated", (1,)),
+                    ("fill_holes", ()),
+                    ("largest", ()),
+                ]
+                for oname, oargs in candidates:
+                    if oname in have or oname not in OP_REGISTRY:
+                        continue
+                    sp = _append_step_clone(current.program, StepCls, ProgramCls, oname, oargs)
+                    if sp is not None:
+                        successors.append(sp)
+
+        if depth_here < 2 and _is_shift_name(_last_step_name(current.program)):
+            filtered_successors = []
+            for sp in successors:
+                nm, _ = _step_name_and_args(sp)
+                if not _is_shift_name(nm):
+                    filtered_successors.append(sp)
+            successors = filtered_successors
+        # --- end early opener hygiene -----------------------------------------------
+
+        # === GOF-9000: rails + identity policy ===
         try:
             depth = len(current.program.steps)
-            allowed_names = allowed if allowed is not None else OP_REGISTRY.keys()
-            gated_names = _gate_allowed_ops(settings, depth, phi, allowed_names)
-            if gated_names:
-                succ_filtered = [sprog for sprog in successors if _last_step_op(sprog) in gated_names]
-                if succ_filtered:
-                    successors = succ_filtered
+        except Exception:
+            depth = 0
 
-            if getattr(settings, "block_identity", True):
-                in_shape = ctx_iter.get("in_shape")
-                succ_filtered = [sprog for sprog in successors if not _is_identity_successor(sprog, in_shape)]
-                if succ_filtered:
-                    successors = succ_filtered
+        gated_names = set(allowed) if allowed else set(OP_REGISTRY.keys())
+        try:
+            k_palette = int(getattr(settings, "early_palette_block_steps", 3))
+            k_scale = int(getattr(settings, "scale_hard_steps", 3))
+        except Exception:
+            k_palette, k_scale = 3, 3
+
+        if depth < k_palette:
+            gated_names -= (PALETTE_OPS & gated_names)
+
+        phi_ctx = ctx_iter.get("phi") if isinstance(ctx_iter, dict) else None
+        in_shape = ctx_iter.get("in_shape") if isinstance(ctx_iter, dict) else None
+        out_shape = ctx_iter.get("out_shape") if isinstance(ctx_iter, dict) else None
+
+        scale_sign = 0.0
+        try:
+            if isinstance(phi_ctx, (list, tuple)) and len(phi_ctx) > 0:
+                scale_sign = float(phi_ctx[0])
+            elif in_shape and out_shape:
+                ia = int(in_shape[0]) * int(in_shape[1])
+                oa = int(out_shape[0]) * int(out_shape[1])
+                if oa < 0.9 * ia:
+                    scale_sign = -1.0
+                elif oa > 1.1 * ia:
+                    scale_sign = +1.0
+        except Exception:
+            scale_sign = 0.0
+
+        def _resize_is_shrink(args):
+            try:
+                if not in_shape or len(args) < 2:
+                    return False
+                h, w = int(args[0]), int(args[1])
+                return (h * w) < (int(in_shape[0]) * int(in_shape[1]))
+            except Exception:
+                return False
+
+        def _scale_is_shrink(args):
+            try:
+                return float(args[0]) < 1.0
+            except Exception:
+                return False
+
+        if depth < k_scale:
+            next_names = set()
+            for nm in gated_names:
+                if scale_sign <= -1.0:
+                    if nm in TOPOLOGY_OPS or nm in ALIGNMENT_OPS or nm in {"resize", "scale"}:
+                        next_names.add(nm)
+                elif scale_sign >= 1.0:
+                    if nm in (EXPANSION_OPS | ALIGNMENT_OPS) or nm in {"resize", "scale"}:
+                        next_names.add(nm)
+                else:
+                    next_names.add(nm)
+            if next_names:
+                gated_names = next_names
+
+        filtered = []
+        block_identity = bool(getattr(settings, "block_identity", True)) if settings else True
+
+        for sp in list(successors):
+            lop = _last_step_op(sp)
+            largs = _last_step_args(sp)
+            if gated_names and lop not in gated_names:
+                continue
+            if depth < k_scale and scale_sign <= -1.0:
+                if lop == "resize" and not _resize_is_shrink(largs):
+                    continue
+                if lop == "scale" and not _scale_is_shrink(largs):
+                    continue
+            if depth < k_scale and scale_sign >= 1.0:
+                if lop == "resize" and _resize_is_shrink(largs):
+                    continue
+                if lop == "scale" and _scale_is_shrink(largs):
+                    continue
+            if block_identity and _should_block_identity(lop, largs, in_shape, out_shape, depth):
+                continue
+            filtered.append(sp)
+
+        successors = filtered
+        try:
+            _telemetry_note(
+                current,
+                rails_scale_sign=float(scale_sign),
+                rail_depth=int(depth),
+                rail_allowed=list(sorted(gated_names))[:8],
+                identity_policy=IDENTITY_POLICY,
+            )
         except Exception:
             pass
+        # === end rails + identity policy ===
+
+        # Update GOF/HFP face and consciousness
+        try:
+            depth_for_face = len(current.program.steps)
+        except Exception:
+            depth_for_face = 0
+        if monitor is not None:
+            try:
+                C_base, C_mod = monitor.gof_consciousness(program_depth=depth_for_face)
+                new_face = monitor.determine_face(C_mod)
+                if monitor.face_enabled:
+                    if new_face != monitor.face:
+                        monitor.face = new_face
+                    monitor.face_log.append((len(monitor.face_log), new_face))
+                    if len(monitor.face_log) > 64:
+                        monitor.face_log = monitor.face_log[-64:]
+                if 'controller' in locals() and hasattr(controller, "mode") and new_face != controller.mode:
+                    controller.mode = new_face
+                    if hasattr(controller, "rotation_count"):
+                        controller.rotation_count = 0
+            except Exception:
+                pass
 
         # Score each successor
         for succ_prog in successors:
@@ -3715,6 +5837,13 @@ def beam_search_one_pair(
 
             # Compute cost
             cost = compute_cost(succ_prog, input_grid, target_grid, phi, settings)
+            if monitor is not None:
+                try:
+                    t_prog_val = float(compute_program_tension(succ_prog, phi))
+                    monitor.tension_hist.append(t_prog_val)
+                    monitor.update_hfp_from_tension(t_prog_val)
+                except Exception:
+                    pass
 
             # Check successor output for tie-break, early exit, and shape tracking
             pred = None
@@ -3726,13 +5855,32 @@ def beam_search_one_pair(
                     no_shape_seen = False
 
                 # Tiny tie-break for tile_masked when shape matches
-                if pred.shape == target_grid.shape:
-                    last = succ_prog.steps[-1].op if succ_prog.steps else None
-                    if last == "tile_masked":
-                        cost -= 0.02
+                    if pred.shape == target_grid.shape:
+                        last = succ_prog.steps[-1].op if succ_prog.steps else None
+                        if last == "tile_masked":
+                            cost -= SHAPE_MATCH_BONUS
 
                     # Early exit if exact match
                     if np.array_equal(pred, target_grid):
+                        attempt_tag = getattr(settings, "_attempt_tag", "A") if settings is not None else "A"
+                        last_op = succ_prog.steps[-1].op if getattr(succ_prog, "steps", None) else None
+                        pre_err = None
+                        try:
+                            parent_pred = interpret_program(current.program, input_grid)
+                            if parent_pred.shape == target_grid.shape:
+                                pre_err = float((parent_pred != target_grid).mean())
+                        except Exception:
+                            pass
+                        _log_exact_win(
+                            {
+                                "task_id": task_id,
+                                "win_attributed_to": last_op,
+                                "pre_win_err": pre_err,
+                                "depth_at_win": getattr(current, "depth", 0) + 1,
+                                "rho_at_win": getattr(settings, "_hfp_rho_smoothed", None) if settings else None,
+                                "attempt_tag": attempt_tag,
+                            }
+                        )
                         return succ_prog
             except Exception:
                 pass
@@ -3769,6 +5917,14 @@ def beam_search_one_pair(
         # Prune to beam width
         beam = beam[:settings.beam_width]
 
+        if monitor is not None:
+            try:
+                if monitor.should_health_break():
+                    monitor.events.append(("hfp_break", round(monitor.R_last, 3)))
+                    break
+            except Exception:
+                pass
+
         # Periodic logging
         if logger and iteration % settings.log_every == 0:
             logger.log_iteration(iteration, len(beam), best_cost)
@@ -3781,8 +5937,21 @@ def beam_search_one_pair(
 
 def generate_successors(prog: Program, ctx, allowed: Optional[Set[str]] = None) -> List[Program]:
     """Generate all valid single-step extensions of a program, filtered & ordered."""
-    # Order operations by OP_ORDER_O2, and apply optional whitelist
-    ordered = sorted(OP_NAMES_BASIC, key=lambda t: _OP_RANK.get(t[0], 10_000))
+    # Order operations by OP_ORDER_O2, allowing memory bias overrides
+    biased_names = globals().get("_OP_NAMES_BIASED")
+    if biased_names:
+        seen = set()
+        ordered = []
+        for name in biased_names:
+            entry = _OP_ENTRY_BY_NAME.get(name)
+            if entry and name not in seen:
+                ordered.append(entry)
+                seen.add(name)
+        for entry in OP_NAMES_BASIC:
+            if entry[0] not in seen:
+                ordered.append(entry)
+    else:
+        ordered = sorted(OP_NAMES_BASIC, key=lambda t: _OP_RANK.get(t[0], 10_000))
     successors = []
     for op_name, arity, param_types in ordered:
         if allowed is not None and op_name not in allowed:
@@ -3946,7 +6115,7 @@ class MetaControllerUCB:
         self.bandits[fam].update(arm, reward)
 
 
-def should_rotate(state: ControllerState, current_cost: float, settings: SearchSettings) -> bool:
+def should_rotate(state: ControllerState, current_cost: float, settings: _InternalSearchSettings) -> bool:
     """Decide if controller should rotate to next mode."""
     if settings._disable_rotation:
         return False
@@ -3970,7 +6139,7 @@ def rotate_mode(state: ControllerState) -> str:
     return modes[next_idx]
 
 
-def apply_mode_bias(settings: SearchSettings, mode: str) -> SearchSettings:
+def apply_mode_bias(settings: _InternalSearchSettings, mode: str) -> _InternalSearchSettings:
     """Adjust search settings based on controller mode."""
     from dataclasses import replace
 
@@ -4202,10 +6371,10 @@ def _update_rho(settings, best_program, train_pairs, phi, palette_is_safe):
         setattr(settings, "_hfp_ready", True)
     return rho
 
-def solve_task(
+def _solve_task_internal(
     task_id: str,
     task_json: Dict,
-    settings: SearchSettings,
+    settings: _InternalSearchSettings,
     logger: Optional[StepLogger] = None
 ) -> List[Any]:
     """
@@ -4228,6 +6397,7 @@ def solve_task(
     t0 = _now()
     hit_deadline = False
     setattr(settings, "_deadline_hit", False)
+    setattr(settings, "_object_soft_pref", False)
 
     # Extract training pairs and test inputs
     train_pairs = trains_from_task(task_json)
@@ -4244,11 +6414,74 @@ def solve_task(
     phi = compute_phi(features)
     rho_samples = list(getattr(settings, "_rho_samples", []))
 
+    # === Memory v1.0 hooks ==================================================
+    memo: Dict[str, Any] = {}
+    layout_fp: Dict[str, Any] = {}
+    seeded_programs: List[Program] = []
+    seed_token_lists: List[List[str]] = []
+    memory_family = None
+    priors_applied = False
+    phi_family = None
+    try:
+        phi_family = phi_to_family(phi)
+    except Exception:
+        phi_family = None
+    if getattr(settings, "use_memory", True) and MEM is not None:
+        try:
+            memory_dir = getattr(settings, "memory_dir", None) or os.environ.get("ARC_MEMORY_DIR", "./memory_bank")
+            memo = MEM.load_all(memory_dir)
+            layout_fp = MEM.fingerprint_layout(task_json)
+            memory_family = MEM.detect_family(layout_fp)
+            if memory_family is None:
+                memory_family = phi_family or layout_fp.get("family_hint")
+            if getattr(settings, "memory_use_priors", True):
+                priors_map = memo.get("priors", {})
+                priors = MEM.op_prior_for_task(
+                    memory_family or (phi_family or "default"),
+                    priors_map,
+                    alpha=float(getattr(settings, "priors_alpha", 1.0)),
+                )
+                if priors:
+                    _apply_op_priors_soft(priors, alpha=float(getattr(settings, "priors_alpha", 1.0)))
+                    priors_applied = True
+            if getattr(settings, "memory_use_motifs", True):
+                motif_topk = int(max(0, getattr(settings, "motif_topk", 0) or 0))
+                motif_tokens = MEM.choose_motifs(layout_fp, memo.get("motifs", {}), topk=motif_topk)
+                for toks in motif_tokens:
+                    toks_list = [str(t) for t in toks]
+                    seed_token_lists.append(toks_list)
+                    prog = _program_from_ops_tokens(toks_list)
+                    if prog is not None and prog.steps:
+                        seeded_programs.append(prog)
+        except Exception as mem_exc:
+            print(f"[MEMORY] disabled ({mem_exc})")
+            memo = {}
+            seeded_programs = []
+            memory_family = None
+    else:
+        memo = {}
+        seeded_programs = []
+        seed_token_lists = []
+        memory_family = phi_family
+
+    if not priors_applied:
+        globals().pop("_OP_NAMES_BIASED", None)
+
+    setattr(settings, "_memory_seeded_programs", seeded_programs)
+    setattr(settings, "_memory_seed_tokens", seed_token_lists)
+    setattr(settings, "_memory_layout_fp", layout_fp)
+    setattr(settings, "_memory_family", memory_family)
+    setattr(settings, "_phi_family", memory_family or phi_family)
+    setattr(settings, "_memory_priors_applied", priors_applied)
+
     if getattr(settings, "_policy_prior", None) is None:
         settings._policy_prior = _DEFAULT_POLICY_PRIOR
 
     trace = getattr(settings, "_trace_ops", False)
     settings._trace_buffer = []
+
+    monitor = SelfMonitor(settings)
+    setattr(settings, "_monitor", monitor)
 
     # --- Topology hint (side-channel): averages over train pairs ---
     dholes_g = dcomps_g = dholes_pc = dcomps_pc = 0.0
@@ -4268,10 +6501,10 @@ def solve_task(
     # Meta-controller (opt-in)
     meta = None
     if settings.use_meta_controller:
-        meta = getattr(solve_task, "_META", None)
+        meta = getattr(_solve_task_internal, "_META", None)
         if meta is None:
             meta = MetaControllerUCB()
-            solve_task._META = meta
+            _solve_task_internal._META = meta
 
     # --- Consensus one-step sweep (fast path) ---
     cons_prog, cons_mean = _consensus_one_step_candidate(train_pairs)
@@ -4329,6 +6562,10 @@ def solve_task(
             setattr(mode_settings, "_trace_ops", getattr(settings, "_trace_ops", False))
             if hasattr(settings, "_trace_buffer"):
                 setattr(mode_settings, "_trace_buffer", getattr(settings, "_trace_buffer"))
+            if hasattr(settings, "_memory_seed_tokens"):
+                setattr(mode_settings, "_memory_seed_tokens", getattr(settings, "_memory_seed_tokens", []))
+            if hasattr(settings, "_memory_seeded_programs"):
+                setattr(mode_settings, "_memory_seeded_programs", getattr(settings, "_memory_seeded_programs", []))
 
             # Search for program
             prog = beam_search_one_pair(x, y, phi, mode_settings, logger, deadline=deadline)
@@ -4574,6 +6811,8 @@ def solve_task(
     # Truncate program at last tile_masked to get pure shape transformation
     base_steps, ky, kx, m = _truncate_at_last_tile_masked(best_program)
     emit_two_attempts = (base_steps is not None)
+
+    seconds_adjusted = False
     
     # Debug telemetry
     if logger and emit_two_attempts:
@@ -4585,38 +6824,82 @@ def solve_task(
     if emit_two_attempts:
         # Build truncated programs: attempt_1 = original mode, attempt_2 = swapped mode
         prog1 = Program(list(base_steps))  # keep original mode m
-        
+
         # Build alternate with swapped mode
         alt_mode = 1 - m
         alt_steps = list(base_steps)
         alt_steps[-1] = Step("tile_masked", (ky, kx, alt_mode))
         prog2 = Program(alt_steps)
-        
-        for test_x in test_inputs:
+
+        for test_idx, test_x in enumerate(test_inputs):
             if deadline.expired():
                 hit_deadline = True
                 setattr(settings, "_deadline_hit", True)
                 fallback = test_x.copy()
-                predictions.append({"attempt_1": fallback.tolist(), "attempt_2": fallback.tolist()})
+                fallback_list = fallback.tolist()
+                entry = {
+                    "attempt_1": fallback_list,
+                    "attempt_2": fallback_list,
+                    "grid": fallback_list,
+                    "_telemetry": {},
+                }
+                seconds_val = float(getattr(settings, "max_seconds", 0.0) or 0.0)
+                _telemetry_note(entry, seconds_after_schedule=seconds_val)
+                predictions.append(entry)
                 continue
-            # Attempt 1: Original mode (raw output)
+
             try:
                 pred1 = interpret_program(prog1, test_x)
             except Exception:
                 pred1 = test_x.copy()
-            
-            # Attempt 2: Swapped mode (raw output)
+
             try:
                 pred2 = interpret_program(prog2, test_x)
             except Exception:
                 pred2 = pred1  # Fallback to attempt_1
-            
-            # Return two-attempts dict (raw outputs, no finishers applied)
-            predictions.append({"attempt_1": pred1.tolist(), "attempt_2": pred2.tolist()})
+
+            att1_grid = pred1.tolist()
+            att2_grid = pred2.tolist()
+            telemetry = {}
+            att1_entry = {"grid": att1_grid, "_telemetry": telemetry, "meta": {"tension": prog_tension}}
+            att2_entry = {"grid": att2_grid, "_telemetry": telemetry, "meta": {"tension": prog_tension}}
+
+            truth_probe = None
+            try:
+                tests_full = task_json.get("test", [])
+                if isinstance(tests_full, list) and test_idx < len(tests_full):
+                    truth_probe = tests_full[test_idx].get("output")
+            except Exception:
+                truth_probe = None
+
+            if not seconds_adjusted:
+                base_secs = float(getattr(settings, "max_seconds", 30.0) or 0.0)
+                rho_probe = _rho_from(att1_entry["grid"], truth_probe, (att1_entry.get("meta") or {}).get("tension"))
+                new_secs = float(_seconds_schedule(base_secs, rho_probe))
+                try:
+                    settings.max_seconds = new_secs
+                except Exception:
+                    pass
+                seconds_val = new_secs
+                seconds_adjusted = True
+            else:
+                seconds_val = float(getattr(settings, "max_seconds", 0.0) or 0.0)
+
+            att2_entry = _enforce_diversity(att1_entry, att2_entry)
+            winner = _debate_reconcile(task_json, att1_entry, att2_entry)
+
+            entry = {
+                "attempt_1": att1_entry["grid"],
+                "attempt_2": att2_entry["grid"],
+                "grid": winner.get("grid", att1_entry["grid"]),
+                "_telemetry": telemetry,
+            }
+            _telemetry_note(entry, seconds_after_schedule=seconds_val)
+            predictions.append(entry)
     
     # SINGLE-ATTEMPT MODE: Apply finishers on TEST
     else:
-        for test_x in test_inputs:
+        for test_idx, test_x in enumerate(test_inputs):
             expired_now = deadline.expired()
             if expired_now:
                 hit_deadline = True
@@ -4659,7 +6942,31 @@ def solve_task(
                 "palette_safe": bool(palette_is_safe),
                 "ky_kx": ky_kx_meta,
             }
-            predictions.append({"grid": pred_np.tolist(), "meta": meta})
+            entry = {"grid": pred_np.tolist(), "meta": meta, "_telemetry": {}}
+
+            truth_probe = None
+            try:
+                tests_full = task_json.get("test", [])
+                if isinstance(tests_full, list) and test_idx < len(tests_full):
+                    truth_probe = tests_full[test_idx].get("output")
+            except Exception:
+                truth_probe = None
+
+            if not seconds_adjusted:
+                base_secs = float(getattr(settings, "max_seconds", 30.0) or 0.0)
+                rho_probe = _rho_from(entry["grid"], truth_probe, meta.get("tension"))
+                new_secs = float(_seconds_schedule(base_secs, rho_probe))
+                try:
+                    settings.max_seconds = new_secs
+                except Exception:
+                    pass
+                seconds_val = new_secs
+                seconds_adjusted = True
+            else:
+                seconds_val = float(getattr(settings, "max_seconds", 0.0) or 0.0)
+
+            _telemetry_note(entry, seconds_after_schedule=seconds_val)
+            predictions.append(entry)
 
     # v2.8.7: expose last program for replay/debugging
     try:
@@ -4679,7 +6986,14 @@ def solve_task(
                 hit_deadline = True
                 setattr(settings, "_deadline_hit", True)
                 fallback = grid.tolist() if hasattr(grid, "tolist") else grid
-                enhanced.append({"attempt_1": fallback, "attempt_2": fallback})
+                entry = {
+                    "attempt_1": fallback,
+                    "attempt_2": fallback,
+                    "grid": fallback,
+                    "_telemetry": {},
+                }
+                _telemetry_note(entry, seconds_after_schedule=float(getattr(settings, "max_seconds", 0.0) or 0.0))
+                enhanced.append(entry)
                 continue
             try:
                 g = np.asarray(grid)
@@ -4691,15 +7005,28 @@ def solve_task(
                     np.flipud(g),
                 ]
                 attempt_2 = alt_cands[0]
-                enhanced.append(
-                    {
-                        "attempt_1": g.tolist(),
-                        "attempt_2": attempt_2.tolist(),
-                    }
-                )
+                telemetry = {}
+                att1_entry = {"grid": g.tolist(), "_telemetry": telemetry, "meta": {"tension": prog_tension}}
+                att2_entry = {"grid": attempt_2.tolist(), "_telemetry": telemetry, "meta": {"tension": prog_tension}}
+                att2_entry = _enforce_diversity(att1_entry, att2_entry)
+                entry = {
+                    "attempt_1": att1_entry["grid"],
+                    "attempt_2": att2_entry["grid"],
+                    "grid": att1_entry["grid"],
+                    "_telemetry": telemetry,
+                }
+                _telemetry_note(entry, seconds_after_schedule=float(getattr(settings, "max_seconds", 0.0) or 0.0))
+                enhanced.append(entry)
             except Exception:
                 fallback = grid.tolist() if hasattr(grid, "tolist") else grid
-                enhanced.append({"attempt_1": fallback, "attempt_2": fallback})
+                entry = {
+                    "attempt_1": fallback,
+                    "attempt_2": fallback,
+                    "grid": fallback,
+                    "_telemetry": {},
+                }
+                _telemetry_note(entry, seconds_after_schedule=float(getattr(settings, "max_seconds", 0.0) or 0.0))
+                enhanced.append(entry)
         predictions = enhanced
 
     elapsed = _now() - t0
@@ -4723,6 +7050,7 @@ def solve_task(
         for step in best_program.steps:
             ops_tokens.append(_format_step_token(step))
             ops_families.append(_op_family_tag(step))
+    object_soft_pref_flag = bool(getattr(settings, "_object_soft_pref", False))
     payload = {
         "budget_sec": budget,
         "elapsed_sec": float(elapsed),
@@ -4730,7 +7058,25 @@ def solve_task(
         "ops_tokens": ops_tokens,
         "ops_families": ops_families,
         "program_len": int(len(ops_tokens)),
+        "object_soft_pref": object_soft_pref_flag,
+        "k_scale": int(getattr(settings, "scale_hard_steps", 3)),
+        "k_palette": int(getattr(settings, "early_palette_block_steps", 3)),
+        "rails_scale_hard": bool(getattr(settings, "rails_scale_hard", True)),
     }
+    memory_seed_info = []
+    try:
+        memory_seed_info = [
+            [step.op for step in prog.steps]
+            for prog in (getattr(settings, "_memory_seeded_programs", []) or [])
+        ]
+    except Exception:
+        memory_seed_info = []
+    if memory_seed_info:
+        payload["memory_seeded"] = memory_seed_info
+        payload["memory_family"] = getattr(settings, "_memory_family", None)
+    if getattr(settings, "_memory_priors_applied", False):
+        payload["memory_priors_alpha"] = float(getattr(settings, "priors_alpha", 0.0) or 0.0)
+        payload.setdefault("memory_family", getattr(settings, "_memory_family", None))
     if logger and hasattr(logger, "log_kv"):
         try:
             logger.log_kv("budget_sec", budget)
@@ -4738,12 +7084,49 @@ def solve_task(
             logger.log_kv("hit_deadline", bool(hit_deadline))
         except Exception:
             pass
+    try:
+        if isinstance(predictions, list) and predictions:
+            first = predictions[0]
+            if isinstance(first, dict):
+                predictions[0] = _endgame_refine(task_json, first)
+        elif isinstance(predictions, dict):
+            predictions = _endgame_refine(task_json, predictions)
+    except Exception:
+        pass
+
     if isinstance(predictions, list):
         for entry in predictions:
             if isinstance(entry, dict):
                 _telemetry_note(entry, **payload)
+                _telemetry_note(
+                    entry,
+                    policy="accuracy_pack",
+                    debate_refiner=(entry.get("_telemetry", {}) or {}).get("debate_refiner"),
+                    diversity_nudge=(entry.get("_telemetry", {}) or {}).get("diversity_nudge"),
+                )
+        try:
+            if predictions and isinstance(predictions[0], dict):
+                telem = predictions[0].setdefault("_telemetry", {})
+                telem["gof9k_monitor"] = monitor.as_dict()
+                if getattr(settings, "hfp_debug_telemetry", True) and getattr(monitor, "hfp_dbg", True):
+                    telem["hfp_gof"] = monitor.hfp_gof_dict()
+        except Exception:
+            pass
     elif isinstance(predictions, dict):
         _telemetry_note(predictions, **payload)
+        _telemetry_note(
+            predictions,
+            policy="accuracy_pack",
+            debate_refiner=(predictions.get("_telemetry", {}) or {}).get("debate_refiner"),
+            diversity_nudge=(predictions.get("_telemetry", {}) or {}).get("diversity_nudge"),
+        )
+        try:
+            telem = predictions.setdefault("_telemetry", {})
+            telem["gof9k_monitor"] = monitor.as_dict()
+            if getattr(settings, "hfp_debug_telemetry", True) and getattr(monitor, "hfp_dbg", True):
+                telem["hfp_gof"] = monitor.hfp_gof_dict()
+        except Exception:
+            pass
 
     if logger:
         logger.log_task_end(task_id, success, elapsed)
@@ -4787,7 +7170,7 @@ def solve_task_with_schedule(
             if hasattr(settings, attr):
                 setattr(sub, attr, getattr(settings, attr))
 
-        preds = solve_task(tid, task_json, sub, logger=logger)
+        preds = _solve_task_internal(tid, task_json, sub, logger=logger)
         last_preds = preds
         score = -1.0
         if truths is not None and preds is not None and len(truths) == len(preds):
@@ -4813,7 +7196,7 @@ def solve_task_with_schedule(
 
 def run_dir(
     tasks_dir: str,
-    settings: SearchSettings,
+    settings: _InternalSearchSettings,
     max_tasks: Optional[int] = None,
     logger: Optional[StepLogger] = None
 ) -> Dict[str, List[Any]]:
@@ -5066,12 +7449,12 @@ Examples:
                        help="Program tension weight (default: 0.30)")
     parser.add_argument("--lambda2", type=float, default=0.20,
                        help="Slice tension weight (default: 0.20)")
-    parser.add_argument("--div_lambda", type=float, default=0.20,
-                        help="Diversity bonus weight for two-attempt selection (default: 0.20)")
+    parser.add_argument("--div_lambda", type=float, default=0.50,
+                        help="Diversity penalty λ for Attempt-B selection (default: 0.50)")
     parser.add_argument("--iou_cap", type=float, default=0.97,
                         help="Maximum IoU allowed before alternates are rejected (default: 0.97)")
-    parser.add_argument("--max_bounces", type=int, default=-1,
-                        help="Hard cap on debate bounces (default: -1 for rho-driven)")
+    parser.add_argument("--max_bounces", type=int, default=8,
+                        help="Hard cap on debate bounces (default: 8)")
     parser.add_argument("--no_octo_prior", action="store_true",
                         help="Disable palette8 octonion distance–based time scaling (training stage).")
     parser.add_argument("--octo_alpha", type=float, default=0.25,
@@ -5088,8 +7471,7 @@ Examples:
                         help="Skim diversity threshold to trigger bounce (default 0.05).")
     parser.add_argument("--octo_z_min_for_bounce", type=float, default=1.20,
                         help="Minimum octonion z to consider a task 'hard' (default 1.20).")
-    parser.add_argument("--bounce_max", type=int, default=1,
-                        help="Maximum bounces to force when the trigger fires (default 1).")
+    parser.add_argument("--bounce_max", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--no_block_identity", action="store_true",
                         help="Disable identity ejection (tile(1,1), scale(1), resize to same size).")
     parser.add_argument(
@@ -5103,6 +7485,70 @@ Examples:
                         help="Early steps to enforce hard scale rails (default 3).")
     parser.add_argument("--early_palette_block_steps", type=int, default=3,
                         help="Block palette ops for the first N steps (default 3).")
+    # GOF-9000 SelfMonitor options
+    parser.add_argument("--no_monitor", action="store_true",
+                        help="Disable GOF-9000 self-monitor (pressure/novelty guard).")
+    parser.add_argument("--monitor_pressure_thresh", type=float, default=0.70,
+                        help="Pressure threshold (fraction of ops in one class) before injecting diversity.")
+    parser.add_argument("--monitor_plateau_N", type=int, default=3,
+                        help="Reserved plateau detector window (default 3).")
+    parser.add_argument("--monitor_visited_cap", type=int, default=50000,
+                        help="LRU cap for duplicate-program signatures (default 50k).")
+    parser.add_argument("--no_monitor_inject_underused", action="store_true",
+                        help="Do not inject underused-class successors when pressure detected.")
+    parser.add_argument("--no_monitor_drop_dupe_sigs", action="store_true",
+                        help="Do not prune duplicate program signatures during search.")
+
+    # Memory v1.0
+    parser.add_argument("--use_memory", dest="use_memory", action="store_true",
+        help="Enable memory (motifs + priors).")
+    parser.add_argument("--no_use_memory", dest="use_memory", action="store_false",
+        help="Disable memory (motifs + priors).")
+    parser.add_argument("--no_memory_motifs", action="store_true",
+        help="Disable motif seeding.")
+    parser.add_argument("--no_memory_priors", action="store_true",
+        help="Disable priors bias.")
+    parser.add_argument("--memory_dir", type=str, default=None,
+        help="Path to memory_bank directory (default: $ARC_MEMORY_DIR or ./memory_bank).")
+    parser.add_argument("--motif_topk", type=int, default=None,
+        help="Max motif seeds to inject (default 1).")
+    parser.add_argument("--priors_alpha", type=float, default=None,
+        help="Strength of priors logit bump (default 1.0).")
+    # Legacy aliases (kept for backwards compatibility; hidden in help)
+    parser.add_argument("--memory_max_seeded", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--memory_prior_alpha", type=float, default=None, help=argparse.SUPPRESS)
+    parser.set_defaults(use_memory=True)
+
+    # Diversity guard toggles for Attempt B
+    parser.add_argument("--diversity_guard", dest="diversity_guard", action="store_true",
+        help="Enable Attempt-B diversity guard (default ON).")
+    parser.add_argument("--no_diversity_guard", dest="diversity_guard", action="store_false",
+        help="Disable Attempt-B diversity guard.")
+    parser.add_argument("--diversity_b_force_first", action="store_true", default=False,
+        help="Force Attempt-B to start with a different opener when Attempt-A was align-first.")
+    parser.add_argument("--attemptB_beam_scale", type=float, default=1.0,
+        help="Heuristic diversity scaling factor for Attempt-B candidate selection (default 1.0).")
+    parser.add_argument("--attemptB_time_scale", type=float, default=1.0,
+        help="Heuristic schedule scaling for Attempt-B debate/time (default 1.0).")
+    parser.set_defaults(diversity_guard=True)
+
+    # HFP × GOF integration
+    parser.add_argument("--no_hfp", action="store_true",
+                        help="Disable HFP×GOF integration (ρ gating + R break).")
+    parser.add_argument("--hfp_alpha", type=float, default=0.50,
+                        help="EMA smoothing for ρ (default 0.50).")
+    parser.add_argument("--hfp_rho_hi", type=float, default=0.80,
+                        help="ρ threshold for healthy band (default 0.80).")
+    parser.add_argument("--hfp_rho_lo", type=float, default=0.55,
+                        help="ρ threshold for degraded band (default 0.55).")
+    parser.add_argument("--hfp_break_R", type=float, default=5.00,
+                        help="Anti-friction break threshold on R(ρ) (default 5.00).")
+    parser.add_argument("--no_hfp_gate_by_health", action="store_true",
+                        help="Disable successor gating by health bands.")
+    parser.add_argument("--no_hfp_gate_keep", action="store_true",
+                        help="Do not preserve strong object/align openers during health gating.")
+    parser.add_argument("--no_hfp_debug_telemetry", action="store_true",
+                        help="Omit hfp_gof telemetry block from outputs.")
     
     # Ablations
     parser.add_argument("--ablation", type=str, default=None,
@@ -5116,6 +7562,10 @@ Examples:
                        help="Log every N iterations (default: 200)")
     parser.add_argument("--jsonl", type=str, default=None,
                        help="Path for JSONL telemetry log")
+    parser.add_argument("--exact_wins_csv", type=str, default=None,
+                       help="Optional CSV path for exact-win attribution events")
+    parser.add_argument("--octo_stats_csv", type=str, default=None,
+                       help="Optional CSV path for octonion/confounds telemetry")
     
     # Determinism
     parser.add_argument("--seed", type=int, default=1337,
@@ -5123,9 +7573,36 @@ Examples:
     
     args = parser.parse_args()
 
+    if getattr(args, "bounce_max", None) is not None:
+        try:
+            args.max_bounces = int(args.bounce_max)
+        except Exception:
+            pass
+    args.bounce_max = args.max_bounces
+
+    global _CLI_ARGS
+    _CLI_ARGS = args
+
     if not _NUMPY_AVAILABLE:
         print(f"ERROR: {_NUMPY_IMPORT_ERROR}", file=sys.stderr)
         sys.exit(1)
+
+    # Derived configuration knobs (memory/diversity)
+    motif_topk = args.motif_topk
+    if motif_topk is None and args.memory_max_seeded is not None:
+        motif_topk = args.memory_max_seeded
+    if motif_topk is None:
+        motif_topk = 1
+    priors_alpha = args.priors_alpha
+    if priors_alpha is None and args.memory_prior_alpha is not None:
+        priors_alpha = args.memory_prior_alpha
+    if priors_alpha is None:
+        priors_alpha = 1.0
+    memory_dir_effective = args.memory_dir or os.environ.get("ARC_MEMORY_DIR", "./memory_bank")
+    use_memory_flag = bool(args.use_memory)
+    memory_motifs_flag = not args.no_memory_motifs
+    memory_priors_flag = not args.no_memory_priors
+    diversity_guard_flag = bool(args.diversity_guard)
 
     # Banner
     print("=" * 80)
@@ -5163,10 +7640,24 @@ Examples:
         f"scale_hard_steps={args.scale_hard_steps}, "
         f"early_palette_block_steps={args.early_palette_block_steps}"
     )
+    print(
+        f"  HFP×GOF: {'ON' if not args.no_hfp else 'OFF'}, "
+        f"rho_hi={args.hfp_rho_hi:.2f}, rho_lo={args.hfp_rho_lo:.2f}, "
+        f"R_break>{args.hfp_break_R:.2f}, gate_by_health={'ON' if not args.no_hfp_gate_by_health else 'OFF'}"
+    )
+    print(
+        f"  Memory: use={use_memory_flag}, motifs={memory_motifs_flag}, priors={memory_priors_flag}, "
+        f"dir={memory_dir_effective}, motif_topk={motif_topk}, alpha={priors_alpha:.2f}"
+    )
+    print(
+        f"  Diversity guard: {'ON' if diversity_guard_flag else 'OFF'}, "
+        f"force_first={args.diversity_b_force_first}, "
+        f"attemptB_beam_scale={args.attemptB_beam_scale:.2f}, attemptB_time_scale={args.attemptB_time_scale:.2f}"
+    )
     print("=" * 80)
-    
+
     # Build settings
-    settings = SearchSettings(
+    settings = _InternalSearchSettings(
         beam_width=args.beam,
         max_depth=args.depth,
         max_seconds=args.seconds,
@@ -5193,6 +7684,30 @@ Examples:
         scale_hard_thresh=args.scale_hard_thresh,
         scale_hard_steps=args.scale_hard_steps,
         early_palette_block_steps=args.early_palette_block_steps,
+        monitor_enable=(not args.no_monitor),
+        monitor_pressure_thresh=args.monitor_pressure_thresh,
+        monitor_plateau_N=args.monitor_plateau_N,
+        monitor_visited_cap=args.monitor_visited_cap,
+        monitor_inject_underused=(not args.no_monitor_inject_underused),
+        monitor_drop_dupe_sigs=(not args.no_monitor_drop_dupe_sigs),
+        use_memory=use_memory_flag,
+        memory_use_motifs=memory_motifs_flag,
+        memory_use_priors=memory_priors_flag,
+        memory_dir=args.memory_dir,
+        priors_alpha=priors_alpha,
+        motif_topk=int(max(0, motif_topk)),
+        diversity_guard=diversity_guard_flag,
+        diversity_b_force_first=args.diversity_b_force_first,
+        attemptB_beam_scale=args.attemptB_beam_scale,
+        attemptB_time_scale=args.attemptB_time_scale,
+        hfp_enable=(not args.no_hfp),
+        hfp_alpha=args.hfp_alpha,
+        hfp_rho_hi=args.hfp_rho_hi,
+        hfp_rho_lo=args.hfp_rho_lo,
+        hfp_break_R=args.hfp_break_R,
+        hfp_gate_by_health=(not args.no_hfp_gate_by_health),
+        hfp_gate_keep=(not args.no_hfp_gate_keep),
+        hfp_debug_telemetry=(not args.no_hfp_debug_telemetry),
     )
     
     # Apply ablation if specified
@@ -5221,7 +7736,14 @@ Examples:
     
     # Write submission (function dumps whatever dict we pass)
     write_submission_json(args.out, predictions)
-    
+
+    _flush_exact_wins(args.exact_wins_csv)
+    _flush_octo_csv(args.octo_stats_csv)
+    if args.exact_wins_csv:
+        print(f"  [LOG] exact-win events → {args.exact_wins_csv}")
+    if args.octo_stats_csv:
+        print(f"  [LOG] octonion telemetry → {args.octo_stats_csv}")
+
     # Summary
     print("\n" + "=" * 80)
     print(f"✅ COMPLETE!")
@@ -5233,6 +7755,254 @@ Examples:
     if args.jsonl:
         print(f"  Telemetry: {args.jsonl}")
     print("=" * 80)
+
+
+# === ARC-ONE public API shim (compat) =======================================
+# Provides: SearchSettings, solve_task(task_id, task_json, settings)
+# Normalizes outputs: list[{"grid": <2D list>, "_telemetry": {"ops_tokens": [...]}}]
+
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Tuple, Optional
+import numpy as np
+import inspect, sys
+
+
+def make_sample_submission(preds_by_tid):
+    """
+    preds_by_tid: dict[task_id] -> 2D list (grid prediction)
+    Returns dict in Kaggle's expected schema.
+    """
+    return {tid: [{"output": grid}] for tid, grid in preds_by_tid.items()}
+
+# 1) Lightweight SearchSettings (safe defaults; ignored if unused downstream)
+@dataclass
+class SearchSettings:
+    beam_width: int = 64
+    max_depth: int = 8
+    max_seconds: float = 30.0
+    # GOF-9000 policy knobs (default ON; modules may ignore)
+    block_identity: bool = True
+    rails_scale_hard: bool = True
+    scale_hard_thresh: float = 1.0
+    scale_hard_steps: int = 3
+    early_palette_block_steps: int = 3
+    # Palette test policy (optional)
+    test_palette_policy: str = "second_only_guarded"
+    # --- GOF-9000 SelfMonitor -----------------------------------------------
+    monitor_enable: bool = True
+    monitor_pressure_thresh: float = 0.70
+    monitor_plateau_N: int = 3
+    monitor_visited_cap: int = 50000
+    monitor_inject_underused: bool = True
+    monitor_drop_dupe_sigs: bool = True
+    # --- HFP × GOF integration (v2.9.34) -------------------------------------
+    hfp_enable: bool = True
+    hfp_alpha: float = 0.50
+    hfp_rho_hi: float = 0.80
+    hfp_rho_lo: float = 0.55
+    hfp_break_R: float = 5.00
+    hfp_gate_by_health: bool = True
+    hfp_gate_keep: bool = True
+    hfp_debug_telemetry: bool = True
+    # --- Memory & Diversity (v2.10.x) ----------------------------------------
+    use_memory: bool = True
+    memory_use_motifs: bool = True
+    memory_use_priors: bool = True
+    memory_dir: Optional[str] = None
+    priors_alpha: float = 1.0
+    motif_topk: int = 1
+    diversity_guard: bool = True
+    diversity_b_force_first: bool = False
+    attemptB_beam_scale: float = 1.0
+    attemptB_time_scale: float = 1.0
+    div_lambda: float = 0.50
+    iou_cap: float = 0.97
+    max_bounces: int = 8
+
+_INTERNAL_SETTINGS_CLS = globals().get("_InternalSearchSettings")
+_SETTINGS_SYNC_ATTRS = (
+    "beam_width",
+    "max_depth",
+    "max_seconds",
+    "block_identity",
+    "rails_scale_hard",
+    "scale_hard_thresh",
+    "scale_hard_steps",
+    "early_palette_block_steps",
+    "test_palette_policy",
+    "monitor_enable",
+    "monitor_pressure_thresh",
+    "monitor_plateau_N",
+    "monitor_visited_cap",
+    "monitor_inject_underused",
+    "monitor_drop_dupe_sigs",
+    "use_memory",
+    "memory_use_motifs",
+    "memory_use_priors",
+    "memory_dir",
+    "priors_alpha",
+    "motif_topk",
+    "diversity_guard",
+    "diversity_b_force_first",
+    "attemptB_beam_scale",
+    "attemptB_time_scale",
+    "div_lambda",
+    "iou_cap",
+    "max_bounces",
+    "hfp_enable",
+    "hfp_alpha",
+    "hfp_rho_hi",
+    "hfp_rho_lo",
+    "hfp_break_R",
+    "hfp_gate_by_health",
+    "hfp_gate_keep",
+    "hfp_debug_telemetry",
+)
+
+def _coerce_settings(settings_obj: Optional[Any]) -> Any:
+    if _INTERNAL_SETTINGS_CLS is None:
+        return settings_obj
+    if settings_obj is None:
+        return _INTERNAL_SETTINGS_CLS()
+    if isinstance(settings_obj, _INTERNAL_SETTINGS_CLS):
+        return settings_obj
+    if isinstance(settings_obj, SearchSettings):
+        coerced = _INTERNAL_SETTINGS_CLS()
+        for name in _SETTINGS_SYNC_ATTRS:
+            setattr(coerced, name, getattr(settings_obj, name))
+        return coerced
+    return settings_obj
+
+# 2) Discover an existing single-task solver in this module
+def _discover_solver() -> Tuple[Callable, int]:
+    mod = sys.modules[__name__]
+    candidates = (
+        "_solve_task_internal",
+        "solve_eval_one",
+        "solve_task",
+        "solve",
+        "run_task",
+        "infer_eval_one",
+        "evaluate_one",
+    )
+    for name in candidates:
+        fn = getattr(mod, name, None)
+        if callable(fn):
+            try:
+                arity = len(inspect.signature(fn).parameters)
+            except Exception:
+                arity = 2
+            return fn, arity
+    raise RuntimeError("No single-task solver found. Expected one of: "
+                       "_solve_task_internal / solve_eval_one / solve / run_task / infer_eval_one / evaluate_one.")
+
+_SOLVE_FN, _SOLVE_ARITY = _discover_solver()
+
+def _wrap_to_list(result: Any) -> List[Dict[str, Any]]:
+    """Ensure we return: list of dicts with 'grid' and '_telemetry.ops_tokens'."""
+
+    def _grid_from(first: Any):
+        import numpy as _np
+
+        if isinstance(first, dict):
+            if "grid" in first:
+                g = first["grid"]
+                return g.tolist() if isinstance(g, _np.ndarray) else g
+            if "attempt_1" in first:
+                g = first["attempt_1"]
+                return g.tolist() if isinstance(g, _np.ndarray) else g
+        return _np.array(first).tolist() if not isinstance(first, dict) else [[0]]
+
+    # Already a non-empty list
+    if isinstance(result, list) and result:
+        first = result[0]
+        if isinstance(first, dict):
+            for entry in result:
+                if not isinstance(entry, dict):
+                    continue
+                td = entry.setdefault("_telemetry", {})
+                if "ops_tokens" not in td:
+                    prog = entry.get("program", None)
+                    if prog is not None:
+                        td["ops_tokens"] = _ops_tokens_from_program(prog)
+                tokens = td.get("ops_tokens", [])
+                if tokens is None:
+                    tokens = []
+                elif isinstance(tokens, (list, tuple)):
+                    tokens = list(tokens)
+                else:
+                    tokens = [tokens]
+                td["ops_tokens"] = [_gof_sanitize_token(str(t)) for t in tokens]
+            return result
+        first_norm = {"grid": _grid_from(first), "_telemetry": {}}
+        toks = _ops_tokens_from_program(getattr(first, "program", None))
+        first_norm["_telemetry"]["ops_tokens"] = [_gof_sanitize_token(str(t)) for t in toks]
+        return [first_norm]
+
+    if isinstance(result, list):
+        return []
+
+    first_norm = {"grid": _grid_from(result), "_telemetry": {}}
+    toks = _ops_tokens_from_program(getattr(result, "program", None))
+    first_norm["_telemetry"]["ops_tokens"] = [_gof_sanitize_token(str(t)) for t in toks]
+    return [first_norm]
+
+
+# 4) Public wrapper with stable signature
+def solve_task(task_id: str, task_json: Dict[str, Any], settings: Optional[SearchSettings] = None):
+    settings_obj = settings or SearchSettings()
+    coerced_settings = _coerce_settings(settings_obj)
+    if _SOLVE_ARITY >= 3:
+        raw = _SOLVE_FN(task_id, task_json, coerced_settings)
+    elif _SOLVE_ARITY == 2:
+        raw = _SOLVE_FN(task_id, task_json)
+    else:
+        raw = _SOLVE_FN(task_json)  # last-resort form
+    return _wrap_to_list(raw)
+
+
+# 5) One-time banner
+try:
+    _printed_banner
+except NameError:
+    _printed_banner = True
+    ver = globals().get("__version__", "(unknown)")
+    print(f"[ARC-ONE] API shim active — version {ver} | solve_task + SearchSettings normalized.")
+    try:
+        _default_settings = SearchSettings()
+    except Exception:
+        _default_settings = None
+    if _default_settings is not None:
+        print(
+            "[ARC-ONE] GOF-9000 monitor: "
+            f"{'ON' if _default_settings.monitor_enable else 'OFF'} | "
+            f"pressure≥{_default_settings.monitor_pressure_thresh:.2f} | "
+            f"inject_underused={_default_settings.monitor_inject_underused} | "
+            f"drop_dupes={_default_settings.monitor_drop_dupe_sigs}"
+        )
+        print(
+            "[ARC-ONE] HFP×GOF: "
+            f"{'ON' if _default_settings.hfp_enable else 'OFF'} | "
+            f"ρ_hi={_default_settings.hfp_rho_hi:.2f} ρ_lo={_default_settings.hfp_rho_lo:.2f} "
+            f"R_break>{_default_settings.hfp_break_R:.2f} | "
+            f"gate_by_health={_default_settings.hfp_gate_by_health}"
+        )
+        print(
+            "[ARC-ONE] Memory: "
+            f"use={_default_settings.use_memory} | "
+            f"motifs={_default_settings.memory_use_motifs} | "
+            f"priors={_default_settings.memory_use_priors} | "
+            f"motif_topk={_default_settings.motif_topk} | "
+            f"alpha={_default_settings.priors_alpha:.2f}"
+        )
+        print(
+            "[ARC-ONE] Diversity guard: "
+            f"{'ON' if _default_settings.diversity_guard else 'OFF'} | "
+            f"force_first={_default_settings.diversity_b_force_first} | "
+            f"attemptB_beam_scale={_default_settings.attemptB_beam_scale:.2f} | "
+            f"attemptB_time_scale={_default_settings.attemptB_time_scale:.2f}"
+        )
+# === end API shim ============================================================
 
 
 if __name__ == "__main__":
