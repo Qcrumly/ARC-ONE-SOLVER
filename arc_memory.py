@@ -199,7 +199,14 @@ def choose_motifs(layout_fp: Dict[str, Any], motifs: Any, topk: int = 1) -> List
 _OP_TOKEN_RE = re.compile(r"^\s*([a-zA-Z_]\w*)\s*\((.*)\)\s*$")
 
 
-def parse_op_tokens(tokens: List[str]):
+def parse_op_tokens(tokens: List[str]) -> List[Any]:
+    """Parse serialized motif tokens into Step objects.
+
+    The solver now always falls back to its local parser, so even if a memory
+    shard returns an empty program we still hand back a syntactically valid
+    sequence of `Step` instances to seed the beam.
+    """
+
     from arc_one import Step  # type: ignore
 
     steps: List[Step] = []

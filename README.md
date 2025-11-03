@@ -1,7 +1,7 @@
 # ARC‑ONE (Octonionic Control Overlay ARC solver)
 
 **What this is (one lungful).**
-ARC‑ONE v2.10.3-hotfix2 couples a compact ARC DSL (ops like `tile`, `rot90`, `keep_n_largest`, …) with octonion task embeddings **φ** that steer a staged beam-search pipeline (**skim → main → polish**). The solver now drives two diverse attempts via a strict confidence-minus-IoU chooser, protects them with the GOF-9000 self-monitor + HFP health gates, and lands solutions with palette-safe finishers. Telemetry (JSONL + optional CSVs) keeps the entire run explainable.
+ARC‑ONE v2.10.4 couples a compact ARC DSL (ops like `tile`, `rot90`, `keep_n_largest`, …) with octonion task embeddings **φ** that steer a staged beam-search pipeline (**skim → main → polish**). The solver now drives two diverse attempts via a strict confidence-minus-IoU chooser, protects them with the GOF-9000 self-monitor + HFP health gates, and lands solutions with palette-safe finishers. Telemetry (JSONL + optional CSVs) keeps the entire run explainable.
 
 ## Quick start
 Requires Python, `numpy`, `scipy` (for connected components).
@@ -35,8 +35,8 @@ Telemetry: `--jsonl`, `--exact_wins_csv`, `--octo_stats_csv`, `--public_mode`
 * **DSL & interpreter.** Ops registry + `interpret_program` with guardrails (identity ejection, directional rails, safe refusals).
 * **Search.** Staged beam search with φ-aware priors, live ρ, bounded debate, and GOF-9000 self-monitor pressure relief.
 * **OCO guidance.** 8-D φ vectors, tension, palette difficulty, time scaling, bounce heuristics.
-* **Two attempts & diversity.** Confidence-minus-IoU Attempt-B chooser, diversity guardrails, micro-debate repairs.
-* **Health gating (HFP × GOF).** Hidden-factor ρ health bands gate successors and break futile loops while logging `hfp_gof` telemetry.
+* **Two attempts & diversity.** Confidence-minus-IoU Attempt-B chooser, diversity guardrails, micro-debate repairs, and a restored stack search space (`stack(grid, axis)` enumerates correctly again with optional `ARC_DEBUG_STACK=1` logging).
+* **Health gating (HFP × GOF).** Hidden-factor ρ health bands gate successors and break futile loops while logging `hfp_gof` telemetry. Defaults now calibrate to the analytic maximum of the heptad kernel so “healthy” stretches are realistically attainable, with overrides available via `ARC_R_GOOD` / `ARC_R_BREAK`.
 * **Finishers.** Align (learned (dy,dx)), block masks, blockwise dominant color, denoising, palette snap + micro-shifts.
 * **Telemetry.** Stage times, ops tokens, rails settings, memory/diversity notes, and optional CSVs for exact wins & octonion stats.
 * **API shim.** `SearchSettings`, `solve_task(...)` for notebooks.
@@ -46,8 +46,8 @@ Telemetry: `--jsonl`, `--exact_wins_csv`, `--octo_stats_csv`, `--public_mode`
 * Early-step wrappers respect true depth, enforcing opening bans only when appropriate.
 * Exact-match exits are hardened (no NameErrors) and pixel IoU guards tolerate empty grids.
 * SciPy is optional—connected components falls back to a pure NumPy implementation.
-* Memory v1.0 loads read-only motifs/priors; missing files simply disable the feature.
-* Stack candidates are enumerated again (axis guard in v2.10.3-hotfix2). Set `ARC_DEBUG_STACK=1` to print sample combinations during search debugging.
+* Memory v1.0 loads read-only motifs/priors; missing files simply disable the feature. Motif tokens are deduplicated and, if the memory shard yields no steps, the solver falls back to its local parser so seeds never silently disappear.
+* Stack candidates are enumerated again (axis guard fixed in v2.10.4). Set `ARC_DEBUG_STACK=1` to print sample combinations during search debugging.
 
 ### Memory v1.0 (read-only) & Diversity Guard
 

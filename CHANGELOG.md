@@ -15,6 +15,7 @@
   - `ARC_IOU_CAP=0.92`, `ARC_DIV_LAMBDA=0.70`
   - `ARC_SCALE_HARD_THRESH=0.6` (only if early size ops are desired for clear tilers)
   - Calibrated R thresholds now ship by default; override via `ARC_R_GOOD` / `ARC_R_BREAK` only if experimenting.
+- Documentation now flags the stack enumeration fix, calibrated R thresholds, and the fail-safe motif seeding fallback so the README stays aligned with the code.
 
 ## v2.10.3 (2025-11-03)
 - Strict two-attempts chooser: Attempt-B picked by score = conf - λ·IoU(first), with hard IoU cap.
