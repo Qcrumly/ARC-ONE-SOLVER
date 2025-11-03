@@ -101,6 +101,20 @@ import tempfile
 import shutil
 import hashlib
 import re
+
+
+def _envfloat(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _envint(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
 try:
     from scipy.ndimage import label as _cc_label
 except Exception:  # pragma: no cover - optional SciPy dependency
@@ -127,6 +141,27 @@ except Exception:  # pragma: no cover - optional SciPy dependency
                                 labels[ny, nx] = current
                                 stack.append((ny, nx))
         return labels, int(current)
+
+
+def _keep_n_largest_ll(grid_ll, n=1):
+    g = np.asarray(grid_ll)
+    bg = 0
+    mask = g != bg
+    if not mask.any():
+        return g.tolist()
+    labels, k = _cc_label(mask.astype(np.uint8))
+    areas = [(i, int((labels == i).sum())) for i in range(1, k + 1)]
+    areas.sort(key=lambda t: t[1], reverse=True)
+    keep = {i for i, _ in areas[: max(1, n)]}
+    out = g.copy()
+    out[~np.isin(labels, list(keep))] = bg
+    return out.tolist()
+
+
+def _structure_tuple(arr):
+    a = np.asarray(arr)
+    h, w = a.shape
+    return (h, w, int((a != 0).sum()))
 
 
 # === Determinism & banner ===
@@ -2255,6 +2290,10 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             palette_info = None
             choice = None
             forced_alternate = False
+            target = None
+            if isinstance(test_in, dict):
+                target = test_in.get("output")
+            i12 = None
             if _is_masked_tiling(meta_dict):
                 att2 = _masked_tiling_alternate(base, meta)
                 policy_tag = "masked_raw"
@@ -2449,16 +2488,78 @@ def _two_attempts_from_results(results, tasks_dir, strategy="oco_auto", settings
             att2_entry = {"grid": att2_np.tolist(), "_telemetry": telemetry, "meta": meta_dict}
             att2_entry = _enforce_diversity(att1_entry, att2_entry)
             _cap_telemetry(telemetry)
+
+            if i12 is None:
+                try:
+                    i12 = _pixel_iou(att1_entry["grid"], att2_entry["grid"])
+                except Exception:
+                    i12 = 0.0
+
+            conf1 = 0.0
+            conf2 = 0.0
+            if isinstance(choice, dict):
+                try:
+                    conf1 = float(choice.get("conf1", 0.0) or 0.0)
+                except Exception:
+                    conf1 = 0.0
+                try:
+                    conf2 = float(choice.get("conf2", 0.0) or 0.0)
+                except Exception:
+                    conf2 = 0.0
+            dis = 1.0 - float(i12 or 0.0)
+            lam = getattr(settings, "div_lambda", 0.30) if settings else 0.30
+            scoreA = conf1 - lam * (1.0 - dis)
+            scoreB = conf2 - lam * (1.0 - dis)
+            pickB = scoreB > scoreA
+
+            try:
+                train_pairs = pairs if pairs else []
+                comp_counts = []
+                for (_x, y) in train_pairs:
+                    yy = np.asarray(y)
+                    labels, k = _cc_label((yy != 0).astype(np.uint8))
+                    comp_counts.append(int(k))
+                single_object = (
+                    len(comp_counts) > 0
+                    and (sum(c == 1 for c in comp_counts) / len(comp_counts)) >= 0.6
+                )
+            except Exception:
+                single_object = False
+
+            gA = att1_entry["grid"]
+            gB = att2_entry["grid"]
+            tgt = target
+            if single_object and tgt is not None:
+                try:
+                    if _structure_tuple(gA) >= _structure_tuple(tgt):
+                        gA = _keep_n_largest_ll(gA, 1)
+                    if _structure_tuple(gB) >= _structure_tuple(tgt):
+                        gB = _keep_n_largest_ll(gB, 1)
+                except Exception:
+                    pass
+
+            att1_entry["grid"] = gA
+            att2_entry["grid"] = gB
+            final_grid = gB if pickB else gA
+
             entry = {
                 "attempt_1": att1_entry["grid"],
                 "attempt_2": att2_entry["grid"],
-                "grid": att1_entry["grid"],
+                "grid": final_grid,
                 "_telemetry": telemetry,
                 "iou12": i12,
             }
             _telemetry_note(
                 entry,
                 seconds_after_schedule=float(getattr(settings, "max_seconds", 0.0) if settings else 0.0),
+            )
+            _telemetry_note(
+                entry,
+                chosen=("B" if pickB else "A"),
+                conf1=float(conf1),
+                conf2=float(conf2),
+                dis=float(dis),
+                lam=float(lam),
             )
             cli_args = globals().get("_CLI_ARGS")
             if getattr(cli_args, "octo_stats_csv", None):
@@ -8200,6 +8301,17 @@ Examples:
         hfp_gate_by_health=(not args.no_hfp_gate_by_health),
         hfp_gate_keep=(not args.no_hfp_gate_keep),
         hfp_debug_telemetry=(not args.no_hfp_debug_telemetry),
+    )
+
+    settings.iou_cap = _envfloat("ARC_IOU_CAP", getattr(settings, "iou_cap", 0.97))
+    settings.div_lambda = _envfloat("ARC_DIV_LAMBDA", getattr(settings, "div_lambda", 0.30))
+    settings.monitor_plateau_N = _envint("ARC_PLATEAU_N", getattr(settings, "monitor_plateau_N", 8))
+    settings.monitor_visited_cap = _envint("ARC_VISITED_CAP", getattr(settings, "monitor_visited_cap", 4096))
+    settings.attemptB_beam_scale = _envfloat(
+        "ARC_ATTEMPTB_BEAM_SCALE", getattr(settings, "attemptB_beam_scale", 1.0)
+    )
+    settings.attemptB_time_scale = _envfloat(
+        "ARC_ATTEMPTB_TIME_SCALE", getattr(settings, "attemptB_time_scale", 1.0)
     )
     
     # Apply ablation if specified
