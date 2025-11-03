@@ -409,6 +409,170 @@ _set_determinism(0)
 print(f"[ARC-ONE] seed=0  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
 
 
+# === Determinism & banner ===
+import random
+try:  # Prefer real numpy but fall back to the shim if unavailable
+    import numpy as _np
+except ModuleNotFoundError:  # pragma: no cover - aligns with optional numpy install
+    _np = np  # type: ignore
+
+try:  # Memory helpers are optional
+    import arc_memory as MEM
+except Exception:  # pragma: no cover - memory module optional
+    MEM = None
+
+
+# ---- Memory motif token parsing & safe telemetry --------------------------------
+_OP_TOKEN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*\((.*)\)\s*$")
+
+
+def _telemetry_note_safe(carrier, **kv):
+    """Silently attach telemetry if helper is available."""
+    try:
+        _telemetry_note  # type: ignore[name-defined]
+    except Exception:
+        return
+    try:
+        _telemetry_note(carrier, **kv)  # type: ignore[name-defined]
+    except Exception:
+        pass
+
+
+def _parse_seed_tokens_to_program(
+    tokens: Optional[List[str]],
+    StepCls: Optional[Any] = None,
+    ProgramCls: Optional[Any] = None,
+):
+    """Return (Program or None, number_of_steps) for a motif token list."""
+    if not tokens:
+        return None, 0
+
+    StepType = StepCls or globals().get("Step")
+    ProgType = ProgramCls or globals().get("Program")
+    if StepType is None or ProgType is None:
+        return None, 0
+
+    steps = []
+    regex_primary = globals().get("_OP_RE")
+    for raw in tokens:
+        tok = (raw or "").strip()
+        if not tok:
+            continue
+        match = None
+        if regex_primary is not None:
+            try:
+                match = regex_primary.match(tok)
+            except Exception:
+                match = None
+        if match is None:
+            match = _OP_TOKEN_RE.match(tok)
+        if not match:
+            # allow bare op name by appending ()
+            match = _OP_TOKEN_RE.match(f"{tok}()")
+            if not match:
+                continue
+        name, arg_str = match.group(1), match.group(2).strip()
+        args: List[int] = []
+        if arg_str:
+            for part in arg_str.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    args.append(int(part))
+                except Exception:
+                    # Ignore non-integer args for v1.0; extend as needed.
+                    continue
+        try:
+            steps.append(StepType(name, tuple(args)))
+        except Exception:
+            return None, 0
+
+    if not steps:
+        return None, 0
+
+    try:
+        program = ProgType(steps)
+    except Exception:
+        return None, 0
+    return program, len(steps)
+
+
+def _enqueue_seed_programs(
+    frontier: List[Any],
+    input_grid: Any,
+    target_grid: Any,
+    seed_tokens_list: Optional[List[List[str]]],
+    interpret_program_fn,
+    compute_cost_fn,
+    step_cls: Optional[Any] = None,
+    prog_cls: Optional[Any] = None,
+    telem_carrier: Optional[Any] = None,
+) -> int:
+    """Append parsed motif programs to the frontier. Returns count appended."""
+    if not seed_tokens_list:
+        return 0
+
+    pushed = 0
+    for toks in seed_tokens_list:
+        prog, nops = _parse_seed_tokens_to_program(toks, StepCls=step_cls, ProgramCls=prog_cls)
+        if prog is None or not getattr(prog, "steps", None):
+            continue
+        try:
+            pred = interpret_program_fn(prog, input_grid)
+            cost = compute_cost_fn(prog, input_grid, target_grid)
+        except Exception:
+            continue
+
+        try:
+            if "BeamEntry" in globals():
+                entry = BeamEntry(program=prog, pred=pred, cost=cost)  # type: ignore[name-defined]
+            else:
+                entry = {"program": prog, "pred": pred, "cost": float(cost)}
+            frontier.append(entry)
+            _telemetry_note_safe(
+                entry,
+                memory_seeded_motif=list(toks or []),
+                memory_seed_ops=int(nops),
+                memory_seed_cost=float(cost),
+            )
+            if telem_carrier is not None:
+                _telemetry_note_safe(
+                    telem_carrier,
+                    memory_seeded_motif=list(toks or []),
+                    memory_seed_ops=int(nops),
+                    memory_seed_cost=float(cost),
+                )
+            pushed += 1
+        except Exception:
+            continue
+
+    return pushed
+
+
+def _parse_tokens_to_program(tokens: List[str]):
+    """Compat shim for callers expecting the older helper name."""
+    prog, _ = _parse_seed_tokens_to_program(tokens)
+    if prog is not None:
+        return prog
+    ProgramCls = globals().get("Program")
+    return ProgramCls([]) if ProgramCls is not None else []
+
+
+def _set_determinism(seed=0):
+    random.seed(seed)
+    try:
+        _np.random.seed(seed)
+    except Exception:
+        pass
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+
+_set_determinism(0)
+
+print(f"[ARC-ONE] seed=0  OMP={os.environ.get('OMP_NUM_THREADS','?')}")
+
+
 # ==================================================================================
 # REGISTER TOKENS (for multi-grid operations)
 # ==================================================================================
